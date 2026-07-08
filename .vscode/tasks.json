@@ -1,0 +1,67 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: configure Debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--preset",
+                "Debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake: build Debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "Debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": [
+                "CMake: configure Debug"
+            ],
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "OpenOCD: flash Debug",
+            "type": "shell",
+            "command": "F:/xpack-openocd-0.12.0-7/bin/openocd.exe",
+            "args": [
+                "-f",
+                "${workspaceFolder}/stm32h743_daplink.cfg",
+                "-c",
+                "adapter speed 200",
+                "-c",
+                "init; reset halt; sleep 200; program build/Debug-cmake/dog_leg_test_SDK.elf verify; reset run; shutdown"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Build + Flash Debug",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "CMake: build Debug",
+                "OpenOCD: flash Debug"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

@@ -1,0 +1,32 @@
+build/
+cmake-build-debug/
+mx.scratch/
+
+# STM32CubeIDE / editor metadata
+.settings/
+.idea/
+.agents/
+
+# Firmware and debug outputs
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.o
+*.obj
+*.d
+*.su
+*.dep
+*.lnp
+*.htm
+*.log
+
+# Keil/MDK projects are intentionally not used in this repository.
+MDK-ARM/
+*.uvprojx
+*.uvoptx
+*.uvguix*
+*.scvd
+*.sct
