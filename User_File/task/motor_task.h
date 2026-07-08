@@ -292,6 +292,7 @@ const Dog_Mit_Ang_Pid *dog_mit_active_ang_pid(void);
 uint8_t dog_mit_goto_motor_pose(float hip_motor_deg, float knee_motor_deg);
 uint8_t dog_mit_goto_stand_pose(void);
 uint8_t dog_mit_stand_sequence(void);
+uint8_t dog_mit_return_to_stand_start_pose(void);
 uint8_t dog_mit_jump_test_sequence(void);
 uint8_t dog_mit_goto_foot_xz(float x_mm, float z_mm);
 uint8_t dog_mit_march_in_place_start(uint8_t cycles);

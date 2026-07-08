@@ -1752,6 +1752,7 @@ static void stand_state_tick(uint32_t now)
 {
     if (s_remote_sample.estop_request != 0U) {
         DogStand_Estop();
+        s_remote_sample.estop_request = 0U;
     }
     if (s_remote_sample.stand_request != 0U) {
         DogStand_Request();
@@ -2236,6 +2237,12 @@ static uint8_t mit_stand_set_rise_pose(float x_mm, float progress)
         }
     }
     return 1U;
+}
+
+static float smoothstep01(float x)
+{
+    x = clampf(x, 0.0f, 1.0f);
+    return x * x * (3.0f - (2.0f * x));
 }
 
 static uint8_t mit_stand_set_jump_land_pose(float x_mm, float progress)
@@ -3243,6 +3250,68 @@ uint8_t dog_mit_stand_sequence(void)
     }
 
     return ok_count;
+}
+
+uint8_t dog_mit_return_to_stand_start_pose(void)
+{
+    if (dog_mit_debug_is_active() == 0U) {
+        DebugUart_Printf("Return start pose FAIL: MIT inactive.\r\n");
+        return 0U;
+    }
+    if (dog_mit_fault_hold_is_active() != 0U) {
+        DebugUart_Printf("Return start pose FAIL: fault-hold active.\r\n");
+        return 0U;
+    }
+    if (s_debug_target != DOG_DEBUG_TARGET_ALL) {
+        DebugUart_Printf("Return start pose FAIL: target all motors first.\r\n");
+        return 0U;
+    }
+    if (dog_leg_foot_xz_is_reachable(DOG_STAND_FOOT_X_MM, dog_leg_stand_foot_z_start_mm(DOG_LEG_LF)) == 0U) {
+        DebugUart_Printf("Return start pose FAIL: front start foot (%ld,%ld)mm unreachable\r\n",
+                         (long)DOG_STAND_FOOT_X_MM,
+                         (long)dog_leg_stand_foot_z_start_mm(DOG_LEG_LF));
+        return 0U;
+    }
+    if (dog_leg_foot_xz_is_reachable(DOG_STAND_FOOT_X_MM, dog_leg_stand_foot_z_start_mm(DOG_LEG_LB)) == 0U) {
+        DebugUart_Printf("Return start pose FAIL: rear start foot (%ld,%ld)mm unreachable\r\n",
+                         (long)DOG_STAND_FOOT_X_MM,
+                         (long)dog_leg_stand_foot_z_start_mm(DOG_LEG_LB));
+        return 0U;
+    }
+
+    dog_mit_march_in_place_stop();
+    mit_set_all_stand_pid_mode();
+    dog_mit_reset_integrators();
+
+    const uint32_t t0 = HAL_GetTick();
+    while (1) {
+        if (dog_mit_fault_hold_is_active() != 0U) {
+            return 0U;
+        }
+
+        const uint32_t now = HAL_GetTick();
+        float elapsed = 1.0f;
+        if (DOG_STAND_RISE_MS > 0U) {
+            elapsed = (float)(now - t0) / (float)DOG_STAND_RISE_MS;
+        }
+        const float progress = 1.0f - smoothstep01(elapsed);
+        if (mit_stand_set_rise_pose(DOG_STAND_FOOT_X_MM, progress) == 0U) {
+            return 0U;
+        }
+        mit_pump_control(now);
+
+        if (elapsed >= 1.0f) {
+            break;
+        }
+        HAL_Delay(1U);
+    }
+
+    if (mit_stand_set_rise_pose(DOG_STAND_FOOT_X_MM, 0.0f) == 0U) {
+        return 0U;
+    }
+    dog_mit_send_control_now();
+    dog_debug_rx_only();
+    return 1U;
 }
 
 uint8_t dog_mit_jump_test_sequence(void)
