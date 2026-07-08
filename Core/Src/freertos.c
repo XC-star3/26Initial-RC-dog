@@ -29,6 +29,7 @@
 #include "board_rgb.h"
 #include "control_task.h"
 #include "debug_uart.h"
+#include "imu_task.h"
 #include "motor_task_c_api.h"
 /* USER CODE END Includes */
 
@@ -159,9 +160,11 @@ void INS_Task(void *argument)
 {
   /* USER CODE BEGIN INS_Task */
   (void)argument;
+  ImuTask_Init();
   for(;;)
   {
-    osDelay(2);
+    ImuTask_Tick();
+    osDelay(IMU_TASK_PERIOD_MS);
   }
   /* USER CODE END INS_Task */
 }
@@ -221,4 +224,3 @@ void CAN_Task(void *argument)
 /* USER CODE BEGIN Application */
 
 /* USER CODE END Application */
-

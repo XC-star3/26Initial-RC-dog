@@ -96,6 +96,15 @@ extern "C" {
 #define DOG_TROT_SETTLE_ERR_DEG         4.0f
 #define DOG_TROT_SETTLE_EXTRA_MS        120U
 
+#define DOG_IMU_SAMPLE_TIMEOUT_MS             100U
+#define DOG_IMU_BALANCE_STAND_REFRESH_MS      20U
+#define DOG_IMU_BALANCE_ROLL_KP_MM_PER_DEG    2.0f
+#define DOG_IMU_BALANCE_PITCH_KP_MM_PER_DEG   2.0f
+#define DOG_IMU_BALANCE_D_MM_PER_DPS          0.03f
+#define DOG_IMU_BALANCE_LIMIT_MM              20.0f
+#define DOG_IMU_BALANCE_ROLL_SIGN             1.0f
+#define DOG_IMU_BALANCE_PITCH_SIGN            1.0f
+
 #define DOG_TURN_STRIDE_X_MM             30.0f    /* in-place turn step per leg side */
 #define DOG_TURN_HZ                       DOG_TROT_HZ
 #define DOG_TURN_SWING_MS                 DOG_TROT_SWING_MS
@@ -224,11 +233,16 @@ struct Dog_Motor_Config {
 };
 
 struct Dog_Imu_Sample {
+    uint8_t valid;
+    uint8_t calibrated;
+    uint8_t init_error;
+    uint8_t reserved;
     float roll_deg;
     float pitch_deg;
     float yaw_deg;
     float gyro_dps[3];
     float accel_mps2[3];
+    float temp_c;
     uint32_t tick_ms;
 };
 
@@ -362,6 +376,10 @@ void dog_motor_query_online_encoders(void);
 
 void DogImu_Update(const Dog_Imu_Sample *sample);
 void DogRemote_Update(const Dog_Remote_Sample *sample);
+void dog_imu_balance_set_enabled(uint8_t enable);
+uint8_t dog_imu_balance_is_enabled(void);
+uint8_t dog_imu_balance_is_active(void);
+void dog_imu_balance_get_leg_z_offsets(float offsets_mm[DOG_LEG_COUNT]);
 void DogStand_Request(void);
 void DogStand_Estop(void);
 Dog_Stand_State DogStand_GetState(void);

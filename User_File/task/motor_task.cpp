@@ -228,6 +228,8 @@ static uint8_t s_mit_torque_test_index = DOG_MOTOR_COUNT;
 static float s_mit_torque_test_nm = 0.0f;
 static uint8_t s_jump_active = 0U;
 static Dog_Imu_Sample s_imu_sample;
+static uint8_t s_imu_balance_enabled = 1U;
+static uint8_t s_imu_balance_stand_hold_active = 0U;
 static Dog_Remote_Sample s_remote_sample;
 
 static float clampf(float v, float lo, float hi)
@@ -235,6 +237,75 @@ static float clampf(float v, float lo, float hi)
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+uint8_t dog_imu_balance_is_enabled(void)
+{
+    return s_imu_balance_enabled;
+}
+
+void dog_imu_balance_set_enabled(uint8_t enable)
+{
+    s_imu_balance_enabled = (enable != 0U) ? 1U : 0U;
+}
+
+uint8_t dog_imu_balance_is_active(void)
+{
+    if (s_imu_balance_enabled == 0U) {
+        return 0U;
+    }
+    if ((s_imu_sample.valid == 0U) || (s_imu_sample.calibrated == 0U)) {
+        return 0U;
+    }
+    if (s_imu_sample.tick_ms == 0U) {
+        return 0U;
+    }
+    if ((uint32_t)(HAL_GetTick() - s_imu_sample.tick_ms) > DOG_IMU_SAMPLE_TIMEOUT_MS) {
+        return 0U;
+    }
+    return 1U;
+}
+
+void dog_imu_balance_get_leg_z_offsets(float offsets_mm[DOG_LEG_COUNT])
+{
+    if (offsets_mm == nullptr) {
+        return;
+    }
+    for (uint8_t i = 0U; i < DOG_LEG_COUNT; ++i) {
+        offsets_mm[i] = 0.0f;
+    }
+    if (dog_imu_balance_is_active() == 0U) {
+        return;
+    }
+
+    const float roll_term = clampf(((s_imu_sample.roll_deg * DOG_IMU_BALANCE_ROLL_KP_MM_PER_DEG) +
+                                    (s_imu_sample.gyro_dps[0] * DOG_IMU_BALANCE_D_MM_PER_DPS)) *
+                                   DOG_IMU_BALANCE_ROLL_SIGN,
+                                   -DOG_IMU_BALANCE_LIMIT_MM,
+                                   DOG_IMU_BALANCE_LIMIT_MM);
+    const float pitch_term = clampf(((s_imu_sample.pitch_deg * DOG_IMU_BALANCE_PITCH_KP_MM_PER_DEG) +
+                                     (s_imu_sample.gyro_dps[1] * DOG_IMU_BALANCE_D_MM_PER_DPS)) *
+                                    DOG_IMU_BALANCE_PITCH_SIGN,
+                                    -DOG_IMU_BALANCE_LIMIT_MM,
+                                    DOG_IMU_BALANCE_LIMIT_MM);
+
+    offsets_mm[DOG_LEG_LF] = clampf(roll_term + pitch_term, -DOG_IMU_BALANCE_LIMIT_MM, DOG_IMU_BALANCE_LIMIT_MM);
+    offsets_mm[DOG_LEG_RF] = clampf(-roll_term + pitch_term, -DOG_IMU_BALANCE_LIMIT_MM, DOG_IMU_BALANCE_LIMIT_MM);
+    offsets_mm[DOG_LEG_LB] = clampf(roll_term - pitch_term, -DOG_IMU_BALANCE_LIMIT_MM, DOG_IMU_BALANCE_LIMIT_MM);
+    offsets_mm[DOG_LEG_RB] = clampf(-roll_term - pitch_term, -DOG_IMU_BALANCE_LIMIT_MM, DOG_IMU_BALANCE_LIMIT_MM);
+}
+
+static float dog_imu_balance_z_for_leg(uint8_t leg)
+{
+    float offsets[DOG_LEG_COUNT] = {};
+    if (leg >= DOG_LEG_COUNT) {
+        return 0.0f;
+    }
+    if ((s_jump_active != 0U) || (s_diag_support_active != 0U)) {
+        return 0.0f;
+    }
+    dog_imu_balance_get_leg_z_offsets(offsets);
+    return offsets[leg];
 }
 
 static const Dog_Gait_Speed_Profile *gait_speed_profile(void)
@@ -1254,6 +1325,7 @@ static float dog_leg_stand_foot_z_mm(uint8_t leg)
     if (dog_leg_is_rear(leg) != 0U) {
         z_mm += DOG_REAR_FOOT_EXTRA_Z_MM;
     }
+    z_mm += dog_imu_balance_z_for_leg(leg);
     return z_mm;
 }
 
@@ -2485,6 +2557,32 @@ static void march_set_all_legs_stand_pose(void)
     }
 }
 
+static void dog_imu_balance_refresh_stand_hold(uint32_t now)
+{
+    static uint32_t s_last_refresh_ms = 0U;
+    if (s_imu_balance_stand_hold_active == 0U) {
+        return;
+    }
+    if ((uint32_t)(now - s_last_refresh_ms) < DOG_IMU_BALANCE_STAND_REFRESH_MS) {
+        return;
+    }
+    s_last_refresh_ms = now;
+
+    if ((s_mit_debug_active == 0U) ||
+        (s_debug_target != DOG_DEBUG_TARGET_ALL) ||
+        (s_march.active != 0U) ||
+        (s_diag_support_active != 0U) ||
+        (s_jump_active != 0U) ||
+        (s_teach_hold_active != 0U) ||
+        (s_mit_torque_test_active != 0U) ||
+        (s_mit_fault_hold_active != 0U)) {
+        return;
+    }
+
+    mit_set_all_stand_pid_mode();
+    march_set_all_legs_stand_pose();
+}
+
 static void march_get_swing_legs(uint8_t *leg_a, uint8_t *leg_b)
 {
     if (march_mode_uses_cycloid(s_march.mode) != 0U) {
@@ -2859,6 +2957,8 @@ void dog_mit_march_in_place_stop(void)
     mit_set_all_stand_pid_mode();
     march_set_all_legs_stand_pose();
     dog_mit_reset_integrators();
+    s_imu_balance_stand_hold_active = ((s_debug_target == DOG_DEBUG_TARGET_ALL) &&
+                                       (s_mit_debug_active != 0U)) ? 1U : 0U;
 }
 
 static void march_advance_step(uint32_t now)
@@ -3006,6 +3106,7 @@ static uint8_t march_in_place_start_mode(uint8_t mode, uint8_t cycles, float tro
 
     dog_mit_march_in_place_stop();
     dog_mit_diag_support_stop();
+    s_imu_balance_stand_hold_active = 0U;
     s_trot_direction_sign = ((mode == DOG_MARCH_MODE_TROT) && (trot_direction_sign < 0.0f)) ? -1.0f : 1.0f;
     mit_set_all_stand_pid_mode();
     march_set_all_legs_stand_pose();
@@ -3112,6 +3213,7 @@ uint8_t dog_mit_diag_support_lf_rb_start(void)
 
     dog_mit_march_in_place_stop();
     dog_mit_diag_support_stop();
+    s_imu_balance_stand_hold_active = 0U;
 
     march_set_leg_foot_xz(DOG_LEG_LF, DOG_STAND_FOOT_X_MM, dog_leg_stand_foot_z_mm(DOG_LEG_LF));
     march_set_leg_foot_xz(DOG_LEG_RB, DOG_STAND_FOOT_X_MM, dog_leg_stand_foot_z_mm(DOG_LEG_RB));
@@ -3193,6 +3295,7 @@ void dog_mit_print_all_motor_current(const char *tag)
 
 uint8_t dog_mit_goto_foot_xz(float x_mm, float z_mm)
 {
+    s_imu_balance_stand_hold_active = 0U;
     if (dog_mit_debug_is_active() == 0U) {
         return 0U;
     }
@@ -3239,9 +3342,11 @@ uint8_t dog_mit_stand_sequence(void)
                      (long)(g_dog_mit_stand_pid.output_limit_a * 1000.0f));
 
     if (mit_stand_move_sequential() == 0U) {
+        s_imu_balance_stand_hold_active = 0U;
         return 0U;
     }
 
+    s_imu_balance_stand_hold_active = (s_debug_target == DOG_DEBUG_TARGET_ALL) ? 1U : 0U;
     return ok_count;
 }
 
@@ -3259,6 +3364,7 @@ uint8_t dog_mit_jump_test_sequence(void)
         DebugUart_Printf("Jump FAIL: send '8' to target all 8 motors.\r\n");
         return 0U;
     }
+    s_imu_balance_stand_hold_active = 0U;
 
     DebugUart_Printf("Jump STAND_PID snap (%ld,%ld)->(%ld,%ld) land front=%ld rear=%ld hold=%ums land=%ums\r\n",
                      (long)DOG_JUMP_FOOT_X_MM,
@@ -3395,6 +3501,7 @@ void dog_debug_rx_only(void)
     dog_mit_march_in_place_stop();
     dog_debug_mit_torque_stop();
     mit_debug_stop_tx();
+    s_imu_balance_stand_hold_active = 0U;
     s_auto_stand_enabled = 0U;
     memset(s_motor_mit_probe_active, 0, sizeof(s_motor_mit_probe_active));
     memset(s_encoder_turn_valid, 0, sizeof(s_encoder_turn_valid));
@@ -4195,6 +4302,7 @@ void motor_task(void)
 
     stand_state_tick(now);
     march_in_place_tick(now);
+    dog_imu_balance_refresh_stand_hold(now);
 
     send_mit_probe_keepalive(now);
     send_mit_torque_test_keepalive(now);

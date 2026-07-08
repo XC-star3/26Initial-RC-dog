@@ -41,6 +41,8 @@ add_subdirectory(cmake/stm32cubemx)
 set(USER_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/User_File/algorithm
     ${CMAKE_SOURCE_DIR}/User_File/BSP/CAN
+    ${CMAKE_SOURCE_DIR}/User_File/BSP/IMU
+    ${CMAKE_SOURCE_DIR}/User_File/BSP/IMU/inc
     ${CMAKE_SOURCE_DIR}/User_File/BSP/RGB
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB
     ${CMAKE_SOURCE_DIR}/User_File/motor/MWSDK
@@ -54,6 +56,9 @@ set(USER_INCLUDE_DIRS
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/User_File/BSP/CAN/bsp_fdcan.cpp
+    ${CMAKE_SOURCE_DIR}/User_File/BSP/IMU/BMI088driver.c
+    ${CMAKE_SOURCE_DIR}/User_File/BSP/IMU/BMI088Middleware.c
+    ${CMAKE_SOURCE_DIR}/User_File/BSP/IMU/imu_task.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/RGB/board_rgb.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/debug_uart.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/vofa_pid.cpp

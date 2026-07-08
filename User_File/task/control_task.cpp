@@ -2,6 +2,7 @@
 
 #include "arm_motor_task.h"
 #include "debug_uart.h"
+#include "imu_task.h"
 #include "motor_task.h"
 #include "sbus.h"
 #include "tim.h"
@@ -126,6 +127,8 @@ static void print_help(void)
     DebugUart_Printf("  q : query encoder now (est+count, std+ext)\r\n");
     DebugUart_Printf("  p : print status\r\n");
     DebugUart_Printf("  Y : print SBUS remote raw/norm/mode diagnostics\r\n");
+    DebugUart_Printf("  I : print BMI088 IMU diagnostics and roll/pitch balance offsets\r\n");
+    DebugUart_Printf("  O : toggle IMU roll/pitch balance foot-Z compensation\r\n");
     DebugUart_Printf("  v : toggle VOFA JustFloat PID plot (500Hz, auto mutes text log)\r\n");
     DebugUart_Printf("  W : cycle VOFA watch motor M0..M7\r\n");
     DebugUart_Printf("  ? : print this help\r\n\r\n");
@@ -1141,6 +1144,17 @@ static void handle_command(char c)
     case 'y':
         print_sbus_status();
         break;
+    case 'I':
+        ImuTask_PrintStatus();
+        break;
+    case 'O':
+    {
+        const uint8_t enable = (dog_imu_balance_is_enabled() == 0U) ? 1U : 0U;
+        dog_imu_balance_set_enabled(enable);
+        DebugUart_Printf("IMU roll/pitch balance %s\r\n", (enable != 0U) ? "ON" : "OFF");
+        ImuTask_PrintStatus();
+        break;
+    }
     case 'v':
         toggle_vofa();
         break;
