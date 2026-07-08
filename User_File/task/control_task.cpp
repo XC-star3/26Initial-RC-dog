@@ -30,7 +30,6 @@
 #define SBUS_SAFETY_HIGH_NORM  50
 #define SBUS_SAFETY_RELEASE_NORM 20
 #define SBUS_SAFETY_DEBOUNCE_MS 50U
-#define SBUS_FAILSAFE_ESTOP_MS 3000U
 #define SBUS_GAIT_RETRY_MS     500U
 
 enum ControlMode {
@@ -65,7 +64,6 @@ static uint8_t s_sbus_safety_wait_release_logged = 0U;
 static uint32_t s_sbus_safety_high_since_ms = 0U;
 static uint32_t s_sbus_lost_since_ms = 0U;
 static uint8_t s_sbus_failsafe_stop_sent = 0U;
-static uint8_t s_sbus_failsafe_estop_sent = 0U;
 static uint8_t s_sbus_remote_lockout = 0U;
 static uint8_t s_sbus_remote_lockout_logged = 0U;
 static uint8_t s_sbus_quad_standing = 0U;
@@ -765,26 +763,15 @@ static void sbus_remote_failsafe(uint32_t now)
     }
 
     if (s_sbus_failsafe_stop_sent == 0U) {
-        DebugUart_Printf("SBUS lost/failsafe: stop gait and disable arm; estop after %ums lost.\r\n",
-                         (unsigned)SBUS_FAILSAFE_ESTOP_MS);
-        if (dog_mit_march_in_place_is_active() != 0U) {
-            dog_mit_march_in_place_stop();
-        }
+        DebugUart_Printf("SBUS lost/failsafe: disable quadruped and arm TX; no estop.\r\n");
+        sbus_quad_rx_only();
         ArmMotor_Disable();
-        s_mode = MODE_IDLE;
+        s_mode = MODE_RX_ONLY;
         s_sbus_arm_active = 0U;
         s_sbus_arm_last_ms = 0U;
-        sbus_quad_reset_state();
         s_sbus_failsafe_stop_sent = 1U;
         s_sbus_remote_lockout = 1U;
         s_sbus_remote_lockout_logged = 0U;
-    }
-
-    if ((s_sbus_failsafe_estop_sent == 0U) &&
-        ((uint32_t)(now - s_sbus_lost_since_ms) >= SBUS_FAILSAFE_ESTOP_MS)) {
-        DebugUart_Printf("SBUS lost/failsafe held: estop quadruped.\r\n");
-        DogStand_Estop();
-        s_sbus_failsafe_estop_sent = 1U;
     }
 
     s_sbus_seen_fresh = 0U;
@@ -803,19 +790,24 @@ static void sbus_control_update(void)
     Sbus_Process();
     (void)Sbus_GetState(&rc);
 
-    if ((rc.frame_count == 0U) || (Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS) == 0U)) {
-        if (rc.frame_count != 0U) {
-            sbus_remote_failsafe(now);
-        }
+    if (rc.frame_count == 0U) {
         return;
     }
 
-    if (s_sbus_lost_since_ms != 0U) {
-        DebugUart_Printf("SBUS restored after %lums.\r\n",
-                         (unsigned long)(now - s_sbus_lost_since_ms));
+    if (Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS) == 0U) {
+        sbus_remote_failsafe(now);
+        return;
+    }
+
+    if ((s_sbus_lost_since_ms != 0U) || (s_sbus_failsafe_stop_sent != 0U)) {
+        if (s_sbus_lost_since_ms != 0U) {
+            DebugUart_Printf("SBUS restored after %lums.\r\n",
+                             (unsigned long)(now - s_sbus_lost_since_ms));
+        } else {
+            DebugUart_Printf("SBUS restored from failsafe frames.\r\n");
+        }
         s_sbus_lost_since_ms = 0U;
         s_sbus_failsafe_stop_sent = 0U;
-        s_sbus_failsafe_estop_sent = 0U;
         s_sbus_remote_lockout = 1U;
         s_sbus_remote_lockout_logged = 0U;
     }

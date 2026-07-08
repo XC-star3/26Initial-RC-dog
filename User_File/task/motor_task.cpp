@@ -3630,6 +3630,13 @@ uint8_t dog_debug_mit_boot_sequence(void)
     if (ok_count == 0U) {
         return 0U;
     }
+    if (ok_count != selected_count()) {
+        DebugUart_Printf("Stand FAIL: boot OK %u/%u, wait all selected motors online/ready.\r\n",
+                         (unsigned)ok_count,
+                         (unsigned)selected_count());
+        dog_debug_rx_only();
+        return 0U;
+    }
 
     mit_debug_settle_and_arm();
 
