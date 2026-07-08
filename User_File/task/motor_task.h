@@ -93,6 +93,8 @@ extern "C" {
 #define DOG_TROT_HOLD_MS                15U
 #define DOG_TROT_SWING_DOWN_MS          35U
 #define DOG_TROT_PAIR_PAUSE_MS          0U
+#define DOG_TROT_SETTLE_ERR_DEG         4.0f
+#define DOG_TROT_SETTLE_EXTRA_MS        120U
 
 #define DOG_TURN_STRIDE_X_MM             30.0f    /* in-place turn step per leg side */
 #define DOG_TURN_HZ                       DOG_TROT_HZ

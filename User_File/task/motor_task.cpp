@@ -2905,9 +2905,20 @@ static void march_in_place_tick(uint32_t now)
     switch (s_march.phase) {
     case DOG_MARCH_PHASE_SWING_UP:
         if (cycloid_gait != 0U) {
-            if ((uint32_t)(now - s_march.swing_t0_ms) >= dog_mit_gait_trot_swing_ms()) {
-                s_march.phase = DOG_MARCH_PHASE_PAUSE;
-                s_march.phase_t0_ms = now;
+            const uint32_t elapsed_ms = (uint32_t)(now - s_march.swing_t0_ms);
+            const uint32_t swing_ms = dog_mit_gait_trot_swing_ms();
+            if (elapsed_ms >= swing_ms) {
+                const uint8_t settled = march_swing_legs_settled(DOG_TROT_SETTLE_ERR_DEG);
+                const uint8_t timeout = (elapsed_ms >= (swing_ms + DOG_TROT_SETTLE_EXTRA_MS)) ? 1U : 0U;
+                if ((settled != 0U) || (timeout != 0U)) {
+                    if ((settled == 0U) && (timeout != 0U)) {
+                        DebugUart_Printf("Trot settle timeout pair=%u err>%lddeg\r\n",
+                                         (unsigned)s_march.leg,
+                                         (long)DOG_TROT_SETTLE_ERR_DEG);
+                    }
+                    s_march.phase = DOG_MARCH_PHASE_PAUSE;
+                    s_march.phase_t0_ms = now;
+                }
             }
         } else if (march_swing_legs_settled(DOG_MARCH_SETTLE_ERR_DEG) != 0U) {
             s_march.phase = DOG_MARCH_PHASE_HOLD;
