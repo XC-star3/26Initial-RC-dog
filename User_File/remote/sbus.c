@@ -12,7 +12,7 @@
 #define SBUS_DMA_BUF_LEN 32U
 #define SBUS_CENTER 1024
 #define SBUS_RANGE 671
-#define SBUS_DEADBAND 3
+#define SBUS_DEADBAND 5
 
 #if defined(__GNUC__)
 #define SBUS_DMA_SECTION __attribute__((section(".dma_buffer"), aligned(32)))

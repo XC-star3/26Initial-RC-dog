@@ -23,14 +23,15 @@
 #define SBUS_ARM_J0_MAX_DEG    90.0f
 #define SBUS_ARM_J1_MIN_DEG    (-90.0f)
 #define SBUS_ARM_J1_MAX_DEG    90.0f
-#define SBUS_MOVE_ENTER_DEADBAND 30
-#define SBUS_MOVE_EXIT_DEADBAND  15
+#define SBUS_MOVE_ENTER_DEADBAND 25
+#define SBUS_MOVE_EXIT_DEADBAND  12
+#define SBUS_ARM_JOG_DEADBAND    8
 #define SBUS_SPEED_LOW_NORM    (-60)
 #define SBUS_SPEED_HIGH_NORM   60
 #define SBUS_SAFETY_CH         8U
 #define SBUS_SAFETY_HIGH_NORM  50
+#define SBUS_SAFETY_RELEASE_NORM 20
 #define SBUS_SAFETY_DEBOUNCE_MS 50U
-#define SBUS_FAILSAFE_ESTOP_MS 1500U
 #define SBUS_GAIT_RETRY_MS     500U
 
 enum ControlMode {
@@ -60,10 +61,13 @@ static fp32 s_sbus_arm_j0_target_deg = 0.0f;
 static fp32 s_sbus_arm_j1_target_deg = 0.0f;
 static uint32_t s_sbus_arm_last_ms = 0U;
 static uint8_t s_sbus_safety_active = 0U;
+static uint8_t s_sbus_safety_armed = 0U;
+static uint8_t s_sbus_safety_wait_release_logged = 0U;
 static uint32_t s_sbus_safety_high_since_ms = 0U;
 static uint32_t s_sbus_lost_since_ms = 0U;
 static uint8_t s_sbus_failsafe_stop_sent = 0U;
-static uint8_t s_sbus_failsafe_estop_sent = 0U;
+static uint8_t s_sbus_remote_lockout = 0U;
+static uint8_t s_sbus_remote_lockout_logged = 0U;
 static uint8_t s_sbus_quad_standing = 0U;
 static uint8_t s_sbus_quad_cmd = SBUS_QUAD_STOP;
 static uint8_t s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
@@ -75,7 +79,9 @@ static const char *sbus_quad_cmd_name(uint8_t cmd);
 static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc);
 static uint8_t sbus_quad_cmd_from_sticks(const SbusState *rc);
 static uint8_t sbus_safety_raw_is_high(const SbusState *rc);
+static uint8_t sbus_safety_raw_is_released(const SbusState *rc);
 static uint8_t sbus_safety_is_active(const SbusState *rc, uint32_t now);
+static void sbus_update_switch_state(uint8_t main_sw, uint8_t sub_sw);
 
 static void print_help(void)
 {
@@ -235,14 +241,15 @@ static void print_sbus_status(void)
                      (int)rc.norm[SBUS_SPEED_CH],
                      (speed == DOG_GAIT_SPEED_LOW) ? "LOW" :
                      ((speed == DOG_GAIT_SPEED_HIGH) ? "HIGH" : "MID"));
-    DebugUart_Printf("  CH5 main raw=%u -> %s  CH8 sub raw=%u -> %s  CH9 safety raw=%u norm=%d active=%u\r\n",
+    DebugUart_Printf("  CH5 main raw=%u -> %s  CH8 sub raw=%u -> %s  CH9 safety raw=%u norm=%d high=%u armed=%u\r\n",
                      (unsigned)rc.ch[SBUS_MAIN_MODE_CH],
                      sbus_switch_name(main_sw),
                      (unsigned)rc.ch[SBUS_SUB_MODE_CH],
                      sbus_switch_name(sub_sw),
                      (unsigned)rc.ch[SBUS_SAFETY_CH],
                      (int)rc.norm[SBUS_SAFETY_CH],
-                     (unsigned)safety_active);
+                     (unsigned)safety_active,
+                     (unsigned)s_sbus_safety_armed);
     DebugUart_Printf("  decoded: cmd=%s arm=%u standing=%u active_gait=%u current_speed=%s\r\n",
                      sbus_quad_cmd_name(stick_cmd),
                      (unsigned)(((main_sw == SBUS_SWITCH_MID) &&
@@ -352,6 +359,14 @@ static fp32 clamp_fp32_local(fp32 value, fp32 min_value, fp32 max_value)
     return value;
 }
 
+static int16_t sbus_apply_deadband(int16_t value, int16_t deadband)
+{
+    if ((value > -deadband) && (value < deadband)) {
+        return 0;
+    }
+    return value;
+}
+
 static const char *sbus_switch_name(uint8_t sw)
 {
     switch (sw) {
@@ -428,9 +443,13 @@ static void sbus_arm_update(const SbusState *rc, uint32_t now)
     }
     s_sbus_arm_last_ms = now;
 
-    const fp32 j0_delta_deg = ((fp32)rc->norm[SBUS_ARM_J0_CH] / 100.0f) *
+    const int16_t j0_norm = sbus_apply_deadband(rc->norm[SBUS_ARM_J0_CH],
+                                                SBUS_ARM_JOG_DEADBAND);
+    const int16_t j1_norm = sbus_apply_deadband(rc->norm[SBUS_ARM_J1_CH],
+                                                SBUS_ARM_JOG_DEADBAND);
+    const fp32 j0_delta_deg = ((fp32)j0_norm / 100.0f) *
                               SBUS_ARM_RATE_DEG_S * dt_s;
-    const fp32 j1_delta_deg = ((fp32)rc->norm[SBUS_ARM_J1_CH] / 100.0f) *
+    const fp32 j1_delta_deg = ((fp32)j1_norm / 100.0f) *
                               SBUS_ARM_RATE_DEG_S * dt_s;
 
     s_sbus_arm_j0_target_deg = clamp_fp32_local(s_sbus_arm_j0_target_deg + j0_delta_deg,
@@ -452,10 +471,34 @@ static uint8_t sbus_safety_raw_is_high(const SbusState *rc)
     return (rc->norm[SBUS_SAFETY_CH] >= SBUS_SAFETY_HIGH_NORM) ? 1U : 0U;
 }
 
+static uint8_t sbus_safety_raw_is_released(const SbusState *rc)
+{
+    if (rc == nullptr) {
+        return 0U;
+    }
+    return (rc->norm[SBUS_SAFETY_CH] <= SBUS_SAFETY_RELEASE_NORM) ? 1U : 0U;
+}
+
 static uint8_t sbus_safety_is_active(const SbusState *rc, uint32_t now)
 {
+    if (sbus_safety_raw_is_released(rc) != 0U) {
+        s_sbus_safety_armed = 1U;
+        s_sbus_safety_wait_release_logged = 0U;
+        s_sbus_safety_high_since_ms = 0U;
+        return 0U;
+    }
+
     if (sbus_safety_raw_is_high(rc) == 0U) {
         s_sbus_safety_high_since_ms = 0U;
+        return 0U;
+    }
+
+    if (s_sbus_safety_armed == 0U) {
+        s_sbus_safety_high_since_ms = 0U;
+        if (s_sbus_safety_wait_release_logged == 0U) {
+            DebugUart_Printf("SBUS CH9 safety is HIGH at startup/restore; release it before edge trigger is armed.\r\n");
+            s_sbus_safety_wait_release_logged = 1U;
+        }
         return 0U;
     }
 
@@ -464,7 +507,12 @@ static uint8_t sbus_safety_is_active(const SbusState *rc, uint32_t now)
         return 0U;
     }
 
-    return ((uint32_t)(now - s_sbus_safety_high_since_ms) >= SBUS_SAFETY_DEBOUNCE_MS) ? 1U : 0U;
+    if ((uint32_t)(now - s_sbus_safety_high_since_ms) < SBUS_SAFETY_DEBOUNCE_MS) {
+        return 0U;
+    }
+
+    s_sbus_safety_armed = 0U;
+    return 1U;
 }
 
 static const char *sbus_quad_cmd_name(uint8_t cmd)
@@ -539,6 +587,62 @@ static void sbus_quad_rx_only(void)
     dog_debug_rx_only();
     s_mode = MODE_RX_ONLY;
     sbus_quad_reset_state();
+}
+
+static void sbus_update_switch_state(uint8_t main_sw, uint8_t sub_sw)
+{
+    s_sbus_switch_valid = 1U;
+    s_sbus_main_prev = main_sw;
+    s_sbus_sub_prev = sub_sw;
+}
+
+static uint8_t sbus_should_return_start_pose(uint8_t changed)
+{
+    if (changed == 0U) {
+        return 0U;
+    }
+    if (s_sbus_main_prev != SBUS_SWITCH_MID) {
+        return 0U;
+    }
+    if (s_sbus_quad_standing == 0U) {
+        return 0U;
+    }
+    if (s_sbus_arm_active != 0U) {
+        return 0U;
+    }
+    if (dog_mit_debug_is_active() == 0U) {
+        return 0U;
+    }
+    if (dog_mit_fault_hold_is_active() != 0U) {
+        return 0U;
+    }
+    if (dog_debug_target() != DOG_DEBUG_TARGET_ALL) {
+        return 0U;
+    }
+    return 1U;
+}
+
+static void sbus_quad_low_mode(uint8_t main_sw, uint8_t sub_sw, uint8_t changed)
+{
+    if ((s_sbus_arm_active != 0U) || (dog_mit_march_in_place_is_active() != 0U)) {
+        sbus_quad_stop_motion(changed);
+    }
+
+    if (sbus_should_return_start_pose(changed) != 0U) {
+        DebugUart_Printf("SBUS main LOW: return to start pose, then RX-only.\r\n");
+        if (dog_mit_return_to_stand_start_pose() == 0U) {
+            DebugUart_Printf("SBUS main LOW: return to start pose FAIL, RX-only fallback.\r\n");
+            sbus_quad_rx_only();
+        } else {
+            s_mode = MODE_RX_ONLY;
+            sbus_quad_reset_state();
+        }
+    } else if ((changed != 0U) || (s_sbus_arm_active != 0U)) {
+        sbus_quad_rx_only();
+        DebugUart_Printf("SBUS main LOW: RX-only, quadruped and arm TX stopped.\r\n");
+    }
+
+    sbus_update_switch_state(main_sw, sub_sw);
 }
 
 static uint8_t sbus_quad_ensure_stand(uint32_t now)
@@ -675,24 +779,15 @@ static void sbus_remote_failsafe(uint32_t now)
     }
 
     if (s_sbus_failsafe_stop_sent == 0U) {
-        DebugUart_Printf("SBUS lost/failsafe: stop gait and disable arm; estop after %ums lost.\r\n",
-                         (unsigned)SBUS_FAILSAFE_ESTOP_MS);
-        if (dog_mit_march_in_place_is_active() != 0U) {
-            dog_mit_march_in_place_stop();
-        }
+        DebugUart_Printf("SBUS lost/failsafe: disable quadruped and arm TX; no estop.\r\n");
+        sbus_quad_rx_only();
         ArmMotor_Disable();
-        s_mode = MODE_IDLE;
+        s_mode = MODE_RX_ONLY;
         s_sbus_arm_active = 0U;
         s_sbus_arm_last_ms = 0U;
-        sbus_quad_reset_state();
         s_sbus_failsafe_stop_sent = 1U;
-    }
-
-    if ((s_sbus_failsafe_estop_sent == 0U) &&
-        ((uint32_t)(now - s_sbus_lost_since_ms) >= SBUS_FAILSAFE_ESTOP_MS)) {
-        DebugUart_Printf("SBUS lost/failsafe held: estop quadruped.\r\n");
-        DogStand_Estop();
-        s_sbus_failsafe_estop_sent = 1U;
+        s_sbus_remote_lockout = 1U;
+        s_sbus_remote_lockout_logged = 0U;
     }
 
     s_sbus_seen_fresh = 0U;
@@ -711,19 +806,26 @@ static void sbus_control_update(void)
     Sbus_Process();
     (void)Sbus_GetState(&rc);
 
-    if ((rc.frame_count == 0U) || (Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS) == 0U)) {
-        if (rc.frame_count != 0U) {
-            sbus_remote_failsafe(now);
-        }
+    if (rc.frame_count == 0U) {
         return;
     }
 
-    if (s_sbus_lost_since_ms != 0U) {
-        DebugUart_Printf("SBUS restored after %lums.\r\n",
-                         (unsigned long)(now - s_sbus_lost_since_ms));
+    if (Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS) == 0U) {
+        sbus_remote_failsafe(now);
+        return;
+    }
+
+    if ((s_sbus_lost_since_ms != 0U) || (s_sbus_failsafe_stop_sent != 0U)) {
+        if (s_sbus_lost_since_ms != 0U) {
+            DebugUart_Printf("SBUS restored after %lums.\r\n",
+                             (unsigned long)(now - s_sbus_lost_since_ms));
+        } else {
+            DebugUart_Printf("SBUS restored from failsafe frames.\r\n");
+        }
         s_sbus_lost_since_ms = 0U;
         s_sbus_failsafe_stop_sent = 0U;
-        s_sbus_failsafe_estop_sent = 0U;
+        s_sbus_remote_lockout = 1U;
+        s_sbus_remote_lockout_logged = 0U;
     }
 
     const uint8_t main_sw = Sbus_Switch3(SBUS_MAIN_MODE_CH);
@@ -753,22 +855,30 @@ static void sbus_control_update(void)
             sbus_safety_trigger();
         }
         s_sbus_safety_active = 1U;
-        s_sbus_switch_valid = 1U;
-        s_sbus_main_prev = main_sw;
-        s_sbus_sub_prev = sub_sw;
+        sbus_update_switch_state(main_sw, sub_sw);
         return;
     }
     s_sbus_safety_active = 0U;
 
-    if (main_sw == SBUS_SWITCH_LOW) {
-        if ((changed != 0U) || (s_sbus_arm_active != 0U)) {
-            sbus_quad_rx_only();
-            DebugUart_Printf("SBUS main LOW: RX-only, quadruped and arm TX stopped.\r\n");
+    if (s_sbus_remote_lockout != 0U) {
+        if (main_sw == SBUS_SWITCH_LOW) {
+            s_sbus_remote_lockout = 0U;
+            s_sbus_remote_lockout_logged = 0U;
+            DebugUart_Printf("SBUS remote lockout cleared by main LOW.\r\n");
+        } else {
+            if (s_sbus_remote_lockout_logged == 0U) {
+                DebugUart_Printf("SBUS remote lockout: move main switch LOW before MID/HIGH control resumes.\r\n");
+                s_sbus_remote_lockout_logged = 1U;
+            }
+            DogRemote_Update(&sample);
+            sbus_update_switch_state(main_sw, sub_sw);
+            return;
         }
+    }
+
+    if (main_sw == SBUS_SWITCH_LOW) {
+        sbus_quad_low_mode(main_sw, sub_sw, changed);
         DogRemote_Update(&sample);
-        s_sbus_switch_valid = 1U;
-        s_sbus_main_prev = main_sw;
-        s_sbus_sub_prev = sub_sw;
         return;
     }
 
@@ -799,9 +909,7 @@ static void sbus_control_update(void)
     }
 
     DogRemote_Update(&sample);
-    s_sbus_switch_valid = 1U;
-    s_sbus_main_prev = main_sw;
-    s_sbus_sub_prev = sub_sw;
+    sbus_update_switch_state(main_sw, sub_sw);
 }
 
 static void handle_command(char c)
