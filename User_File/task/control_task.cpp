@@ -36,6 +36,10 @@
 #define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
 
+#define SBUS_SAFETY_RELEASED   0U
+#define SBUS_SAFETY_INHIBIT    1U
+#define SBUS_SAFETY_TRIGGER    2U
+
 enum ControlMode {
     MODE_RX_ONLY = 0U,
     MODE_HOLD = 1U,
@@ -130,7 +134,7 @@ static void print_help(void)
                      (long)DOG_JUMP_APEX_Z_MM);
     DebugUart_Printf("  D : LF+RB diagonal support test, RF+LB lifted, log cmdI/iq, D/x=stop\r\n");
     DebugUart_Printf("  h : MIT teach-hold, hand move then release to hold posture\r\n");
-    DebugUart_Printf("  ! : emergency stop all motors\r\n");
+    DebugUart_Printf("  ! : disable all motors (SD/CH9 is the only ESTOP input)\r\n");
     DebugUart_Printf("  z : set user zero from current encoder feedback\r\n");
     DebugUart_Printf("  x : send idle (Axis_State=1) and stop TX\r\n");
     DebugUart_Printf("  c : toggle raw CAN RX log\r\n");
@@ -252,12 +256,14 @@ static void print_sbus_status(void)
                      (int)rc.norm[SBUS_SAFETY_CH],
                      (unsigned)safety_active,
                      (unsigned)s_sbus_safety_armed);
-    DebugUart_Printf("  decoded: cmd=%s arm=%u standing=%u active_gait=%u current_speed=%s\r\n",
+    DebugUart_Printf("  decoded: cmd=%s arm=%u standing=%u active_gait=%u estop=%u disabled=%u current_speed=%s\r\n",
                      sbus_quad_cmd_name(stick_cmd),
                      (unsigned)(((main_sw == SBUS_SWITCH_MID) &&
                                  (sub_sw == SBUS_SWITCH_HIGH)) ? 1U : 0U),
                      (unsigned)s_sbus_quad_standing,
                      (unsigned)dog_mit_march_in_place_is_active(),
+                     (unsigned)DogSafety_IsLatched(),
+                     (unsigned)DogStand_IsDisabled(),
                      dog_mit_gait_speed_profile_name());
 }
 
@@ -504,15 +510,19 @@ static uint8_t sbus_safety_update(const SbusState *rc)
     if (sbus_safety_raw_is_released(rc) != 0U) {
         s_sbus_safety_armed = 1U;
         s_sbus_safety_wait_release_logged = 0U;
-        return 0U;
+        return SBUS_SAFETY_RELEASED;
     }
 
-    s_sbus_safety_armed = 0U;
-    if (s_sbus_safety_wait_release_logged == 0U) {
-        DebugUart_Printf("SBUS CH9 safety inhibit active; release it and move main LOW.\r\n");
-        s_sbus_safety_wait_release_logged = 1U;
+    if (sbus_safety_raw_is_high(rc) != 0U) {
+        s_sbus_safety_armed = 0U;
+        if (s_sbus_safety_wait_release_logged == 0U) {
+            DebugUart_Printf("SBUS CH9 safety inhibit active; release it and move main LOW.\r\n");
+            s_sbus_safety_wait_release_logged = 1U;
+        }
+        return SBUS_SAFETY_TRIGGER;
     }
-    return 1U;
+
+    return SBUS_SAFETY_INHIBIT;
 }
 
 static const char *sbus_quad_cmd_name(uint8_t cmd)
@@ -624,6 +634,8 @@ static uint8_t sbus_should_return_start_pose(uint8_t changed)
 
 static void sbus_quad_low_mode(uint8_t main_sw, uint8_t sub_sw, uint8_t changed)
 {
+    (void)DogStand_ClearDisable();
+
     if ((s_sbus_arm_active != 0U) || (dog_mit_march_in_place_is_active() != 0U)) {
         sbus_quad_stop_motion(changed);
     }
@@ -794,7 +806,7 @@ static void sbus_safety_trigger(void)
 {
     sbus_arm_leave();
     dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
-    DogSafety_SetExternalInhibit(1U);
+    DogSafety_SetSdEstop(1U);
     sbus_quad_reset_state();
     s_sbus_safety_needs_clear = 1U;
     s_sbus_safety_recovery_since_ms = 0U;
@@ -813,8 +825,8 @@ static void sbus_remote_failsafe(uint32_t now)
     }
 
     if (s_sbus_failsafe_stop_sent == 0U) {
-        DebugUart_Printf("SBUS lost/failsafe: ESTOP latched; restore signal and move main LOW to re-arm.\r\n");
-        DogSafety_SetExternalInhibit(1U);
+        DebugUart_Printf("SBUS lost/failsafe: all motors disabled; restore signal and move main LOW.\r\n");
+        DogStand_Disable();
         sbus_arm_leave();
         sbus_quad_reset_state();
         s_mode = MODE_RX_ONLY;
@@ -823,10 +835,7 @@ static void sbus_remote_failsafe(uint32_t now)
         s_sbus_failsafe_stop_sent = 1U;
         s_sbus_remote_lockout = 1U;
         s_sbus_remote_lockout_logged = 0U;
-        s_sbus_safety_needs_clear = 1U;
         s_sbus_safety_recovery_since_ms = 0U;
-    } else {
-        DogSafety_SetExternalInhibit(1U);
     }
 
     s_sbus_seen_fresh = 0U;
@@ -854,18 +863,19 @@ void control_task_safety_poll(void)
         return;
     }
 
-    if (sbus_safety_update(&rc) != 0U) {
-        if (s_sbus_safety_active == 0U) {
+    const uint8_t safety_state = sbus_safety_update(&rc);
+    if (safety_state != SBUS_SAFETY_RELEASED) {
+        if ((safety_state == SBUS_SAFETY_TRIGGER) && (DogSafety_IsLatched() == 0U)) {
             sbus_safety_trigger();
-        } else {
-            DogSafety_SetExternalInhibit(1U);
+        } else if (safety_state == SBUS_SAFETY_TRIGGER) {
+            DogSafety_SetSdEstop(1U);
         }
         s_sbus_safety_active = 1U;
         s_sbus_safety_recovery_since_ms = 0U;
         return;
     }
 
-    DogSafety_SetExternalInhibit(0U);
+    DogSafety_SetSdEstop(0U);
     s_sbus_safety_active = 0U;
 }
 
@@ -905,7 +915,7 @@ static void sbus_control_update(void)
 
     const uint8_t main_sw = Sbus_Switch3(SBUS_MAIN_MODE_CH);
     const uint8_t sub_sw = Sbus_Switch3(SBUS_SUB_MODE_CH);
-    const uint8_t safety_active = sbus_safety_update(&rc);
+    const uint8_t safety_state = sbus_safety_update(&rc);
     const uint8_t changed = ((s_sbus_switch_valid == 0U) ||
                              (main_sw != s_sbus_main_prev) ||
                              (sub_sw != s_sbus_sub_prev)) ? 1U : 0U;
@@ -925,20 +935,20 @@ static void sbus_control_update(void)
     sample.mode = (uint8_t)(main_sw * 3U + sub_sw);
     sample.tick_ms = now;
 
-    if (safety_active != 0U) {
-        if (s_sbus_safety_active == 0U) {
+    if (safety_state != SBUS_SAFETY_RELEASED) {
+        if ((safety_state == SBUS_SAFETY_TRIGGER) && (DogSafety_IsLatched() == 0U)) {
             sample.estop_request = 1U;
             DogRemote_Update(&sample);
             sbus_safety_trigger();
-        } else {
-            DogSafety_SetExternalInhibit(1U);
+        } else if (safety_state == SBUS_SAFETY_TRIGGER) {
+            DogSafety_SetSdEstop(1U);
         }
         s_sbus_safety_active = 1U;
         s_sbus_safety_recovery_since_ms = 0U;
         sbus_update_switch_state(main_sw, sub_sw);
         return;
     }
-    DogSafety_SetExternalInhibit(0U);
+    DogSafety_SetSdEstop(0U);
     s_sbus_safety_active = 0U;
 
     if ((DogSafety_IsLatched() != 0U) && (s_sbus_safety_needs_clear == 0U)) {
@@ -949,6 +959,14 @@ static void sbus_control_update(void)
         s_sbus_remote_lockout = 1U;
         s_sbus_remote_lockout_logged = 0U;
         DebugUart_Printf("Motor safety latch active; release CH9 and move main LOW to recover.\r\n");
+    }
+
+    if ((DogStand_IsDisabled() != 0U) && (s_sbus_remote_lockout == 0U)) {
+        sbus_arm_leave();
+        sbus_quad_reset_state();
+        s_sbus_remote_lockout = 1U;
+        s_sbus_remote_lockout_logged = 0U;
+        DebugUart_Printf("Motor control disabled; move main LOW before enabling again.\r\n");
     }
 
     if (s_sbus_remote_lockout != 0U) {
@@ -1069,6 +1087,7 @@ static void handle_command(char c)
         set_target(DOG_DEBUG_TARGET_ALL);
         break;
     case 'r':
+        (void)DogStand_ClearDisable();
         enter_rx_only();
         break;
     case 'e':
@@ -1099,9 +1118,9 @@ static void handle_command(char c)
         hold_current();
         break;
     case '!':
-        DogStand_Estop();
+        DogStand_Disable();
         s_mode = MODE_IDLE;
-        DebugUart_Printf("Emergency stop sent.\r\n");
+        DebugUart_Printf("All motors disabled. SD/CH9 is the only ESTOP input.\r\n");
         break;
     case 'a':
         if (dog_debug_target() != DOG_DEBUG_TARGET_SINGLE_KNEE) {
@@ -1150,6 +1169,7 @@ static void handle_command(char c)
     }
     case 'x':
         dog_debug_idle();
+        (void)DogStand_ClearDisable();
         s_mode = MODE_IDLE;
         DebugUart_Printf("Idle; MIT debug stopped.\r\n");
         break;

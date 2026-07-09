@@ -247,6 +247,7 @@ static uint8_t s_slow_query_kind[DOG_MOTOR_COUNT];
 static uint32_t s_encoder_query_last_ms = 0U;
 static volatile uint8_t s_safety_latched = 0U;
 static volatile uint8_t s_safety_external_inhibit = 0U;
+static volatile uint8_t s_control_disabled = 0U;
 static volatile uint8_t s_safety_rearm_requested = 0U;
 static volatile uint32_t s_safety_generation = 0U;
 static uint32_t s_safety_latched_ms = 0U;
@@ -279,6 +280,7 @@ static uint8_t motor_feedback_health_tick(uint32_t now);
 static void encoder_feedback_query_tick(uint32_t now);
 static uint8_t motor_blocking_service(uint32_t *now_out);
 static void queue_motor_estop(uint8_t index);
+static void DogStand_Estop(void);
 
 static float clampf(float v, float lo, float hi)
 {
@@ -395,7 +397,8 @@ static uint8_t motor_safety_token_acquire(uint32_t *generation)
         return 0U;
     }
     const uint8_t allowed = ((s_safety_latched == 0U) &&
-                             (s_safety_external_inhibit == 0U)) ? 1U : 0U;
+                             (s_safety_external_inhibit == 0U) &&
+                             (s_control_disabled == 0U)) ? 1U : 0U;
     *generation = s_safety_generation;
     motor_tx_guard_give();
     return allowed;
@@ -408,6 +411,7 @@ static uint8_t motor_safety_token_valid(uint32_t generation)
     }
     const uint8_t valid = ((s_safety_latched == 0U) &&
                            (s_safety_external_inhibit == 0U) &&
+                           (s_control_disabled == 0U) &&
                            (s_safety_generation == generation)) ? 1U : 0U;
     motor_tx_guard_give();
     return valid;
@@ -419,6 +423,7 @@ static uint8_t motor_safety_token_guard_take(uint32_t generation)
         return 0U;
     }
     if ((s_safety_latched != 0U) || (s_safety_external_inhibit != 0U) ||
+        (s_control_disabled != 0U) ||
         (s_safety_generation != generation)) {
         motor_tx_guard_give();
         return 0U;
@@ -671,8 +676,8 @@ static void mit_debug_fault_hold(void)
 
 static void mit_debug_abort_control(const char *reason)
 {
-    DebugUart_Printf("SAFETY %s -> latch ESTOP for all motors\r\n", reason);
-    DogStand_Estop();
+    DebugUart_Printf("SAFETY %s -> disable all motors\r\n", reason);
+    DogStand_Disable();
 }
 
 static uint8_t motor_closed_loop(uint8_t index)
@@ -4188,7 +4193,7 @@ uint8_t dog_debug_mit_torque_test(uint8_t bus, uint8_t node_id, float torque_nm)
         DebugUart_Printf("TqTest FAIL M%u(bus%u id%u): cl=%u\r\n",
                          (unsigned)idx, (unsigned)bus, (unsigned)node_id,
                          (unsigned)cl_result);
-        DogStand_Estop();
+        DogStand_Disable();
         return 0U;
     }
 
@@ -4197,7 +4202,7 @@ uint8_t dog_debug_mit_torque_test(uint8_t bus, uint8_t node_id, float torque_nm)
     if ((s_motor_configured[idx] == 0U) || (motor_ready(idx) == 0U) ||
         (motor_encoder_fresh(idx, now) == 0U) ||
         (motor_safety_token_valid(safety_generation) == 0U)) {
-        DogStand_Estop();
+        DogStand_Disable();
         return 0U;
     }
     s_motor_mit_probe_active[idx] = 0U;
@@ -4217,7 +4222,7 @@ uint8_t dog_debug_mit_torque_test(uint8_t bus, uint8_t node_id, float torque_nm)
         (motor_ready(idx) == 0U) ||
         (motor_encoder_fresh(idx, HAL_GetTick()) == 0U) ||
         (motor_safety_token_valid(safety_generation) == 0U)) {
-        DogStand_Estop();
+        DogStand_Disable();
         return 0U;
     }
     fdcan_poll_rx(&hfdcan1);
@@ -4507,14 +4512,14 @@ uint8_t dog_debug_mit_boot_sequence(void)
     }
 
     if (ok_count == 0U) {
-        DogStand_Estop();
+        DogStand_Disable();
         return 0U;
     }
     if (ok_count != selected_count()) {
         DebugUart_Printf("Stand FAIL: boot OK %u/%u, wait all selected motors online/ready.\r\n",
                          (unsigned)ok_count,
                          (unsigned)selected_count());
-        DogStand_Estop();
+        DogStand_Disable();
         return 0U;
     }
 
@@ -4611,14 +4616,14 @@ uint8_t dog_debug_teach_hold_start(void)
     }
 
     if (ok_count != selected_count()) {
-        DogStand_Estop();
+        DogStand_Disable();
         return 0U;
     }
 
     if ((mit_debug_settle_and_arm() == 0U) ||
         (motor_safety_token_guard_take(safety_generation) == 0U)) {
         if (s_safety_latched == 0U) {
-            DogStand_Estop();
+            DogStand_Disable();
         }
         return 0U;
     }
@@ -5260,6 +5265,10 @@ static void queue_motor_estop(uint8_t index)
     if ((index >= DOG_MOTOR_COUNT) || (motor_tx_guard_take() == 0U)) {
         return;
     }
+    if (s_safety_latched == 0U) {
+        motor_tx_guard_give();
+        return;
+    }
     s_estop_pending_mask |= (uint8_t)(1U << index);
     service_estop_pending_locked();
     motor_tx_guard_give();
@@ -5326,12 +5335,94 @@ static uint8_t all_leg_motors_clear_confirmed(void)
     return 1U;
 }
 
-void DogStand_Estop(void)
+void DogStand_Disable(void)
+{
+    if (motor_tx_guard_take() == 0U) {
+        ArmMotor_Disable();
+        return;
+    }
+
+    if (s_safety_latched != 0U) {
+        motor_tx_guard_give();
+        ArmMotor_Disable();
+        return;
+    }
+
+    /* Invalidate in-flight control work before removing queued motor commands. */
+    s_safety_generation++;
+    s_control_disabled = 1U;
+    s_position_tx_enabled = 0U;
+    s_position_tx_arm_pending_mask = 0U;
+    s_position_tx_arm_started_ms = 0U;
+    s_mit_debug_active = 0U;
+    s_mit_fault_hold_active = 0U;
+    s_mit_torque_test_active = 0U;
+    s_mit_torque_test_index = DOG_MOTOR_COUNT;
+    s_mit_torque_test_nm = 0.0f;
+    s_jump_active = 0U;
+    s_auto_stand_enabled = 0U;
+    s_diag_support_active = 0U;
+    s_last_command_tick_ms = 0U;
+    s_mit_last_pid_ms = 0U;
+    s_stand_state = DOG_STAND_IDLE;
+    memset(&s_march, 0, sizeof(s_march));
+    memset(s_leg_foot_x_offset, 0, sizeof(s_leg_foot_x_offset));
+    memset(s_leg_hip_offset_deg, 0, sizeof(s_leg_hip_offset_deg));
+    memset(s_motor_configured, 0, sizeof(s_motor_configured));
+    memset(s_motor_loop_requested, 0, sizeof(s_motor_loop_requested));
+    memset(s_motor_final_mode_pending, 0, sizeof(s_motor_final_mode_pending));
+    memset(s_motor_mit_probe_active, 0, sizeof(s_motor_mit_probe_active));
+    memset(s_position_idle_encoder_rx_baseline, 0, sizeof(s_position_idle_encoder_rx_baseline));
+    memset(s_mit_boot_ok, 0, sizeof(s_mit_boot_ok));
+    mit_clear_mixed_pid();
+    teach_hold_stop();
+    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        s_target_deg[i] = user_deg(i);
+        s_target_turn[i] = g_mw_motor_data[i].encoderEstimates.encoderPosEstimate;
+        mit_reset_motor_integrator(i);
+    }
+
+    (void)fdcan_abort_all_tx(&hfdcan1);
+    (void)fdcan_abort_all_tx(&hfdcan2);
+    motor_tx_guard_give();
+
+    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        MWSetAxisState(g_dog_motor_config[i].bus,
+                       g_dog_motor_config[i].node_id,
+                       MW_AXIS_STATE_IDLE);
+    }
+    ArmMotor_Disable();
+}
+
+uint8_t DogStand_ClearDisable(void)
+{
+    if (motor_tx_guard_take() == 0U) {
+        return 0U;
+    }
+    if ((s_safety_latched != 0U) || (s_safety_external_inhibit != 0U)) {
+        motor_tx_guard_give();
+        return 0U;
+    }
+    if (s_control_disabled != 0U) {
+        s_control_disabled = 0U;
+        s_safety_generation++;
+    }
+    motor_tx_guard_give();
+    return 1U;
+}
+
+uint8_t DogStand_IsDisabled(void)
+{
+    return s_control_disabled;
+}
+
+static void DogStand_Estop(void)
 {
     const uint32_t now = HAL_GetTick();
     if (motor_tx_guard_take() != 0U) {
         s_safety_generation++;
         s_safety_latched = 1U;
+        s_control_disabled = 1U;
         s_safety_rearm_requested = 0U;
         s_safety_latched_ms = now;
         s_safety_clear_started_ms = 0U;
@@ -5347,6 +5438,7 @@ void DogStand_Estop(void)
         __disable_irq();
         s_safety_generation++;
         s_safety_latched = 1U;
+        s_control_disabled = 1U;
         s_safety_rearm_requested = 0U;
         s_safety_latched_ms = now;
         s_safety_clear_started_ms = 0U;
@@ -5374,7 +5466,7 @@ uint8_t DogSafety_IsLatched(void)
     return s_safety_latched;
 }
 
-void DogSafety_SetExternalInhibit(uint8_t active)
+void DogSafety_SetSdEstop(uint8_t active)
 {
     const uint8_t inhibit = (active != 0U) ? 1U : 0U;
     uint8_t trigger_estop = 0U;
@@ -5668,6 +5760,7 @@ void motor_task_init(void)
     memset(s_encoder_turn_valid, 0, sizeof(s_encoder_turn_valid));
     s_safety_latched = 0U;
     s_safety_external_inhibit = 0U;
+    s_control_disabled = 0U;
     s_safety_rearm_requested = 0U;
     s_safety_generation = 0U;
     s_safety_latched_ms = 0U;
@@ -5691,8 +5784,8 @@ void motor_task_init(void)
 
     dog_debug_rx_only();
     if ((system_can[0] == false) || (system_can[1] == false)) {
-        DebugUart_Printf("FDCAN init failed: control remains safety-latched.\r\n");
-        DogStand_Estop();
+        DebugUart_Printf("FDCAN init failed: all motors disabled.\r\n");
+        DogStand_Disable();
         return;
     }
     DebugUart_Printf("quadruped SDK debug: CAN1 front nodes=1..4 CAN2 rear nodes=1..4 arm J0_DM=0x01/0x10 J1_EL05=0x7F disabled\r\n");

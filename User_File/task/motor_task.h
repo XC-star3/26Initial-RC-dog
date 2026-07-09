@@ -365,12 +365,14 @@ void dog_motor_query_online_encoders(void);
 void DogImu_Update(const Dog_Imu_Sample *sample);
 void DogRemote_Update(const Dog_Remote_Sample *sample);
 void DogStand_Request(void);
-void DogStand_Estop(void);
+void DogStand_Disable(void);
+uint8_t DogStand_ClearDisable(void);
+uint8_t DogStand_IsDisabled(void);
 Dog_Stand_State DogStand_GetState(void);
 uint8_t DogStand_GetOnlineMask(void);
 uint8_t DogStand_GetReadyMask(void);
 uint8_t DogSafety_IsLatched(void);
-void DogSafety_SetExternalInhibit(uint8_t active);
+void DogSafety_SetSdEstop(uint8_t active);
 uint8_t DogSafety_RequestRearm(void);
 
 void motor_task_init(void);
