@@ -22,8 +22,9 @@
 #define SBUS_ARM_J0_MAX_DEG    90.0f
 #define SBUS_ARM_J1_MIN_DEG    (-90.0f)
 #define SBUS_ARM_J1_MAX_DEG    90.0f
-#define SBUS_MOVE_ENTER_DEADBAND 30
-#define SBUS_MOVE_EXIT_DEADBAND  15
+#define SBUS_MOVE_ENTER_DEADBAND 25
+#define SBUS_MOVE_EXIT_DEADBAND  12
+#define SBUS_ARM_JOG_DEADBAND    8
 #define SBUS_SPEED_LOW_NORM    (-60)
 #define SBUS_SPEED_HIGH_NORM   60
 #define SBUS_SAFETY_CH         8U
@@ -355,6 +356,14 @@ static fp32 clamp_fp32_local(fp32 value, fp32 min_value, fp32 max_value)
     return value;
 }
 
+static int16_t sbus_apply_deadband(int16_t value, int16_t deadband)
+{
+    if ((value > -deadband) && (value < deadband)) {
+        return 0;
+    }
+    return value;
+}
+
 static const char *sbus_switch_name(uint8_t sw)
 {
     switch (sw) {
@@ -431,9 +440,13 @@ static void sbus_arm_update(const SbusState *rc, uint32_t now)
     }
     s_sbus_arm_last_ms = now;
 
-    const fp32 j0_delta_deg = ((fp32)rc->norm[SBUS_ARM_J0_CH] / 100.0f) *
+    const int16_t j0_norm = sbus_apply_deadband(rc->norm[SBUS_ARM_J0_CH],
+                                                SBUS_ARM_JOG_DEADBAND);
+    const int16_t j1_norm = sbus_apply_deadband(rc->norm[SBUS_ARM_J1_CH],
+                                                SBUS_ARM_JOG_DEADBAND);
+    const fp32 j0_delta_deg = ((fp32)j0_norm / 100.0f) *
                               SBUS_ARM_RATE_DEG_S * dt_s;
-    const fp32 j1_delta_deg = ((fp32)rc->norm[SBUS_ARM_J1_CH] / 100.0f) *
+    const fp32 j1_delta_deg = ((fp32)j1_norm / 100.0f) *
                               SBUS_ARM_RATE_DEG_S * dt_s;
 
     s_sbus_arm_j0_target_deg = clamp_fp32_local(s_sbus_arm_j0_target_deg + j0_delta_deg,

@@ -190,9 +190,9 @@ struct Dog_Gait_Speed_Profile {
 };
 
 static const Dog_Gait_Speed_Profile s_gait_speed_profiles[] = {
-    {"LOW",  1.5f, 50.0f, 22.0f},
+    {"LOW",  DOG_TROT_HZ, DOG_FORWARD_STRIDE_X_MM, DOG_TURN_STRIDE_X_MM},
     {"MID",  DOG_TROT_HZ, DOG_FORWARD_STRIDE_X_MM, DOG_TURN_STRIDE_X_MM},
-    {"HIGH", 2.5f, 85.0f, 38.0f},
+    {"HIGH", 3.0f, DOG_FORWARD_STRIDE_X_MM, DOG_TURN_STRIDE_X_MM},
 };
 
 static float s_leg_foot_x_offset[DOG_LEG_COUNT] = {};
