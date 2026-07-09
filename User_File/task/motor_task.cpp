@@ -40,6 +40,8 @@ extern FDCAN_HandleTypeDef hfdcan2;
 #define DOG_CAN_RECOVERY_PERIOD_MS      10U
 #define DOG_ENCODER_WAIT_MS            300U
 #define DOG_ENCODER_TORQUE_WAIT_MS     500U
+#define DOG_MIT_BOOT_TX_TIMEOUT_MS     100U
+#define DOG_MIT_BOOT_BUS_QUIET_MS        6U
 #define DOG_CLOSED_LOOP_RETRY_MS       200U
 #define DOG_CLOSED_LOOP_RETRY_SLOT_MS  (DOG_CLOSED_LOOP_RETRY_MS / DOG_MOTOR_COUNT)
 #define DOG_SAFETY_RETRY_PERIOD_MS     100U
@@ -244,7 +246,9 @@ static uint8_t s_motor_can_id_type[DOG_MOTOR_COUNT];
 static uint8_t s_encoder_query_cursor[2];
 static uint8_t s_slow_query_cursor[2];
 static uint8_t s_slow_query_kind[DOG_MOTOR_COUNT];
+static uint8_t s_mit_probe_keepalive_cursor[2];
 static uint32_t s_encoder_query_last_ms = 0U;
+static volatile uint8_t s_mit_probe_tx_busy_mask = 0U;
 static volatile uint8_t s_safety_latched = 0U;
 static volatile uint8_t s_safety_external_inhibit = 0U;
 static volatile uint8_t s_control_disabled = 0U;
@@ -279,6 +283,7 @@ static void motor_safety_tick(uint32_t now);
 static uint8_t motor_feedback_health_tick(uint32_t now);
 static void encoder_feedback_query_tick(uint32_t now);
 static uint8_t motor_blocking_service(uint32_t *now_out);
+static uint8_t mit_probe_bus_tx_busy(uint8_t bus);
 static void queue_motor_estop(uint8_t index);
 static void DogStand_Estop(void);
 
@@ -1330,6 +1335,10 @@ static void send_mit_torque_test_keepalive(uint32_t now)
     }
 
     const uint8_t index = s_mit_torque_test_index;
+    if ((index < DOG_MOTOR_COUNT) &&
+        (mit_probe_bus_tx_busy(g_dog_motor_config[index].bus) != 0U)) {
+        return;
+    }
     const uint8_t heartbeat_fresh = ((index < DOG_MOTOR_COUNT) &&
         (s_last_heartbeat_tick_ms[index] != 0U) &&
         ((uint32_t)(now - s_last_heartbeat_tick_ms[index]) <= DOG_HEARTBEAT_TIMEOUT_MS)) ? 1U : 0U;
@@ -1364,9 +1373,23 @@ static void send_mit_probe_keepalive(uint32_t now)
     }
     s_last_ms = now;
 
-    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
-        if ((s_motor_mit_probe_active[i] != 0U) && (motor_closed_loop(i) != 0U)) {
-            send_mit_zero_effort(i, 0.0f);
+    const uint8_t buses[2U] = {DOG_CAN_FRONT_BUS, DOG_CAN_REAR_BUS};
+    for (uint8_t di = 0U; di < 2U; ++di) {
+        const uint8_t bus_mask = (uint8_t)(1U << di);
+        if ((s_mit_probe_tx_busy_mask & bus_mask) != 0U) {
+            continue;
+        }
+
+        const uint8_t start = (uint8_t)(s_mit_probe_keepalive_cursor[di] % DOG_MOTOR_COUNT);
+        for (uint8_t offset = 0U; offset < DOG_MOTOR_COUNT; ++offset) {
+            const uint8_t index = (uint8_t)((start + offset) % DOG_MOTOR_COUNT);
+            if ((g_dog_motor_config[index].bus == buses[di]) &&
+                (s_motor_mit_probe_active[index] != 0U) &&
+                (motor_closed_loop(index) != 0U)) {
+                s_mit_probe_keepalive_cursor[di] = (uint8_t)((index + 1U) % DOG_MOTOR_COUNT);
+                send_mit_zero_effort(index, 0.0f);
+                break;
+            }
         }
     }
 }
@@ -1386,6 +1409,126 @@ static uint8_t motor_blocking_service(uint32_t *now_out)
         *now_out = now;
     }
     return ((feedback_ok != 0U) && (s_safety_latched == 0U)) ? 1U : 0U;
+}
+
+static uint8_t mit_probe_bus_mask(uint8_t bus)
+{
+    if (bus == DOG_CAN_FRONT_BUS) {
+        return 0x01U;
+    }
+    if (bus == DOG_CAN_REAR_BUS) {
+        return 0x02U;
+    }
+    return 0U;
+}
+
+static uint8_t mit_probe_bus_tx_busy(uint8_t bus)
+{
+    const uint8_t mask = mit_probe_bus_mask(bus);
+    return ((mask != 0U) && ((s_mit_probe_tx_busy_mask & mask) != 0U)) ? 1U : 0U;
+}
+
+static void mit_probe_tx_window_end(uint8_t bus)
+{
+    const uint8_t mask = mit_probe_bus_mask(bus);
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s_mit_probe_tx_busy_mask &= (uint8_t)~mask;
+    __set_PRIMASK(primask);
+}
+
+static uint8_t mit_probe_tx_window_wait(uint8_t bus, uint32_t quiet_ms)
+{
+    FDCAN_HandleTypeDef *h = bus_handle(bus);
+    if (h == nullptr) {
+        return 0U;
+    }
+
+    const uint32_t fifo_capacity = h->Init.TxFifoQueueElmtsNbr;
+    if (fifo_capacity == 0U) {
+        return 0U;
+    }
+
+    const uint32_t wait_started_ms = HAL_GetTick();
+    while (fdcan_tx_free_level(h) < fifo_capacity) {
+        if ((uint32_t)(HAL_GetTick() - wait_started_ms) >= DOG_MIT_BOOT_TX_TIMEOUT_MS) {
+            return 0U;
+        }
+        if (motor_blocking_service(nullptr) == 0U) {
+            return 0U;
+        }
+        HAL_Delay(1U);
+    }
+
+    const uint32_t quiet_started_ms = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - quiet_started_ms) < quiet_ms) {
+        if (motor_blocking_service(nullptr) == 0U) {
+            return 0U;
+        }
+        HAL_Delay(1U);
+    }
+    return 1U;
+}
+
+static uint8_t mit_probe_tx_window_begin(uint8_t bus)
+{
+    const uint8_t mask = mit_probe_bus_mask(bus);
+    if (mask == 0U) {
+        return 0U;
+    }
+
+    const uint32_t acquire_started_ms = HAL_GetTick();
+    while (1) {
+        uint8_t acquired = 0U;
+        const uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        if ((s_mit_probe_tx_busy_mask & mask) == 0U) {
+            s_mit_probe_tx_busy_mask |= mask;
+            acquired = 1U;
+        }
+        __set_PRIMASK(primask);
+
+        if (acquired != 0U) {
+            break;
+        }
+        if ((uint32_t)(HAL_GetTick() - acquire_started_ms) >= DOG_MIT_BOOT_TX_TIMEOUT_MS) {
+            return 0U;
+        }
+        if (motor_blocking_service(nullptr) == 0U) {
+            return 0U;
+        }
+        HAL_Delay(1U);
+    }
+
+    if (mit_probe_tx_window_wait(bus, 0U) == 0U) {
+        mit_probe_tx_window_end(bus);
+        return 0U;
+    }
+    return 1U;
+}
+
+static uint8_t mit_probe_tx_window_finish(uint8_t bus, uint32_t quiet_ms)
+{
+    const uint8_t ok = mit_probe_tx_window_wait(bus, quiet_ms);
+    mit_probe_tx_window_end(bus);
+    return ok;
+}
+
+static uint8_t configure_motor_mit_for_boot(uint8_t index)
+{
+    if (index >= DOG_MOTOR_COUNT) {
+        return 0U;
+    }
+
+    const uint8_t bus = g_dog_motor_config[index].bus;
+    if (mit_probe_tx_window_begin(bus) == 0U) {
+        return 0U;
+    }
+
+    configure_motor_mit(index);
+    const uint8_t configured = s_motor_configured[index];
+    const uint8_t drained = mit_probe_tx_window_finish(bus, DOG_MIT_BOOT_BUS_QUIET_MS);
+    return ((configured != 0U) && (drained != 0U)) ? 1U : 0U;
 }
 
 static uint8_t wait_motor_encoder(uint8_t index, uint32_t timeout_ms)
@@ -1425,6 +1568,13 @@ static uint8_t enter_mit_probe_closed_loop(uint8_t index)
 
     Dog_Motor_Config *cfg = &g_dog_motor_config[index];
     const uint8_t di = bus_to_diag_index(cfg->bus);
+    if (mit_probe_tx_window_begin(cfg->bus) == 0U) {
+        return 0U;
+    }
+    if (motor_safety_token_valid(safety_generation) == 0U) {
+        mit_probe_tx_window_end(cfg->bus);
+        return 0U;
+    }
     const uint32_t drops_before = s_can_tx_drop_count[di];
     MWSetLimits(cfg->bus, cfg->node_id,
                 g_dog_mit_motor_limits.vel_limit_turn_s,
@@ -1437,6 +1587,7 @@ static uint8_t enter_mit_probe_closed_loop(uint8_t index)
             queue_motor_estop(index);
         }
         s_motor_mit_probe_active[index] = 0U;
+        mit_probe_tx_window_end(cfg->bus);
         return 0U;
     }
 
@@ -1444,6 +1595,11 @@ static uint8_t enter_mit_probe_closed_loop(uint8_t index)
     if ((s_can_tx_drop_count[di] != drops_before) ||
         (motor_safety_token_valid(safety_generation) == 0U)) {
         queue_motor_estop(index);
+        s_motor_mit_probe_active[index] = 0U;
+        mit_probe_tx_window_end(cfg->bus);
+        return 0U;
+    }
+    if (mit_probe_tx_window_finish(cfg->bus, 0U) == 0U) {
         s_motor_mit_probe_active[index] = 0U;
         return 0U;
     }
@@ -4491,7 +4647,9 @@ uint8_t dog_debug_mit_boot_sequence(void)
 
         s_target_turn[idx] = s_zero_offset_turn[idx];
         s_target_deg[idx] = 0.0f;
-        configure_motor_mit(idx);
+        if (configure_motor_mit_for_boot(idx) == 0U) {
+            continue;
+        }
         s_mit_boot_ok[idx] = 1U;
         ok_count++;
 
@@ -5708,6 +5866,9 @@ static void encoder_feedback_query_tick(uint32_t now)
     s_encoder_query_last_ms = now;
     const uint8_t buses[2U] = {DOG_CAN_FRONT_BUS, DOG_CAN_REAR_BUS};
     for (uint8_t di = 0U; di < 2U; ++di) {
+        if (mit_probe_bus_tx_busy(buses[di]) != 0U) {
+            continue;
+        }
         const uint8_t index = next_online_motor_on_bus(buses[di], &s_encoder_query_cursor[di]);
         if (index < DOG_MOTOR_COUNT) {
             mw_query_encoder_estimate(index);
@@ -5748,7 +5909,9 @@ void motor_task_init(void)
     memset(s_encoder_query_cursor, 0, sizeof(s_encoder_query_cursor));
     memset(s_slow_query_cursor, 0, sizeof(s_slow_query_cursor));
     memset(s_slow_query_kind, 0, sizeof(s_slow_query_kind));
+    memset(s_mit_probe_keepalive_cursor, 0, sizeof(s_mit_probe_keepalive_cursor));
     s_encoder_query_last_ms = 0U;
+    s_mit_probe_tx_busy_mask = 0U;
     s_position_tx_arm_pending_mask = 0U;
     s_position_tx_arm_started_ms = 0U;
     s_can_tx_drop_count[0] = 0U;
@@ -5819,6 +5982,7 @@ void motor_task(void)
         const uint8_t index = s_closed_loop_retry_cursor;
         s_closed_loop_retry_cursor = (uint8_t)((s_closed_loop_retry_cursor + 1U) % DOG_MOTOR_COUNT);
         if ((s_motor_loop_requested[index] != 0U) &&
+            (mit_probe_bus_tx_busy(g_dog_motor_config[index].bus) == 0U) &&
             (motor_heartbeat_fresh(index, now) != 0U) &&
             (motor_has_fault(index) == 0U) &&
             ((s_motor_final_mode_pending[index] != DOG_FINAL_MODE_NONE) ||
@@ -5844,6 +6008,7 @@ void motor_task(void)
 
     static uint32_t s_arm_cmd_last_ms = 0U;
     if ((s_safety_latched == 0U) &&
+        (mit_probe_bus_tx_busy(DOG_CAN_FRONT_BUS) == 0U) &&
         ((uint32_t)(now - s_arm_cmd_last_ms) >= ARM_CMD_PERIOD_MS) &&
         (fdcan_tx_free_level(&hfdcan1) >= 2U)) {
         s_arm_cmd_last_ms = now;
@@ -5855,6 +6020,9 @@ void motor_task(void)
         s_slow_feedback_last_ms = now;
         const uint8_t buses[2U] = {DOG_CAN_FRONT_BUS, DOG_CAN_REAR_BUS};
         for (uint8_t di = 0U; di < 2U; ++di) {
+            if (mit_probe_bus_tx_busy(buses[di]) != 0U) {
+                continue;
+            }
             const uint8_t index = next_online_motor_on_bus(buses[di], &s_slow_query_cursor[di]);
             if (index >= DOG_MOTOR_COUNT) {
                 continue;
