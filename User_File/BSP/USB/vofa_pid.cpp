@@ -1,6 +1,7 @@
 #include "vofa_pid.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -102,7 +103,7 @@ static void vofa_apply_ang_param(Dog_Mit_Ang_Pid *pid, const char *field, float 
 
 static void vofa_apply_param(const char *name, float value)
 {
-    if (name == nullptr) {
+    if ((name == nullptr) || (!isfinite(value))) {
         return;
     }
 

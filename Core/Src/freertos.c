@@ -51,6 +51,7 @@ typedef StaticTask_t osStaticThreadDef_t;
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 static volatile uint8_t s_app_ready = 0U;
+static volatile uint8_t s_motor_ready = 0U;
 
 /* USER CODE END Variables */
 /* Definitions for Start_INS_Task */
@@ -182,6 +183,8 @@ void Control_Task(void *argument)
   DebugUart_Init();
   BoardRgb_SetColor(0U, 255U, 0U);
   DebugUart_Printf("quadruped SDK debug boot ok, CAN1 front nodes=1..4 CAN2 rear nodes=1..4\r\n");
+  motor_task_init();
+  s_motor_ready = 1U;
   control_task_init();
   s_app_ready = 1U;
 
@@ -205,7 +208,11 @@ void CAN_Task(void *argument)
 {
   /* USER CODE BEGIN CAN_Task */
   (void)argument;
+  while (s_motor_ready == 0U) {
+    osDelay(1);
+  }
   while (s_app_ready == 0U) {
+    motor_can_rx_tick();
     osDelay(1);
   }
 
@@ -221,4 +228,3 @@ void CAN_Task(void *argument)
 /* USER CODE BEGIN Application */
 
 /* USER CODE END Application */
-

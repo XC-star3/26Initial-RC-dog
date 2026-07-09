@@ -9,7 +9,9 @@ static constexpr fp32 kPi = 3.14159265358979323846f;
 static constexpr fp32 kDegToRad = kPi / 180.0f;
 static constexpr fp32 kRadToDeg = 180.0f / kPi;
 static constexpr fp32 kRadSToRpm = 60.0f / (2.0f * kPi);
-static constexpr fp32 kControlDtSec = 0.001f;
+static constexpr fp32 kControlNominalDtSec = 0.005f;
+static constexpr fp32 kControlMaxDtSec = 0.050f;
+static constexpr uint32_t kFeedbackTimeoutMs = 100U;
 
 struct J0PidState {
     ArmMotorPidConfig config;
@@ -56,6 +58,8 @@ static uint16_t s_j0_dm_id = 0U;
 static uint16_t s_j0_dm_feedback_id = 0U;
 static uint16_t s_j1_lz_id = 0U;
 static uint8_t s_initialized = 0U;
+static uint32_t s_last_send_ms = 0U;
+static uint32_t s_last_feedback_ms[ARM_JOINT_COUNT] = {};
 static ArmMotorFeedback s_feedback[ARM_JOINT_COUNT] = {};
 static J0Controller s_j0_ctrl = {
     0.0f,
@@ -94,6 +98,17 @@ static fp32 clamp_fp32(fp32 value, fp32 min_value, fp32 max_value)
     return value;
 }
 
+static void refresh_feedback_age(uint32_t now)
+{
+    for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
+        if ((s_feedback[joint].online != 0U) &&
+            ((s_last_feedback_ms[joint] == 0U) ||
+             ((uint32_t)(now - s_last_feedback_ms[joint]) > kFeedbackTimeoutMs))) {
+            s_feedback[joint].online = 0U;
+        }
+    }
+}
+
 static void pid_clear(J0PidState *pid)
 {
     if (pid == nullptr) {
@@ -103,17 +118,17 @@ static void pid_clear(J0PidState *pid)
     pid->last_error = 0.0f;
 }
 
-static fp32 pid_calculate(J0PidState *pid, fp32 error)
+static fp32 pid_calculate(J0PidState *pid, fp32 error, fp32 dt_s)
 {
     if (pid == nullptr) {
         return 0.0f;
     }
 
     const fp32 p_out = pid->config.kp * error;
-    const fp32 d_out = pid->config.kd * (error - pid->last_error) / kControlDtSec;
+    const fp32 d_out = pid->config.kd * (error - pid->last_error) / dt_s;
     fp32 out = p_out + pid->integral + d_out;
 
-    fp32 delta_i = pid->config.ki * error * kControlDtSec;
+    fp32 delta_i = pid->config.ki * error * dt_s;
     if ((out >= pid->config.max_out && delta_i > 0.0f) ||
         (out <= -pid->config.max_out && delta_i < 0.0f)) {
         delta_i = 0.0f;
@@ -249,6 +264,9 @@ void ArmMotor_Init(FDCAN_HandleTypeDef *j0_dm_can,
     s_j1_ctrl.first_set_angle = 1U;
     j0_lock_target_to_measure();
     j1_lock_target_to_measure();
+    s_last_send_ms = 0U;
+    s_last_feedback_ms[ARM_J0_DM4310] = 0U;
+    s_last_feedback_ms[ARM_J1_LZ] = 0U;
     s_initialized = 1U;
 }
 
@@ -423,7 +441,7 @@ void ArmMotor_SetJ1MasterId(uint8_t master_id)
     s_j1_lz.set_master_id(master_id);
 }
 
-static fp32 j0_calculate_torque(void)
+static fp32 j0_calculate_torque(fp32 dt_s)
 {
     if ((s_j0_ctrl.enabled == 0U) || (s_feedback[ARM_J0_DM4310].online == 0U)) {
         j0_lock_target_to_measure();
@@ -443,9 +461,9 @@ static fp32 j0_calculate_torque(void)
     const fp32 current_angle_deg = s_feedback[ARM_J0_DM4310].angle_deg;
     const fp32 current_speed_rpm = s_feedback[ARM_J0_DM4310].vel_rad_s * kRadSToRpm;
     const fp32 angle_error_deg = s_j0_ctrl.target_angle_deg - current_angle_deg;
-    const fp32 speed_outer_rpm = pid_calculate(&s_j0_ctrl.angle_pid, angle_error_deg);
+    const fp32 speed_outer_rpm = pid_calculate(&s_j0_ctrl.angle_pid, angle_error_deg, dt_s);
     const fp32 speed_error_rpm = speed_outer_rpm + s_j0_ctrl.speed_ff_rpm - current_speed_rpm;
-    fp32 torque_nm = pid_calculate(&s_j0_ctrl.speed_pid, speed_error_rpm) + s_j0_ctrl.torque_ff_nm;
+    fp32 torque_nm = pid_calculate(&s_j0_ctrl.speed_pid, speed_error_rpm, dt_s) + s_j0_ctrl.torque_ff_nm;
 
     if (s_j0_ctrl.gravity_enable != 0U) {
         const fp32 angle_diff_rad = (current_angle_deg - s_j0_ctrl.gravity_horizontal_deg) * kDegToRad;
@@ -463,8 +481,26 @@ void ArmMotor_Send(void)
         return;
     }
 
+    const uint32_t now = HAL_GetTick();
+    refresh_feedback_age(now);
+    if (((s_j0_ctrl.enabled != 0U) || (s_j1_ctrl.enabled != 0U)) &&
+        ((s_feedback[ARM_J0_DM4310].online == 0U) ||
+         (s_feedback[ARM_J1_LZ].online == 0U))) {
+        ArmMotor_Disable();
+        return;
+    }
+
+    fp32 dt_s = kControlNominalDtSec;
+    if (s_last_send_ms != 0U) {
+        dt_s = (fp32)(now - s_last_send_ms) * 0.001f;
+        if ((dt_s <= 0.0f) || (dt_s > kControlMaxDtSec)) {
+            dt_s = kControlNominalDtSec;
+        }
+    }
+    s_last_send_ms = now;
+
     if (s_j0_ctrl.enabled != 0U) {
-        const fp32 j0_torque_nm = j0_calculate_torque();
+        const fp32 j0_torque_nm = j0_calculate_torque(dt_s);
         s_j0_dm4310.can_send_torque_only(j0_torque_nm, s_j0_ctrl.invert);
     }
 
@@ -491,6 +527,7 @@ uint8_t ArmMotor_OnCanRx(FDCAN_HandleTypeDef *hfdcan, const FDCAN_RxHeaderTypeDe
             (feedback_node == (uint8_t)(s_j0_dm_id & 0x0FU))) {
             s_j0_dm4310.can_recv(data);
             copy_dm_feedback();
+            s_last_feedback_ms[ARM_J0_DM4310] = HAL_GetTick();
             return 1U;
         }
     }
@@ -505,6 +542,7 @@ uint8_t ArmMotor_OnCanRx(FDCAN_HandleTypeDef *hfdcan, const FDCAN_RxHeaderTypeDe
             ((lz_mode == CANCOM_MODE_ACTIVE_RECV) || (lz_mode == CANCOM_MOTOR_FEEDBACK))) {
             s_j1_lz.can_recv(header->Identifier, data);
             copy_lz_feedback();
+            s_last_feedback_ms[ARM_J1_LZ] = HAL_GetTick();
             return 1U;
         }
     }
@@ -517,6 +555,7 @@ uint8_t ArmMotor_GetFeedback(uint8_t joint, ArmMotorFeedback *feedback)
     if ((joint >= ARM_JOINT_COUNT) || (feedback == nullptr)) {
         return 0U;
     }
+    refresh_feedback_age(HAL_GetTick());
     *feedback = s_feedback[joint];
     return s_feedback[joint].online;
 }

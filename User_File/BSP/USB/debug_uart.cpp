@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cmsis_os2.h"
 #include "stm32h7xx_hal.h"
 #include "usbd_cdc_if.h"
 #include "usbd_def.h"
@@ -202,7 +203,11 @@ uint8_t DebugUart_WaitForHost(uint32_t timeout_ms)
             return 1U;
         }
         DebugUart_Process();
-        HAL_Delay(10U);
+        if (osKernelGetState() == osKernelRunning) {
+            osDelay(10U);
+        } else {
+            HAL_Delay(10U);
+        }
     }
 
     return DebugUart_IsHostOpen();

@@ -67,16 +67,16 @@ extern "C" {
 #define DOG_IK_CAL_B_FOOT_X_MM            80.0f
 #define DOG_IK_CAL_B_FOOT_Z_MM            110.0f
 
-#define DOG_MARCH_LIFT_Z_MM             60.0f
+#define DOG_MARCH_LIFT_Z_MM             60.0f    /* positive clearance, subtracted from +Z-down touch-down */
 #define DOG_DIAG_SUPPORT_LIFT_Z_MM      DOG_MARCH_LIFT_Z_MM
 #define DOG_TROT_FOOT_X1_MM             0.0f
 #define DOG_TROT_FOOT_X2_MM             70.0f    /* body-forward step length magnitude */
 #define DOG_TROT_FOOT_Z1_MM             0.0f     /* relative to per-leg stand touch-down Z */
-#define DOG_TROT_FOOT_Z2_MM             40.0f    /* swing clearance above per-leg stand Z */
+#define DOG_TROT_FOOT_Z2_MM             40.0f    /* positive swing clearance in the +Z-down frame */
 #define DOG_TROT_FORWARD_X_SIGN         (-1.0f)  /* flip to +1 if trot direction is reversed on hardware */
 #define DOG_TROT_YAW_TRIM_X_MM           0.0f
 #define DOG_FORWARD_STRIDE_X_MM         (DOG_TROT_FOOT_X2_MM - DOG_TROT_FOOT_X1_MM)
-#define DOG_FORWARD_SWING_LIFT_Z_MM     (DOG_TROT_FOOT_Z2_MM - DOG_TROT_FOOT_Z1_MM)
+#define DOG_FORWARD_SWING_LIFT_Z_MM     DOG_TROT_FOOT_Z2_MM
 #define DOG_FORWARD_HIP_STEP_DEG        5.0f
 #define DOG_FORWARD_SWING_HIP_DEG       8.0f
 #define DOG_FORWARD_SWING_KNEE_DEG      (-20.0f)
@@ -208,6 +208,7 @@ struct Dog_Can_Diag {
     uint32_t rx_reject_format;
     uint32_t rx_reject_node;
     uint32_t rx_reject_nodata;
+    uint32_t tx_drop_count;
 };
 
 struct Dog_Motor_Config {
@@ -368,6 +369,9 @@ void DogStand_Estop(void);
 Dog_Stand_State DogStand_GetState(void);
 uint8_t DogStand_GetOnlineMask(void);
 uint8_t DogStand_GetReadyMask(void);
+uint8_t DogSafety_IsLatched(void);
+void DogSafety_SetExternalInhibit(uint8_t active);
+uint8_t DogSafety_RequestRearm(void);
 
 void motor_task_init(void);
 void motor_task(void);

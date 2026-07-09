@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+void motor_task_init(void);
+void motor_can_rx_tick(void);
 void motor_task_tick(void);
 
 #ifdef __cplusplus

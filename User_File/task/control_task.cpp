@@ -7,6 +7,8 @@
 #include "tim.h"
 #include "vofa_pid.h"
 
+#include "cmsis_os2.h"
+
 #define DEBUG_LF_STATUS_MS 1000U
 #define STEP_DEG           30.0f
 
@@ -17,6 +19,7 @@
 #define SBUS_ARM_J0_CH         5U
 #define SBUS_ARM_J1_CH         6U
 #define SBUS_ARM_UPDATE_MS     20U
+#define SBUS_ARM_RETRY_MS      500U
 #define SBUS_ARM_RATE_DEG_S    30.0f
 #define SBUS_ARM_J0_MIN_DEG    (-60.0f)
 #define SBUS_ARM_J0_MAX_DEG    90.0f
@@ -30,7 +33,7 @@
 #define SBUS_SAFETY_CH         8U
 #define SBUS_SAFETY_HIGH_NORM  50
 #define SBUS_SAFETY_RELEASE_NORM 20
-#define SBUS_SAFETY_DEBOUNCE_MS 50U
+#define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
 
 enum ControlMode {
@@ -62,8 +65,10 @@ static uint32_t s_sbus_arm_last_ms = 0U;
 static uint8_t s_sbus_safety_active = 0U;
 static uint8_t s_sbus_safety_armed = 0U;
 static uint8_t s_sbus_safety_wait_release_logged = 0U;
-static uint32_t s_sbus_safety_high_since_ms = 0U;
+static uint8_t s_sbus_safety_needs_clear = 0U;
+static uint32_t s_sbus_safety_recovery_since_ms = 0U;
 static uint32_t s_sbus_lost_since_ms = 0U;
+static uint32_t s_sbus_start_ms = 0U;
 static uint8_t s_sbus_failsafe_stop_sent = 0U;
 static uint8_t s_sbus_remote_lockout = 0U;
 static uint8_t s_sbus_remote_lockout_logged = 0U;
@@ -79,7 +84,7 @@ static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc);
 static uint8_t sbus_quad_cmd_from_sticks(const SbusState *rc);
 static uint8_t sbus_safety_raw_is_high(const SbusState *rc);
 static uint8_t sbus_safety_raw_is_released(const SbusState *rc);
-static uint8_t sbus_safety_is_active(const SbusState *rc, uint32_t now);
+static uint8_t sbus_safety_update(const SbusState *rc);
 static void sbus_update_switch_state(uint8_t main_sw, uint8_t sub_sw);
 
 static void print_help(void)
@@ -391,30 +396,37 @@ static void sbus_arm_leave(void)
 
 static void sbus_arm_enter(uint32_t now)
 {
-    ArmMotorFeedback fb = {};
+    ArmMotorFeedback j0_feedback = {};
+    ArmMotorFeedback j1_feedback = {};
 
+    if ((DogSafety_IsLatched() != 0U) || (s_sbus_safety_active != 0U) ||
+        (s_sbus_remote_lockout != 0U)) {
+        return;
+    }
     if (s_sbus_arm_active != 0U) {
+        return;
+    }
+    if ((s_sbus_arm_last_ms != 0U) &&
+        ((uint32_t)(now - s_sbus_arm_last_ms) < SBUS_ARM_RETRY_MS)) {
+        return;
+    }
+
+    if ((ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback) == 0U) ||
+        (ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback) == 0U)) {
+        s_sbus_arm_last_ms = now;
+        ArmMotor_Disable();
+        DebugUart_Printf("SBUS arm mode blocked: both arm joints need fresh feedback.\r\n");
         return;
     }
 
     s_sbus_arm_active = 1U;
     s_sbus_arm_last_ms = now;
-
-    if (ArmMotor_GetFeedback(ARM_J0_DM4310, &fb) != 0U) {
-        s_sbus_arm_j0_target_deg = clamp_fp32_local(fb.angle_deg,
-                                                    SBUS_ARM_J0_MIN_DEG,
-                                                    SBUS_ARM_J0_MAX_DEG);
-    } else {
-        s_sbus_arm_j0_target_deg = 0.0f;
-    }
-
-    if (ArmMotor_GetFeedback(ARM_J1_LZ, &fb) != 0U) {
-        s_sbus_arm_j1_target_deg = clamp_fp32_local(fb.angle_deg,
-                                                    SBUS_ARM_J1_MIN_DEG,
-                                                    SBUS_ARM_J1_MAX_DEG);
-    } else {
-        s_sbus_arm_j1_target_deg = 0.0f;
-    }
+    s_sbus_arm_j0_target_deg = clamp_fp32_local(j0_feedback.angle_deg,
+                                                SBUS_ARM_J0_MIN_DEG,
+                                                SBUS_ARM_J0_MAX_DEG);
+    s_sbus_arm_j1_target_deg = clamp_fp32_local(j1_feedback.angle_deg,
+                                                SBUS_ARM_J1_MIN_DEG,
+                                                SBUS_ARM_J1_MAX_DEG);
 
     ArmMotor_Enable();
     ArmMotor_SetTargetDeg(ARM_J0_DM4310, s_sbus_arm_j0_target_deg, 0.0f, 0.0f);
@@ -431,6 +443,17 @@ static void sbus_arm_update(const SbusState *rc, uint32_t now)
     }
 
     if ((uint32_t)(now - s_sbus_arm_last_ms) < SBUS_ARM_UPDATE_MS) {
+        return;
+    }
+
+    ArmMotorFeedback j0_feedback = {};
+    ArmMotorFeedback j1_feedback = {};
+    if ((ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback) == 0U) ||
+        (ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback) == 0U)) {
+        DebugUart_Printf("SBUS arm feedback timeout: disable arm; move main LOW to recover.\r\n");
+        sbus_arm_leave();
+        s_sbus_remote_lockout = 1U;
+        s_sbus_remote_lockout_logged = 0U;
         return;
     }
 
@@ -476,39 +499,19 @@ static uint8_t sbus_safety_raw_is_released(const SbusState *rc)
     return (rc->norm[SBUS_SAFETY_CH] <= SBUS_SAFETY_RELEASE_NORM) ? 1U : 0U;
 }
 
-static uint8_t sbus_safety_is_active(const SbusState *rc, uint32_t now)
+static uint8_t sbus_safety_update(const SbusState *rc)
 {
     if (sbus_safety_raw_is_released(rc) != 0U) {
         s_sbus_safety_armed = 1U;
         s_sbus_safety_wait_release_logged = 0U;
-        s_sbus_safety_high_since_ms = 0U;
-        return 0U;
-    }
-
-    if (sbus_safety_raw_is_high(rc) == 0U) {
-        s_sbus_safety_high_since_ms = 0U;
-        return 0U;
-    }
-
-    if (s_sbus_safety_armed == 0U) {
-        s_sbus_safety_high_since_ms = 0U;
-        if (s_sbus_safety_wait_release_logged == 0U) {
-            DebugUart_Printf("SBUS CH9 safety is HIGH at startup/restore; release it before edge trigger is armed.\r\n");
-            s_sbus_safety_wait_release_logged = 1U;
-        }
-        return 0U;
-    }
-
-    if (s_sbus_safety_high_since_ms == 0U) {
-        s_sbus_safety_high_since_ms = now;
-        return 0U;
-    }
-
-    if ((uint32_t)(now - s_sbus_safety_high_since_ms) < SBUS_SAFETY_DEBOUNCE_MS) {
         return 0U;
     }
 
     s_sbus_safety_armed = 0U;
+    if (s_sbus_safety_wait_release_logged == 0U) {
+        DebugUart_Printf("SBUS CH9 safety inhibit active; release it and move main LOW.\r\n");
+        s_sbus_safety_wait_release_logged = 1U;
+    }
     return 1U;
 }
 
@@ -756,15 +759,49 @@ static uint8_t sbus_quad_cmd_from_sticks(const SbusState *rc)
     return SBUS_QUAD_STOP;
 }
 
+static uint8_t command_allowed_while_inhibited(char c)
+{
+    switch (c) {
+    case '!':
+    case 'x':
+    case 'r':
+    case 'e':
+    case 'p':
+    case 'q':
+    case 'Y':
+    case 'y':
+    case 'c':
+    case 'v':
+    case 'W':
+    case '?':
+    case 'L':
+    case 'R':
+    case 'B':
+    case 'N':
+    case '1':
+    case '2':
+    case '3':
+    case '4':
+    case '8':
+    case 'k':
+        return 1U;
+    default:
+        return 0U;
+    }
+}
+
 static void sbus_safety_trigger(void)
 {
     sbus_arm_leave();
     dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
-    dog_debug_clear_errors();
-    DogStand_Estop();
+    DogSafety_SetExternalInhibit(1U);
     sbus_quad_reset_state();
+    s_sbus_safety_needs_clear = 1U;
+    s_sbus_safety_recovery_since_ms = 0U;
+    s_sbus_remote_lockout = 1U;
+    s_sbus_remote_lockout_logged = 0U;
     s_mode = MODE_IDLE;
-    DebugUart_Printf("SBUS CH9 safety: clear errors + estop.\r\n");
+    DebugUart_Printf("SBUS CH9 safety: ESTOP latched; release CH9 and move main LOW to re-arm.\r\n");
 }
 
 static void sbus_remote_failsafe(uint32_t now)
@@ -776,15 +813,20 @@ static void sbus_remote_failsafe(uint32_t now)
     }
 
     if (s_sbus_failsafe_stop_sent == 0U) {
-        DebugUart_Printf("SBUS lost/failsafe: disable quadruped and arm TX; no estop.\r\n");
-        sbus_quad_rx_only();
-        ArmMotor_Disable();
+        DebugUart_Printf("SBUS lost/failsafe: ESTOP latched; restore signal and move main LOW to re-arm.\r\n");
+        DogSafety_SetExternalInhibit(1U);
+        sbus_arm_leave();
+        sbus_quad_reset_state();
         s_mode = MODE_RX_ONLY;
         s_sbus_arm_active = 0U;
         s_sbus_arm_last_ms = 0U;
         s_sbus_failsafe_stop_sent = 1U;
         s_sbus_remote_lockout = 1U;
         s_sbus_remote_lockout_logged = 0U;
+        s_sbus_safety_needs_clear = 1U;
+        s_sbus_safety_recovery_since_ms = 0U;
+    } else {
+        DogSafety_SetExternalInhibit(1U);
     }
 
     s_sbus_seen_fresh = 0U;
@@ -792,6 +834,39 @@ static void sbus_remote_failsafe(uint32_t now)
     sample.estop_request = 0U;
     sample.tick_ms = now;
     DogRemote_Update(&sample);
+}
+
+void control_task_safety_poll(void)
+{
+    SbusState rc = {};
+    const uint32_t now = HAL_GetTick();
+
+    Sbus_Process();
+    (void)Sbus_GetState(&rc);
+    if (rc.frame_count == 0U) {
+        if ((uint32_t)(now - s_sbus_start_ms) >= SBUS_REMOTE_TIMEOUT_MS) {
+            sbus_remote_failsafe(now);
+        }
+        return;
+    }
+    if (Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS) == 0U) {
+        sbus_remote_failsafe(now);
+        return;
+    }
+
+    if (sbus_safety_update(&rc) != 0U) {
+        if (s_sbus_safety_active == 0U) {
+            sbus_safety_trigger();
+        } else {
+            DogSafety_SetExternalInhibit(1U);
+        }
+        s_sbus_safety_active = 1U;
+        s_sbus_safety_recovery_since_ms = 0U;
+        return;
+    }
+
+    DogSafety_SetExternalInhibit(0U);
+    s_sbus_safety_active = 0U;
 }
 
 static void sbus_control_update(void)
@@ -804,6 +879,9 @@ static void sbus_control_update(void)
     (void)Sbus_GetState(&rc);
 
     if (rc.frame_count == 0U) {
+        if ((uint32_t)(now - s_sbus_start_ms) >= SBUS_REMOTE_TIMEOUT_MS) {
+            sbus_remote_failsafe(now);
+        }
         return;
     }
 
@@ -827,7 +905,7 @@ static void sbus_control_update(void)
 
     const uint8_t main_sw = Sbus_Switch3(SBUS_MAIN_MODE_CH);
     const uint8_t sub_sw = Sbus_Switch3(SBUS_SUB_MODE_CH);
-    const uint8_t safety_active = sbus_safety_is_active(&rc, now);
+    const uint8_t safety_active = sbus_safety_update(&rc);
     const uint8_t changed = ((s_sbus_switch_valid == 0U) ||
                              (main_sw != s_sbus_main_prev) ||
                              (sub_sw != s_sbus_sub_prev)) ? 1U : 0U;
@@ -838,6 +916,8 @@ static void sbus_control_update(void)
         DebugUart_Printf("SBUS online main=%s sub=%s.\r\n",
                          sbus_switch_name(main_sw),
                          sbus_switch_name(sub_sw));
+        s_sbus_remote_lockout = 1U;
+        s_sbus_remote_lockout_logged = 0U;
     }
     s_sbus_seen_fresh = 1U;
     sbus_update_speed_profile(&rc, (s_sbus_switch_valid == 0U) ? 1U : 0U);
@@ -850,19 +930,55 @@ static void sbus_control_update(void)
             sample.estop_request = 1U;
             DogRemote_Update(&sample);
             sbus_safety_trigger();
+        } else {
+            DogSafety_SetExternalInhibit(1U);
         }
         s_sbus_safety_active = 1U;
+        s_sbus_safety_recovery_since_ms = 0U;
         sbus_update_switch_state(main_sw, sub_sw);
         return;
     }
+    DogSafety_SetExternalInhibit(0U);
     s_sbus_safety_active = 0U;
+
+    if ((DogSafety_IsLatched() != 0U) && (s_sbus_safety_needs_clear == 0U)) {
+        sbus_arm_leave();
+        sbus_quad_reset_state();
+        s_sbus_safety_needs_clear = 1U;
+        s_sbus_safety_recovery_since_ms = 0U;
+        s_sbus_remote_lockout = 1U;
+        s_sbus_remote_lockout_logged = 0U;
+        DebugUart_Printf("Motor safety latch active; release CH9 and move main LOW to recover.\r\n");
+    }
 
     if (s_sbus_remote_lockout != 0U) {
         if (main_sw == SBUS_SWITCH_LOW) {
+            if (s_sbus_safety_needs_clear != 0U) {
+                if (s_sbus_safety_recovery_since_ms == 0U) {
+                    s_sbus_safety_recovery_since_ms = now;
+                }
+                if ((uint32_t)(now - s_sbus_safety_recovery_since_ms) < SBUS_SAFETY_RECOVERY_MS) {
+                    DogRemote_Update(&sample);
+                    sbus_update_switch_state(main_sw, sub_sw);
+                    return;
+                }
+                (void)DogSafety_RequestRearm();
+            }
+            if (DogSafety_IsLatched() != 0U) {
+                DogRemote_Update(&sample);
+                sbus_update_switch_state(main_sw, sub_sw);
+                return;
+            }
+            if (s_sbus_safety_needs_clear != 0U) {
+                s_sbus_safety_needs_clear = 0U;
+                s_sbus_safety_recovery_since_ms = 0U;
+                DebugUart_Printf("SBUS safety latch confirmed clear in main LOW.\r\n");
+            }
             s_sbus_remote_lockout = 0U;
             s_sbus_remote_lockout_logged = 0U;
             DebugUart_Printf("SBUS remote lockout cleared by main LOW.\r\n");
         } else {
+            s_sbus_safety_recovery_since_ms = 0U;
             if (s_sbus_remote_lockout_logged == 0U) {
                 DebugUart_Printf("SBUS remote lockout: move main switch LOW before MID/HIGH control resumes.\r\n");
                 s_sbus_remote_lockout_logged = 1U;
@@ -915,6 +1031,12 @@ static void handle_command(char c)
         return;
     }
 
+    if (((DogSafety_IsLatched() != 0U) || (s_sbus_safety_active != 0U) ||
+         (s_sbus_remote_lockout != 0U)) && (command_allowed_while_inhibited(c) == 0U)) {
+        DebugUart_Printf("Command '%c' blocked by safety/remote lockout.\r\n", c);
+        return;
+    }
+
     switch (c) {
     case 'L':
         set_leg(DOG_LEG_LF);
@@ -950,8 +1072,18 @@ static void handle_command(char c)
         enter_rx_only();
         break;
     case 'e':
-        dog_debug_clear_errors();
-        DebugUart_Printf("Clear errors sent.\r\n");
+        if (DogSafety_IsLatched() != 0U) {
+            if ((s_sbus_remote_lockout != 0U) || (s_sbus_seen_fresh != 0U)) {
+                DebugUart_Printf("Safety re-arm requires fresh SBUS with main LOW.\r\n");
+            } else if (DogSafety_RequestRearm() != 0U) {
+                DebugUart_Printf("Safety re-arm requested; wait for all 8 motors idle/fault-free.\r\n");
+            } else {
+                DebugUart_Printf("Safety re-arm blocked by active CH9 inhibit.\r\n");
+            }
+        } else {
+            dog_debug_clear_errors();
+            DebugUart_Printf("Clear errors sent.\r\n");
+        }
         break;
     case 'm':
         dog_debug_position_setup();
@@ -1296,14 +1428,27 @@ static void lf_periodic_status(void)
     dog_lf_print_periodic_status();
 }
 
+static void control_init_wait(uint32_t timeout_ms, uint8_t stop_when_host_open)
+{
+    const uint32_t start_ms = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - start_ms) < timeout_ms) {
+        control_task_safety_poll();
+        DebugUart_Process();
+        if ((stop_when_host_open != 0U) && (DebugUart_IsHostOpen() != 0U)) {
+            return;
+        }
+        osDelay(10U);
+    }
+}
+
 void control_task_init(void)
 {
-    motor_task_init();
     VofaPid_Init();
     Sbus_Init();
+    s_sbus_start_ms = HAL_GetTick();
 
-    (void)DebugUart_WaitForHost(1500U);
-    HAL_Delay(500U);
+    control_init_wait(1500U, 1U);
+    control_init_wait(500U, 0U);
 
     print_help();
     enter_rx_only();
@@ -1311,6 +1456,8 @@ void control_task_init(void)
 
 void control_task(void)
 {
+    update_target();
+
     int ch;
     while ((ch = DebugUart_GetByte()) >= 0) {
         if (VofaPid_IsEnabled() != 0U) {
@@ -1321,7 +1468,6 @@ void control_task(void)
         handle_command((char)ch);
     }
 
-    update_target();
     lf_periodic_status();
 }
 
