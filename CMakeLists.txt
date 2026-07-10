@@ -65,6 +65,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/User_File/task/arm/arm_motor_task.cpp
     ${CMAKE_SOURCE_DIR}/User_File/task/control_task.cpp
     ${CMAKE_SOURCE_DIR}/User_File/task/motor_task.cpp
+    ${CMAKE_SOURCE_DIR}/User_File/task/wheel_motor_task.cpp
 )
 
 # Add include paths

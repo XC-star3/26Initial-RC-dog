@@ -7,16 +7,17 @@ bool system_can[3];
 
 CAN_Manage_Object CAN1_Manage_Object;
 CAN_Manage_Object CAN2_Manage_Object;
+CAN_Manage_Object CAN3_Manage_Object;
 
-static volatile uint32_t s_can_rx_count[2] = {0U, 0U};
-static StaticSemaphore_t s_can_bus_mutex_storage[2];
-static SemaphoreHandle_t s_can_bus_mutex[2] = {nullptr, nullptr};
-static StaticSemaphore_t s_can_rx_dispatch_mutex_storage[2];
-static SemaphoreHandle_t s_can_rx_dispatch_mutex[2] = {nullptr, nullptr};
+static volatile uint32_t s_can_rx_count[3] = {0U, 0U, 0U};
+static StaticSemaphore_t s_can_bus_mutex_storage[3];
+static SemaphoreHandle_t s_can_bus_mutex[3] = {nullptr, nullptr, nullptr};
+static StaticSemaphore_t s_can_rx_dispatch_mutex_storage[3];
+static SemaphoreHandle_t s_can_rx_dispatch_mutex[3] = {nullptr, nullptr, nullptr};
 
 static uint8_t can_bus_lock(uint8_t index)
 {
-    if ((index >= 2U) || (s_can_bus_mutex[index] == nullptr)) {
+    if ((index >= 3U) || (s_can_bus_mutex[index] == nullptr)) {
         return 0U;
     }
     return (xSemaphoreTake(s_can_bus_mutex[index], portMAX_DELAY) == pdTRUE) ? 1U : 0U;
@@ -24,7 +25,7 @@ static uint8_t can_bus_lock(uint8_t index)
 
 static void can_bus_unlock(uint8_t index)
 {
-    if ((index < 2U) && (s_can_bus_mutex[index] != nullptr)) {
+    if ((index < 3U) && (s_can_bus_mutex[index] != nullptr)) {
         (void)xSemaphoreGive(s_can_bus_mutex[index]);
     }
 }
@@ -47,6 +48,12 @@ static CAN_Manage_Object *can_object(FDCAN_HandleTypeDef *hfdcan, uint8_t *index
         }
         return &CAN2_Manage_Object;
     }
+    if (hfdcan->Instance == FDCAN3) {
+        if (index != nullptr) {
+            *index = 2U;
+        }
+        return &CAN3_Manage_Object;
+    }
     return nullptr;
 }
 
@@ -55,10 +62,11 @@ static uint8_t can_filter_init(FDCAN_HandleTypeDef *hfdcan)
     FDCAN_FilterTypeDef fdcan_filter = {};
     fdcan_filter.IdType = FDCAN_STANDARD_ID;
     fdcan_filter.FilterIndex = 0;
-    fdcan_filter.FilterType = FDCAN_FILTER_MASK;
+    fdcan_filter.FilterType = (hfdcan->Instance == FDCAN3) ?
+                              FDCAN_FILTER_RANGE : FDCAN_FILTER_MASK;
     fdcan_filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-    fdcan_filter.FilterID1 = 0x00U;
-    fdcan_filter.FilterID2 = 0x00U;
+    fdcan_filter.FilterID1 = (hfdcan->Instance == FDCAN3) ? 0x201U : 0x00U;
+    fdcan_filter.FilterID2 = (hfdcan->Instance == FDCAN3) ? 0x204U : 0x00U;
 
     if (HAL_FDCAN_ConfigFilter(hfdcan, &fdcan_filter) != HAL_OK) {
         return 0U;
@@ -68,7 +76,8 @@ static uint8_t can_filter_init(FDCAN_HandleTypeDef *hfdcan)
     fdcan_ext_filter.IdType = FDCAN_EXTENDED_ID;
     fdcan_ext_filter.FilterIndex = 0;
     fdcan_ext_filter.FilterType = FDCAN_FILTER_MASK;
-    fdcan_ext_filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    fdcan_ext_filter.FilterConfig = (hfdcan->Instance == FDCAN3) ?
+                                    FDCAN_FILTER_DISABLE : FDCAN_FILTER_TO_RXFIFO0;
     fdcan_ext_filter.FilterID1 = 0x00U;
     fdcan_ext_filter.FilterID2 = 0x00U;
     if (HAL_FDCAN_ConfigFilter(hfdcan, &fdcan_ext_filter) != HAL_OK) {
@@ -76,7 +85,8 @@ static uint8_t can_filter_init(FDCAN_HandleTypeDef *hfdcan)
     }
 
     if (HAL_FDCAN_ConfigGlobalFilter(hfdcan,
-                                     FDCAN_ACCEPT_IN_RX_FIFO0,
+                                     (hfdcan->Instance == FDCAN3) ?
+                                         FDCAN_REJECT : FDCAN_ACCEPT_IN_RX_FIFO0,
                                      FDCAN_REJECT,
                                      FDCAN_REJECT_REMOTE,
                                      FDCAN_REJECT_REMOTE) != HAL_OK) {

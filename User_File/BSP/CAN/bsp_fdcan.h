@@ -21,6 +21,9 @@ struct CAN_Manage_Object
 };
 
 extern bool system_can[3];
+extern CAN_Manage_Object CAN1_Manage_Object;
+extern CAN_Manage_Object CAN2_Manage_Object;
+extern CAN_Manage_Object CAN3_Manage_Object;
 
 void bsp_can_init(FDCAN_HandleTypeDef *hfdcan, CAN_Callback Callback_Function);
 void fdcan_poll_rx(FDCAN_HandleTypeDef *hfdcan);

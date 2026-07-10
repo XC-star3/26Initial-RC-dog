@@ -1,0 +1,70 @@
+#ifndef WHEEL_MOTOR_TASK_H
+#define WHEEL_MOTOR_TASK_H
+
+#include "fdcan.h"
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define WHEEL_MOTOR_COUNT 4U
+
+typedef enum WheelDriveCommand {
+    WHEEL_DRIVE_STOP = 0,
+    WHEEL_DRIVE_FORWARD,
+    WHEEL_DRIVE_REVERSE,
+} WheelDriveCommand;
+
+typedef enum WheelDriveProfile {
+    WHEEL_PROFILE_NORMAL = 0,
+    WHEEL_PROFILE_MECHANICAL_CRAWL,
+} WheelDriveProfile;
+
+typedef struct WheelMotorFeedback {
+    uint16_t encoder_raw;
+    int32_t encoder_rounds;
+    float output_position_rad;
+    float output_speed_rad_s;
+    int16_t torque_current_raw;
+    uint8_t temperature_c;
+    uint8_t received;
+    uint32_t last_update_ms;
+} WheelMotorFeedback;
+
+typedef struct WheelDriveDiag {
+    uint8_t can_ready;
+    uint8_t mode_enabled;
+    uint8_t locked;
+    uint8_t all_online;
+    uint8_t stopped;
+    uint8_t feedback_seen_mask;
+    uint8_t command;
+    uint8_t profile;
+    float ramped_target_rad_s;
+    uint32_t tx_fail_count;
+    uint32_t bus_off_count;
+    uint32_t feedback_timeout_count;
+    uint32_t rx_reject_count;
+    WheelMotorFeedback motor[WHEEL_MOTOR_COUNT];
+} WheelDriveDiag;
+
+void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan);
+uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t data[8]);
+void WheelDrive_SetCommand(WheelDriveCommand command);
+void WheelDrive_SetProfile(WheelDriveProfile profile);
+void WheelDrive_Enable(void);
+void WheelDrive_Disable(void);
+void WheelDrive_Tick(uint32_t now_ms);
+void WheelDrive_StopAndLock(void);
+uint8_t WheelDrive_TryClearLock(void);
+uint8_t WheelDrive_AllOnline(void);
+uint8_t WheelDrive_IsStopped(void);
+void WheelDrive_GetDiag(WheelDriveDiag *diag);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

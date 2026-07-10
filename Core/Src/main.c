@@ -117,6 +117,7 @@ int main(void)
   MX_BDMA_Init();
   MX_FDCAN1_Init();
   MX_FDCAN2_Init();
+  MX_FDCAN3_Init();
   MX_UART5_Init();
   MX_SPI2_Init();
   MX_TIM3_Init();

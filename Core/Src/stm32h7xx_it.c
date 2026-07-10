@@ -78,6 +78,7 @@ extern DMA_HandleTypeDef hdma_adc3;
 extern DMA_HandleTypeDef hdma_memtomem_dma2_stream6;
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
+extern FDCAN_HandleTypeDef hfdcan3;
 extern DMA_HandleTypeDef hdma_spi2_rx;
 extern DMA_HandleTypeDef hdma_spi2_tx;
 extern SPI_HandleTypeDef hspi2;
@@ -364,6 +365,22 @@ void FDCAN2_IT0_IRQHandler(void)
 void FDCAN2_IT1_IRQHandler(void)
 {
   HAL_FDCAN_IRQHandler(&hfdcan2);
+}
+
+/**
+  * @brief This function handles FDCAN3 interrupt 0.
+  */
+void FDCAN3_IT0_IRQHandler(void)
+{
+  HAL_FDCAN_IRQHandler(&hfdcan3);
+}
+
+/**
+  * @brief This function handles FDCAN3 interrupt 1.
+  */
+void FDCAN3_IT1_IRQHandler(void)
+{
+  HAL_FDCAN_IRQHandler(&hfdcan3);
 }
 
 /**

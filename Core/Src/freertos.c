@@ -30,6 +30,7 @@
 #include "control_task.h"
 #include "debug_uart.h"
 #include "motor_task_c_api.h"
+#include "wheel_motor_task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -90,6 +91,18 @@ const osThreadAttr_t Start_CAN_Task_attributes = {
   .stack_size = sizeof(Start_CAN_TaskBuffer),
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for Start_Wheel_Task */
+osThreadId_t Start_Wheel_TaskHandle;
+uint32_t Start_Wheel_TaskBuffer[512];
+osStaticThreadDef_t Start_Wheel_TaskControlBlock;
+const osThreadAttr_t Start_Wheel_Task_attributes = {
+  .name = "Start_Wheel_Task",
+  .cb_mem = &Start_Wheel_TaskControlBlock,
+  .cb_size = sizeof(Start_Wheel_TaskControlBlock),
+  .stack_mem = &Start_Wheel_TaskBuffer[0],
+  .stack_size = sizeof(Start_Wheel_TaskBuffer),
+  .priority = (osPriority_t) osPriorityNormal,
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -99,6 +112,7 @@ const osThreadAttr_t Start_CAN_Task_attributes = {
 void INS_Task(void *argument);
 void Control_Task(void *argument);
 void CAN_Task(void *argument);
+void Wheel_Task(void *argument);
 
 extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -138,6 +152,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of Start_CAN_Task */
   Start_CAN_TaskHandle = osThreadNew(CAN_Task, NULL, &Start_CAN_Task_attributes);
+
+  /* creation of Start_Wheel_Task */
+  Start_Wheel_TaskHandle = osThreadNew(Wheel_Task, NULL, &Start_Wheel_Task_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -182,7 +199,7 @@ void Control_Task(void *argument)
   (void)argument;
   DebugUart_Init();
   BoardRgb_SetColor(0U, 255U, 0U);
-  DebugUart_Printf("quadruped SDK debug boot ok, CAN1 front nodes=1..4 CAN2 rear nodes=1..4\r\n");
+  DebugUart_Printf("quadruped SDK debug boot ok, CAN1/2 legs, CAN3 wheels 0x201..0x204\r\n");
   motor_task_init();
   s_motor_ready = 1U;
   control_task_init();
@@ -222,6 +239,21 @@ void CAN_Task(void *argument)
     osDelay(1);
   }
   /* USER CODE END CAN_Task */
+}
+
+void Wheel_Task(void *argument)
+{
+  (void)argument;
+  while (s_motor_ready == 0U) {
+    osDelay(1U);
+  }
+
+  uint32_t next_wake = osKernelGetTickCount();
+  for (;;) {
+    WheelDrive_Tick(HAL_GetTick());
+    next_wake += 2U;
+    (void)osDelayUntil(next_wake);
+  }
 }
 
 /* Private application code --------------------------------------------------*/
