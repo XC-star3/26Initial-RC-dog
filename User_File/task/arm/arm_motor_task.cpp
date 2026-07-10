@@ -60,6 +60,7 @@ static uint16_t s_j1_lz_id = 0U;
 static uint8_t s_initialized = 0U;
 static uint32_t s_last_send_ms = 0U;
 static uint32_t s_last_feedback_ms[ARM_JOINT_COUNT] = {};
+static uint32_t s_enable_request_ms[ARM_JOINT_COUNT] = {};
 static ArmMotorFeedback s_feedback[ARM_JOINT_COUNT] = {};
 static J0Controller s_j0_ctrl = {
     0.0f,
@@ -208,6 +209,22 @@ static void j0_lock_target_to_measure(void)
     j0_clear_pid();
 }
 
+static void j0_disable(void)
+{
+    s_j0_ctrl.enabled = 0U;
+    s_enable_request_ms[ARM_J0_DM4310] = 0U;
+    j0_lock_target_to_measure();
+    s_j0_dm4310.lose();
+}
+
+static void j1_disable(void)
+{
+    s_j1_ctrl.enabled = 0U;
+    s_enable_request_ms[ARM_J1_LZ] = 0U;
+    j1_lock_target_to_measure();
+    s_j1_lz.lose();
+}
+
 static void copy_dm_feedback(void)
 {
     const fp32 angle_deg = j0_correct_angle_deg(s_j0_dm4310.Get_Now_Angle());
@@ -267,6 +284,8 @@ void ArmMotor_Init(FDCAN_HandleTypeDef *j0_dm_can,
     s_last_send_ms = 0U;
     s_last_feedback_ms[ARM_J0_DM4310] = 0U;
     s_last_feedback_ms[ARM_J1_LZ] = 0U;
+    s_enable_request_ms[ARM_J0_DM4310] = 0U;
+    s_enable_request_ms[ARM_J1_LZ] = 0U;
     s_initialized = 1U;
 }
 
@@ -279,6 +298,9 @@ void ArmMotor_Enable(void)
     s_j0_ctrl.first_set_angle = 1U;
     s_j1_ctrl.enabled = 1U;
     s_j1_ctrl.first_set_angle = 1U;
+    const uint32_t now = HAL_GetTick();
+    s_enable_request_ms[ARM_J0_DM4310] = now;
+    s_enable_request_ms[ARM_J1_LZ] = now;
     j0_lock_target_to_measure();
     j1_lock_target_to_measure();
     s_j0_dm4310.enable();
@@ -292,12 +314,8 @@ void ArmMotor_Disable(void)
     if (s_initialized == 0U) {
         return;
     }
-    s_j0_ctrl.enabled = 0U;
-    s_j1_ctrl.enabled = 0U;
-    j0_lock_target_to_measure();
-    j1_lock_target_to_measure();
-    s_j0_dm4310.lose();
-    s_j1_lz.lose();
+    j0_disable();
+    j1_disable();
 }
 
 void ArmMotor_Zero(uint8_t joint)
@@ -483,11 +501,15 @@ void ArmMotor_Send(void)
 
     const uint32_t now = HAL_GetTick();
     refresh_feedback_age(now);
-    if (((s_j0_ctrl.enabled != 0U) || (s_j1_ctrl.enabled != 0U)) &&
-        ((s_feedback[ARM_J0_DM4310].online == 0U) ||
-         (s_feedback[ARM_J1_LZ].online == 0U))) {
-        ArmMotor_Disable();
-        return;
+    if ((s_j0_ctrl.enabled != 0U) && (s_feedback[ARM_J0_DM4310].online == 0U) &&
+        (s_enable_request_ms[ARM_J0_DM4310] != 0U) &&
+        ((uint32_t)(now - s_enable_request_ms[ARM_J0_DM4310]) > kFeedbackTimeoutMs)) {
+        j0_disable();
+    }
+    if ((s_j1_ctrl.enabled != 0U) && (s_feedback[ARM_J1_LZ].online == 0U) &&
+        (s_enable_request_ms[ARM_J1_LZ] != 0U) &&
+        ((uint32_t)(now - s_enable_request_ms[ARM_J1_LZ]) > kFeedbackTimeoutMs)) {
+        j1_disable();
     }
 
     fp32 dt_s = kControlNominalDtSec;
@@ -499,7 +521,7 @@ void ArmMotor_Send(void)
     }
     s_last_send_ms = now;
 
-    if (s_j0_ctrl.enabled != 0U) {
+    if ((s_j0_ctrl.enabled != 0U) && (s_feedback[ARM_J0_DM4310].online != 0U)) {
         const fp32 j0_torque_nm = j0_calculate_torque(dt_s);
         s_j0_dm4310.can_send_torque_only(j0_torque_nm, s_j0_ctrl.invert);
     }

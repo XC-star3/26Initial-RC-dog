@@ -68,6 +68,7 @@ static uint8_t s_sbus_switch_valid = 0U;
 static uint8_t s_sbus_main_prev = SBUS_SWITCH_LOW;
 static uint8_t s_sbus_sub_prev = SBUS_SWITCH_LOW;
 static uint8_t s_sbus_arm_active = 0U;
+static uint8_t s_sbus_arm_enable_pending = 0U;
 static fp32 s_sbus_arm_j0_target_deg = 0.0f;
 static fp32 s_sbus_arm_j1_target_deg = 0.0f;
 static uint32_t s_sbus_arm_last_ms = 0U;
@@ -412,10 +413,11 @@ static const char *sbus_switch_name(uint8_t sw)
 
 static void sbus_arm_leave(void)
 {
-    if (s_sbus_arm_active == 0U) {
+    if ((s_sbus_arm_active == 0U) && (s_sbus_arm_enable_pending == 0U)) {
         return;
     }
     s_sbus_arm_active = 0U;
+    s_sbus_arm_enable_pending = 0U;
     s_sbus_arm_last_ms = 0U;
     ArmMotor_Disable();
     DebugUart_Printf("SBUS arm mode OFF.\r\n");
@@ -438,29 +440,39 @@ static void sbus_arm_enter(uint32_t now)
         return;
     }
 
-    if ((ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback) == 0U) ||
-        (ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback) == 0U)) {
+    const uint8_t j0_online = ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback);
+    const uint8_t j1_online = ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback);
+    if ((j0_online == 0U) && (j1_online == 0U)) {
         s_sbus_arm_last_ms = now;
-        ArmMotor_Disable();
-        DebugUart_Printf("SBUS arm mode blocked: both arm joints need fresh feedback.\r\n");
+        s_sbus_arm_enable_pending = 1U;
+        ArmMotor_Enable();
+        DebugUart_Printf("SBUS arm enable request sent; waiting for J0/J1 feedback.\r\n");
         return;
     }
 
     s_sbus_arm_active = 1U;
+    s_sbus_arm_enable_pending = 0U;
     s_sbus_arm_last_ms = now;
-    s_sbus_arm_j0_target_deg = clamp_fp32_local(j0_feedback.angle_deg,
-                                                SBUS_ARM_J0_MIN_DEG,
-                                                SBUS_ARM_J0_MAX_DEG);
-    s_sbus_arm_j1_target_deg = clamp_fp32_local(j1_feedback.angle_deg,
-                                                SBUS_ARM_J1_MIN_DEG,
-                                                SBUS_ARM_J1_MAX_DEG);
+    if (j0_online != 0U) {
+        s_sbus_arm_j0_target_deg = clamp_fp32_local(j0_feedback.angle_deg,
+                                                    SBUS_ARM_J0_MIN_DEG,
+                                                    SBUS_ARM_J0_MAX_DEG);
+    }
+    if (j1_online != 0U) {
+        s_sbus_arm_j1_target_deg = clamp_fp32_local(j1_feedback.angle_deg,
+                                                    SBUS_ARM_J1_MIN_DEG,
+                                                    SBUS_ARM_J1_MAX_DEG);
+    }
 
     ArmMotor_Enable();
-    ArmMotor_SetTargetDeg(ARM_J0_DM4310, s_sbus_arm_j0_target_deg, 0.0f, 0.0f);
-    ArmMotor_SetTargetDeg(ARM_J1_LZ, s_sbus_arm_j1_target_deg, 0.0f, 0.0f);
-    DebugUart_Printf("SBUS arm mode ON J0=%lddeg J1=%lddeg.\r\n",
-                     (long)s_sbus_arm_j0_target_deg,
-                     (long)s_sbus_arm_j1_target_deg);
+    if (j0_online != 0U) {
+        ArmMotor_SetTargetDeg(ARM_J0_DM4310, s_sbus_arm_j0_target_deg, 0.0f, 0.0f);
+    }
+    if (j1_online != 0U) {
+        ArmMotor_SetTargetDeg(ARM_J1_LZ, s_sbus_arm_j1_target_deg, 0.0f, 0.0f);
+    }
+    DebugUart_Printf("SBUS arm mode ON J0=%u J1=%u.\r\n",
+                     (unsigned)j0_online, (unsigned)j1_online);
 }
 
 static void sbus_arm_update(const SbusState *rc, uint32_t now)
@@ -475,9 +487,10 @@ static void sbus_arm_update(const SbusState *rc, uint32_t now)
 
     ArmMotorFeedback j0_feedback = {};
     ArmMotorFeedback j1_feedback = {};
-    if ((ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback) == 0U) ||
-        (ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback) == 0U)) {
-        DebugUart_Printf("SBUS arm feedback timeout: disable arm; move main LOW to recover.\r\n");
+    const uint8_t j0_online = ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback);
+    const uint8_t j1_online = ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback);
+    if ((j0_online == 0U) && (j1_online == 0U)) {
+        DebugUart_Printf("SBUS arm feedback timeout: both joints offline; move main LOW to recover.\r\n");
         sbus_arm_leave();
         s_sbus_remote_lockout = 1U;
         s_sbus_remote_lockout_logged = 0U;
@@ -499,15 +512,23 @@ static void sbus_arm_update(const SbusState *rc, uint32_t now)
     const fp32 j1_delta_deg = ((fp32)j1_norm / 100.0f) *
                               SBUS_ARM_RATE_DEG_S * dt_s;
 
-    s_sbus_arm_j0_target_deg = clamp_fp32_local(s_sbus_arm_j0_target_deg + j0_delta_deg,
-                                                SBUS_ARM_J0_MIN_DEG,
-                                                SBUS_ARM_J0_MAX_DEG);
-    s_sbus_arm_j1_target_deg = clamp_fp32_local(s_sbus_arm_j1_target_deg + j1_delta_deg,
-                                                SBUS_ARM_J1_MIN_DEG,
-                                                SBUS_ARM_J1_MAX_DEG);
+    if (j0_online != 0U) {
+        s_sbus_arm_j0_target_deg = clamp_fp32_local(s_sbus_arm_j0_target_deg + j0_delta_deg,
+                                                    SBUS_ARM_J0_MIN_DEG,
+                                                    SBUS_ARM_J0_MAX_DEG);
+    }
+    if (j1_online != 0U) {
+        s_sbus_arm_j1_target_deg = clamp_fp32_local(s_sbus_arm_j1_target_deg + j1_delta_deg,
+                                                    SBUS_ARM_J1_MIN_DEG,
+                                                    SBUS_ARM_J1_MAX_DEG);
+    }
 
-    ArmMotor_SetTargetDeg(ARM_J0_DM4310, s_sbus_arm_j0_target_deg, 0.0f, 0.0f);
-    ArmMotor_SetTargetDeg(ARM_J1_LZ, s_sbus_arm_j1_target_deg, 0.0f, 0.0f);
+    if (j0_online != 0U) {
+        ArmMotor_SetTargetDeg(ARM_J0_DM4310, s_sbus_arm_j0_target_deg, 0.0f, 0.0f);
+    }
+    if (j1_online != 0U) {
+        ArmMotor_SetTargetDeg(ARM_J1_LZ, s_sbus_arm_j1_target_deg, 0.0f, 0.0f);
+    }
 }
 
 static uint8_t sbus_safety_raw_is_high(const SbusState *rc)
@@ -1107,7 +1128,7 @@ static void sbus_control_update(void)
             sbus_arm_update(&rc, now);
         }
     } else {
-        if (s_sbus_arm_active != 0U) {
+        if ((s_sbus_arm_active != 0U) || (s_sbus_arm_enable_pending != 0U)) {
             sbus_arm_leave();
         }
 

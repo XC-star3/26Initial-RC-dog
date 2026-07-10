@@ -6495,7 +6495,7 @@ void motor_task_init(void)
     ArmMotor_Init(&hfdcan1,
                   ARM_J0_DM_CAN_ID,
                   ARM_J0_DM_FEEDBACK_ID,
-                  &hfdcan1,
+                  &hfdcan2,
                   ARM_J1_EL05_CAN_ID,
                   ARM_J1_EL05_INIT_MODEL_IGNORED);
 
@@ -6554,7 +6554,7 @@ void motor_task_init(void)
         DogStand_Disable();
         return;
     }
-    DebugUart_Printf("quadruped SDK debug: CAN1 front nodes=1..4 CAN2 rear nodes=1..4 arm J0_DM=0x01/0x10 J1_EL05=0x7F disabled\r\n");
+    DebugUart_Printf("quadruped SDK debug: CAN1 front+J0_DM=0x01/0x10 CAN2 rear+J1_EL05=0x7F disabled\r\n");
 }
 
 void motor_task(void)
@@ -6612,8 +6612,10 @@ void motor_task(void)
     static uint32_t s_arm_cmd_last_ms = 0U;
     if ((s_safety_latched == 0U) &&
         (mit_probe_bus_tx_busy(DOG_CAN_FRONT_BUS) == 0U) &&
+        (mit_probe_bus_tx_busy(DOG_CAN_REAR_BUS) == 0U) &&
         ((uint32_t)(now - s_arm_cmd_last_ms) >= ARM_CMD_PERIOD_MS) &&
-        (fdcan_tx_free_level(&hfdcan1) >= 2U)) {
+        (fdcan_tx_free_level(&hfdcan1) >= 1U) &&
+        (fdcan_tx_free_level(&hfdcan2) >= 1U)) {
         s_arm_cmd_last_ms = now;
         ArmMotor_Send();
     }
