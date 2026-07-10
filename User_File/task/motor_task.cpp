@@ -2110,13 +2110,13 @@ static float march_stride_x_delta(uint8_t leg)
         (void)leg;
         const float turn_stride_x_mm = (s_march.active_swing_ms != 0U) ?
             s_march.active_turn_stride_x_mm : dog_mit_gait_turn_stride_x_mm();
-        return -turn_stride_x_mm * DOG_TROT_FORWARD_X_SIGN;
+        return -turn_stride_x_mm * DOG_TURN_X_SIGN;
     }
     if (s_march.mode == DOG_MARCH_MODE_TURN_RIGHT) {
         (void)leg;
         const float turn_stride_x_mm = (s_march.active_swing_ms != 0U) ?
             s_march.active_turn_stride_x_mm : dog_mit_gait_turn_stride_x_mm();
-        return turn_stride_x_mm * DOG_TROT_FORWARD_X_SIGN;
+        return turn_stride_x_mm * DOG_TURN_X_SIGN;
     }
     return march_trot_forward_x_delta(leg);
 }

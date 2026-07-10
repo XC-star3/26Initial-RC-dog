@@ -71,7 +71,8 @@ extern "C" {
 #define DOG_DIAG_SUPPORT_LIFT_Z_MM      DOG_MARCH_LIFT_Z_MM
 #define DOG_TROT_FOOT_X1_MM             0.0f
 #define DOG_TROT_FOOT_Z1_MM             0.0f     /* relative to per-leg stand touch-down Z */
-#define DOG_TROT_FORWARD_X_SIGN         (-1.0f)  /* flip to +1 if trot direction is reversed on hardware */
+#define DOG_TROT_FORWARD_X_SIGN          1.0f    /* physical forward calibration for trot */
+#define DOG_TURN_X_SIGN                 (-1.0f)  /* independent turn calibration; preserves left/right */
 #define DOG_TROT_YAW_TRIM_X_MM           0.0f
 #define DOG_FORWARD_HIP_STEP_DEG        5.0f
 #define DOG_FORWARD_SWING_HIP_DEG       8.0f
