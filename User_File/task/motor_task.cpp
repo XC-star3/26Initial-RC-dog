@@ -335,6 +335,32 @@ static const Dog_Gait_Speed_Profile *gait_speed_profile(void)
     return &s_gait_speed_profiles[s_gait_speed_profile];
 }
 
+static uint32_t march_walk_hold_ms(void)
+{
+    switch (s_march.active_speed_profile) {
+    case DOG_GAIT_SPEED_LOW:
+        return 250U;
+    case DOG_GAIT_SPEED_HIGH:
+        return 100U;
+    case DOG_GAIT_SPEED_MID:
+    default:
+        return 125U;
+    }
+}
+
+static uint32_t march_walk_leg_pause_ms(void)
+{
+    switch (s_march.active_speed_profile) {
+    case DOG_GAIT_SPEED_LOW:
+        return 150U;
+    case DOG_GAIT_SPEED_HIGH:
+        return 50U;
+    case DOG_GAIT_SPEED_MID:
+    default:
+        return 75U;
+    }
+}
+
 float dog_mit_gait_trot_hz(void)
 {
     return gait_speed_profile()->trot_hz;
@@ -4365,7 +4391,8 @@ static void march_in_place_tick(uint32_t now)
         break;
 
     case DOG_MARCH_PHASE_HOLD:
-        if ((uint32_t)(now - s_march.phase_t0_ms) >= ((cycloid_gait != 0U) ? DOG_TROT_HOLD_MS : DOG_MARCH_HOLD_MS)) {
+        if ((uint32_t)(now - s_march.phase_t0_ms) >=
+            ((cycloid_gait != 0U) ? DOG_TROT_HOLD_MS : march_walk_hold_ms())) {
             march_begin_swing_down(now);
         }
         break;
@@ -4387,7 +4414,8 @@ static void march_in_place_tick(uint32_t now)
         break;
 
     case DOG_MARCH_PHASE_PAUSE:
-        if ((uint32_t)(now - s_march.phase_t0_ms) >= DOG_MARCH_LEG_PAUSE_MS) {
+        if ((uint32_t)(now - s_march.phase_t0_ms) >=
+            ((cycloid_gait != 0U) ? DOG_MARCH_LEG_PAUSE_MS : march_walk_leg_pause_ms())) {
             march_advance_step(now);
         }
         break;
@@ -4466,6 +4494,7 @@ static uint8_t march_in_place_start_mode(uint8_t mode, uint8_t cycles,
     s_march.active = 1U;
     s_march.mode = mode;
     s_march.cycles_remaining = cycles;
+    s_march.active_speed_profile = dog_mit_get_gait_speed_profile();
     s_march.requested_forward = forward;
     s_march.requested_yaw = yaw;
     s_march.phase = DOG_MARCH_PHASE_ENTRY_SETTLE;

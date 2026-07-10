@@ -777,6 +777,11 @@ static uint8_t sbus_quad_drive_command(const SbusDriveInput *drive, uint32_t now
         if (dog_mit_march_in_place_is_stopping() != 0U) {
             return 0U;
         }
+        if (dog_mit_trot_march_is_active() == 0U) {
+            sbus_quad_stop_motion(1U);
+            DebugUart_Printf("SBUS stick input: stopping in-place march before drive.\r\n");
+            return 0U;
+        }
         float applied_forward = 0.0f;
         dog_mit_drive_get_command(nullptr, nullptr, &applied_forward, nullptr);
         if ((fabsf(applied_forward) >= 0.20f) && (fabsf(drive->forward) >= 0.20f) &&
@@ -820,6 +825,33 @@ static uint8_t sbus_quad_drive_command(const SbusDriveInput *drive, uint32_t now
     DebugUart_Printf("SBUS drive start f=%ld yaw=%ld.\r\n",
                      (long)(drive->forward * 1000.0f),
                      (long)(drive->yaw * 1000.0f));
+    return 1U;
+}
+
+static uint8_t sbus_quad_start_in_place(uint32_t now)
+{
+    if (dog_mit_march_in_place_is_active() != 0U) {
+        return 1U;
+    }
+    if ((s_sbus_gait_retry_cmd == SBUS_QUAD_STOP) &&
+        (s_sbus_gait_retry_ms != 0U) &&
+        ((uint32_t)(now - s_sbus_gait_retry_ms) < SBUS_GAIT_RETRY_MS)) {
+        return 0U;
+    }
+
+    if (dog_mit_march_in_place_start(0U) == 0U) {
+        s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
+        s_sbus_gait_retry_ms = now;
+        DebugUart_Printf("SBUS in-place march FAIL: check online/enc/fault.\r\n");
+        return 0U;
+    }
+
+    s_mode = MODE_MIT_DEBUG;
+    s_sbus_quad_cmd = SBUS_QUAD_STOP;
+    s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
+    s_sbus_gait_retry_ms = 0U;
+    DebugUart_Printf("SBUS main MID->HIGH: in-place march speed=%s.\r\n",
+                     dog_mit_gait_speed_profile_name());
     return 1U;
 }
 
@@ -1089,7 +1121,13 @@ static void sbus_control_update(void)
             if (sbus_quad_ensure_stand(now) != 0U) {
                 SbusDriveInput drive = {};
                 sbus_drive_input_from_sticks(&rc, &drive);
-                (void)sbus_quad_drive_command(&drive, now);
+                if (drive.active != 0U) {
+                    (void)sbus_quad_drive_command(&drive, now);
+                } else if (dog_mit_trot_march_is_active() != 0U) {
+                    sbus_quad_stop_motion(1U);
+                } else if ((changed != 0U) && (s_sbus_main_prev == SBUS_SWITCH_MID)) {
+                    (void)sbus_quad_start_in_place(now);
+                }
             }
         }
     }
