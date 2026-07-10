@@ -94,12 +94,21 @@ extern "C" {
 #define DOG_GAIT_ENTRY_VEL_DPS          10.0f
 #define DOG_GAIT_ENTRY_STABLE_MS        150U
 #define DOG_GAIT_ENTRY_TIMEOUT_MS      1500U
+#define DOG_GAIT_LOW_ENTRY_ERR_DEG       4.0f
+#define DOG_GAIT_LOW_ENTRY_VEL_DPS       8.0f
+#define DOG_GAIT_LOW_ENTRY_STABLE_MS    200U
+#define DOG_GAIT_LOW_ENTRY_TIMEOUT_MS  2000U
 #define DOG_TROT_TOUCHDOWN_VEL_DPS      10.0f
 #define DOG_TROT_TOUCHDOWN_IQ_RISE_A     1.5f
 #define DOG_TROT_TOUCHDOWN_IQ_ALPHA      0.10f
 #define DOG_TROT_TOUCHDOWN_IQ_START      0.80f
 #define DOG_TROT_TOUCHDOWN_FALLBACK_MS   40U
 #define DOG_TROT_TOUCHDOWN_TIMEOUT_MS   200U
+#define DOG_GAIT_LOW_TOUCHDOWN_ERR_DEG    4.0f
+#define DOG_GAIT_LOW_TOUCHDOWN_VEL_DPS    8.0f
+#define DOG_GAIT_LOW_TOUCHDOWN_STABLE_MS 80U
+#define DOG_GAIT_LOW_TOUCHDOWN_TIMEOUT_MS 500U
+#define DOG_GAIT_LOW_SUPPORT_CURRENT_A   16.0f
 
 #define DOG_TURN_STRIDE_X_MM             30.0f    /* in-place turn step per leg side */
 #define DOG_TURN_HZ                       DOG_TROT_HZ
@@ -306,6 +315,10 @@ uint8_t dog_mit_trot_in_place_start(uint8_t cycles);
 uint8_t dog_mit_trot_reverse_in_place_start(uint8_t cycles);
 uint8_t dog_mit_turn_left_in_place_start(uint8_t cycles);
 uint8_t dog_mit_turn_right_in_place_start(uint8_t cycles);
+uint8_t dog_mit_drive_start(uint8_t cycles, float forward, float yaw);
+uint8_t dog_mit_drive_update(float forward, float yaw);
+void dog_mit_drive_get_command(float *requested_forward, float *requested_yaw,
+                               float *applied_forward, float *applied_yaw);
 void dog_mit_march_in_place_stop(void);
 void dog_mit_march_request_stop(void);
 uint8_t dog_mit_march_in_place_is_active(void);
@@ -320,6 +333,7 @@ float dog_mit_gait_forward_stride_x_mm(void);
 float dog_mit_gait_turn_stride_x_mm(void);
 float dog_mit_gait_swing_height_mm(void);
 uint32_t dog_mit_gait_touchdown_dwell_ms(void);
+uint32_t dog_mit_gait_diagonal_stagger_ms(void);
 uint32_t dog_mit_gait_trot_swing_ms(void);
 uint8_t dog_mit_diag_support_lf_rb_start(void);
 void dog_mit_diag_support_stop(void);
