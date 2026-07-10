@@ -80,6 +80,7 @@ static uint8_t s_sbus_quad_standing = 0U;
 static uint8_t s_sbus_quad_cmd = SBUS_QUAD_STOP;
 static uint8_t s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
 static uint32_t s_sbus_gait_retry_ms = 0U;
+static uint8_t s_sbus_gait_rearm_required = 0U;
 static uint8_t s_sbus_speed_profile = DOG_GAIT_SPEED_DEFAULT;
 
 static const char *sbus_switch_name(uint8_t sw);
@@ -119,9 +120,9 @@ static void print_help(void)
     DebugUart_Printf("  T : trot cycloid speed=%s hz=%ld.%01ld step=%ldmm height=%ldmm, LF+RB<->RF+LB, x=stop\r\n",
                      dog_mit_gait_speed_profile_name(),
                      (long)dog_mit_gait_trot_hz(),
-                     (long)(dog_mit_gait_trot_hz() * 10.0f) % 10L,
-                     (long)dog_mit_gait_forward_stride_x_mm(),
-                     (long)DOG_FORWARD_SWING_LIFT_Z_MM);
+                      (long)(dog_mit_gait_trot_hz() * 10.0f) % 10L,
+                      (long)dog_mit_gait_forward_stride_x_mm(),
+                      (long)dog_mit_gait_swing_height_mm());
     DebugUart_Printf("  [ : turn left in place speed=%s stride=%ldmm, diag opposite LF+RB<->RF+LB, x=stop\r\n",
                      dog_mit_gait_speed_profile_name(),
                      (long)dog_mit_gait_turn_stride_x_mm());
@@ -547,6 +548,7 @@ static void sbus_quad_reset_state(void)
     s_sbus_quad_cmd = SBUS_QUAD_STOP;
     s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
     s_sbus_gait_retry_ms = 0U;
+    s_sbus_gait_rearm_required = 0U;
 }
 
 static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc)
@@ -571,11 +573,13 @@ static void sbus_update_speed_profile(const SbusState *rc, uint8_t changed)
     if ((changed != 0U) || (profile != s_sbus_speed_profile)) {
         s_sbus_speed_profile = profile;
         dog_mit_set_gait_speed_profile(profile);
-        DebugUart_Printf("SBUS CH3 speed=%s hz=%ld.%01ld step=%ldmm turn=%ldmm\r\n",
+        DebugUart_Printf("SBUS CH3 speed=%s hz=%ld.%01ld step=%ldmm height=%ldmm dwell=%lums turn=%ldmm\r\n",
                          dog_mit_gait_speed_profile_name(),
                          (long)dog_mit_gait_trot_hz(),
                          (long)(dog_mit_gait_trot_hz() * 10.0f) % 10L,
                          (long)dog_mit_gait_forward_stride_x_mm(),
+                         (long)dog_mit_gait_swing_height_mm(),
+                         (unsigned long)dog_mit_gait_touchdown_dwell_ms(),
                          (long)dog_mit_gait_turn_stride_x_mm());
     }
 }
@@ -583,9 +587,23 @@ static void sbus_update_speed_profile(const SbusState *rc, uint8_t changed)
 static void sbus_quad_stop_motion(uint8_t print_log)
 {
     if (dog_mit_march_in_place_is_active() != 0U) {
+        if (dog_mit_march_in_place_is_stopping() == 0U) {
+            dog_mit_march_request_stop();
+            if (print_log != 0U) {
+                DebugUart_Printf("SBUS gait stopping at neutral stance.\r\n");
+            }
+        }
+        return;
+    }
+    s_sbus_quad_cmd = SBUS_QUAD_STOP;
+}
+
+static void sbus_quad_stop_motion_immediate(uint8_t print_log)
+{
+    if (dog_mit_march_in_place_is_active() != 0U) {
         dog_mit_march_in_place_stop();
         if (print_log != 0U) {
-            DebugUart_Printf("SBUS gait stopped, holding stand.\r\n");
+            DebugUart_Printf("SBUS gait stopped immediately.\r\n");
         }
     }
     s_sbus_quad_cmd = SBUS_QUAD_STOP;
@@ -637,7 +655,7 @@ static void sbus_quad_low_mode(uint8_t main_sw, uint8_t sub_sw, uint8_t changed)
     (void)DogStand_ClearDisable();
 
     if ((s_sbus_arm_active != 0U) || (dog_mit_march_in_place_is_active() != 0U)) {
-        sbus_quad_stop_motion(changed);
+        sbus_quad_stop_motion_immediate(changed);
     }
 
     if (sbus_should_return_start_pose(changed) != 0U) {
@@ -695,12 +713,20 @@ static uint8_t sbus_quad_ensure_stand(uint32_t now)
 static uint8_t sbus_quad_start_cmd(uint8_t cmd, uint32_t now)
 {
     if (cmd == SBUS_QUAD_STOP) {
+        s_sbus_gait_rearm_required = 0U;
         sbus_quad_stop_motion(1U);
         return 1U;
     }
 
-    if ((s_sbus_quad_cmd == cmd) && (dog_mit_march_in_place_is_active() != 0U)) {
-        return 1U;
+    if (s_sbus_gait_rearm_required != 0U) {
+        return 0U;
+    }
+
+    if ((s_sbus_quad_cmd == cmd) && (dog_mit_march_in_place_is_active() == 0U)) {
+        s_sbus_quad_cmd = SBUS_QUAD_STOP;
+        s_sbus_gait_rearm_required = 1U;
+        DebugUart_Printf("SBUS gait start rejected; center sticks before retry.\r\n");
+        return 0U;
     }
 
     if ((s_sbus_gait_retry_cmd == cmd) &&
@@ -709,7 +735,11 @@ static uint8_t sbus_quad_start_cmd(uint8_t cmd, uint32_t now)
     }
 
     if (dog_mit_march_in_place_is_active() != 0U) {
-        dog_mit_march_in_place_stop();
+        if ((s_sbus_quad_cmd == cmd) && (dog_mit_march_in_place_is_stopping() == 0U)) {
+            return 1U;
+        }
+        sbus_quad_stop_motion(1U);
+        return 0U;
     }
 
     uint8_t ok = 0U;
@@ -1018,8 +1048,10 @@ static void sbus_control_update(void)
             DebugUart_Printf("SBUS main MID/sub HIGH: arm jog mode, CH6=J0 CH7=J1.\r\n");
         }
         sbus_quad_stop_motion(changed);
-        sbus_arm_enter(now);
-        sbus_arm_update(&rc, now);
+        if (dog_mit_march_in_place_is_active() == 0U) {
+            sbus_arm_enter(now);
+            sbus_arm_update(&rc, now);
+        }
     } else {
         if (s_sbus_arm_active != 0U) {
             sbus_arm_leave();

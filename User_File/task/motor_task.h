@@ -70,13 +70,9 @@ extern "C" {
 #define DOG_MARCH_LIFT_Z_MM             60.0f    /* positive clearance, subtracted from +Z-down touch-down */
 #define DOG_DIAG_SUPPORT_LIFT_Z_MM      DOG_MARCH_LIFT_Z_MM
 #define DOG_TROT_FOOT_X1_MM             0.0f
-#define DOG_TROT_FOOT_X2_MM             70.0f    /* body-forward step length magnitude */
 #define DOG_TROT_FOOT_Z1_MM             0.0f     /* relative to per-leg stand touch-down Z */
-#define DOG_TROT_FOOT_Z2_MM             40.0f    /* positive swing clearance in the +Z-down frame */
 #define DOG_TROT_FORWARD_X_SIGN         (-1.0f)  /* flip to +1 if trot direction is reversed on hardware */
 #define DOG_TROT_YAW_TRIM_X_MM           0.0f
-#define DOG_FORWARD_STRIDE_X_MM         (DOG_TROT_FOOT_X2_MM - DOG_TROT_FOOT_X1_MM)
-#define DOG_FORWARD_SWING_LIFT_Z_MM     DOG_TROT_FOOT_Z2_MM
 #define DOG_FORWARD_HIP_STEP_DEG        5.0f
 #define DOG_FORWARD_SWING_HIP_DEG       8.0f
 #define DOG_FORWARD_SWING_KNEE_DEG      (-20.0f)
@@ -92,9 +88,17 @@ extern "C" {
 #define DOG_TROT_SWING_UP_MS            35U                /* walk mode only */
 #define DOG_TROT_HOLD_MS                15U
 #define DOG_TROT_SWING_DOWN_MS          35U
-#define DOG_TROT_PAIR_PAUSE_MS          0U
 #define DOG_TROT_SETTLE_ERR_DEG         4.0f
-#define DOG_TROT_SETTLE_EXTRA_MS        120U
+#define DOG_GAIT_ENTRY_ERR_DEG           5.0f
+#define DOG_GAIT_ENTRY_VEL_DPS          10.0f
+#define DOG_GAIT_ENTRY_STABLE_MS        150U
+#define DOG_GAIT_ENTRY_TIMEOUT_MS      1500U
+#define DOG_TROT_TOUCHDOWN_VEL_DPS      10.0f
+#define DOG_TROT_TOUCHDOWN_IQ_RISE_A     1.5f
+#define DOG_TROT_TOUCHDOWN_IQ_ALPHA      0.10f
+#define DOG_TROT_TOUCHDOWN_IQ_START      0.80f
+#define DOG_TROT_TOUCHDOWN_FALLBACK_MS   40U
+#define DOG_TROT_TOUCHDOWN_TIMEOUT_MS   200U
 
 #define DOG_TURN_STRIDE_X_MM             30.0f    /* in-place turn step per leg side */
 #define DOG_TURN_HZ                       DOG_TROT_HZ
@@ -302,7 +306,9 @@ uint8_t dog_mit_trot_reverse_in_place_start(uint8_t cycles);
 uint8_t dog_mit_turn_left_in_place_start(uint8_t cycles);
 uint8_t dog_mit_turn_right_in_place_start(uint8_t cycles);
 void dog_mit_march_in_place_stop(void);
+void dog_mit_march_request_stop(void);
 uint8_t dog_mit_march_in_place_is_active(void);
+uint8_t dog_mit_march_in_place_is_stopping(void);
 uint8_t dog_mit_trot_march_is_active(void);
 uint8_t dog_mit_turn_march_is_active(void);
 void dog_mit_set_gait_speed_profile(uint8_t profile);
@@ -311,6 +317,8 @@ const char *dog_mit_gait_speed_profile_name(void);
 float dog_mit_gait_trot_hz(void);
 float dog_mit_gait_forward_stride_x_mm(void);
 float dog_mit_gait_turn_stride_x_mm(void);
+float dog_mit_gait_swing_height_mm(void);
+uint32_t dog_mit_gait_touchdown_dwell_ms(void);
 uint32_t dog_mit_gait_trot_swing_ms(void);
 uint8_t dog_mit_diag_support_lf_rb_start(void);
 void dog_mit_diag_support_stop(void);
