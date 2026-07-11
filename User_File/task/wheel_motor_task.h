@@ -68,6 +68,7 @@ uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t da
 void WheelDrive_SetMotion(float forward, float yaw, float max_rpm);
 void WheelDrive_SetProfile(WheelDriveProfile profile);
 void WheelDrive_SetOperatingMode(WheelDriveOperatingMode mode);
+void WheelDrive_HoldIfEnabled(void);
 void WheelDrive_Enable(void);
 void WheelDrive_Disable(void);
 void WheelDrive_Tick(uint32_t now_ms);

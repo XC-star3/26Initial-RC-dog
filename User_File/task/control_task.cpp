@@ -16,7 +16,9 @@
 #define DEBUG_LF_STATUS_MS 1000U
 #define STEP_DEG           30.0f
 
-#define SBUS_REMOTE_TIMEOUT_MS 1000U
+#define SBUS_REMOTE_TIMEOUT_MS 250U
+#define SBUS_FAILSAFE_CONFIRM_MS 100U
+#define SBUS_RECOVERY_GOOD_FRAMES 3U
 #define SBUS_SPEED_CH          2U
 #define SBUS_MAIN_MODE_CH      4U
 #define SBUS_SUB_MODE_CH       7U
@@ -39,6 +41,7 @@
 #define SBUS_SAFETY_RELEASE_NORM 20
 #define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
+#define SBUS_FAULT_CLEAR_RETRY_MS 1000U
 #define SBUS_MECHANICAL_PREPARE_MS     200U
 
 #define SBUS_SAFETY_RELEASED   0U
@@ -91,6 +94,12 @@ enum SbusModeBlockReason {
     SBUS_BLOCK_LEG_FAULT,
 };
 
+enum SbusLinkState {
+    SBUS_LINK_GOOD = 0U,
+    SBUS_LINK_TRANSIENT,
+    SBUS_LINK_LOST,
+};
+
 struct SbusDriveInput {
     float forward;
     float yaw;
@@ -117,6 +126,9 @@ static uint32_t s_sbus_safety_recovery_since_ms = 0U;
 static uint32_t s_sbus_lost_since_ms = 0U;
 static uint32_t s_sbus_start_ms = 0U;
 static uint8_t s_sbus_failsafe_stop_sent = 0U;
+static uint32_t s_sbus_link_bad_since_ms = 0U;
+static uint32_t s_sbus_link_last_frame = 0U;
+static uint8_t s_sbus_link_good_frames = 0U;
 static uint8_t s_sbus_remote_lockout = 0U;
 static uint8_t s_sbus_remote_lockout_logged = 0U;
 static uint8_t s_sbus_quad_standing = 0U;
@@ -133,6 +145,7 @@ static SbusRobotMode s_sbus_active_mode = SBUS_MODE_NONE;
 static SbusModeEntryState s_sbus_entry_state = SBUS_ENTRY_INACTIVE;
 static SbusModeBlockReason s_sbus_block_reason = SBUS_BLOCK_NONE;
 static uint32_t s_sbus_motor_check_last_ms = 0U;
+static uint32_t s_sbus_fault_clear_last_ms = 0U;
 
 static const char *sbus_switch_name(uint8_t sw);
 static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc);
@@ -141,6 +154,7 @@ static uint8_t sbus_safety_raw_is_high(const SbusState *rc);
 static uint8_t sbus_safety_raw_is_released(const SbusState *rc);
 static uint8_t sbus_safety_update(const SbusState *rc);
 static void sbus_update_switch_state(uint8_t main_sw, uint8_t sub_sw);
+static SbusLinkState sbus_link_state_update(const SbusState *rc, uint32_t now);
 static float sbus_axis_to_drive(int16_t value);
 static float sbus_wheel_max_rpm(const SbusState *rc);
 static void sbus_wheel_hold(void);
@@ -358,6 +372,8 @@ static void print_sbus_status(void)
     const uint8_t fresh = Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS);
     const uint32_t age = (rc.last_update_ms == 0U) ? 0xFFFFFFFFU :
                          (uint32_t)(now - rc.last_update_ms);
+    const uint32_t bad_ms = (s_sbus_link_bad_since_ms == 0U) ? 0U :
+                            (uint32_t)(now - s_sbus_link_bad_since_ms);
     const uint8_t main_sw = Sbus_Switch3(SBUS_MAIN_MODE_CH);
     const uint8_t sub_sw = Sbus_Switch3(SBUS_SUB_MODE_CH);
     const uint8_t speed = sbus_speed_profile_from_ch3(&rc);
@@ -371,7 +387,7 @@ static void print_sbus_status(void)
     dog_mit_drive_get_command(&requested_forward, &requested_yaw,
                               &applied_forward, &applied_yaw);
 
-    DebugUart_Printf("SBUS stat: frames=%lu parse_err=%lu rx_evt=%lu rx_bytes=%lu last_size=%u flag=0x%02X online=%u get=%u fresh=%u age=%lums lost=%u failsafe=%u\r\n",
+    DebugUart_Printf("SBUS stat: frames=%lu parse_err=%lu rx_evt=%lu rx_bytes=%lu last_size=%u flag=0x%02X online=%u get=%u fresh=%u age=%lums lost=%u failsafe=%u debounce=%lums good=%u/%u confirmed=%u\r\n",
                      (unsigned long)rc.frame_count,
                      (unsigned long)rc.parse_error_count,
                      (unsigned long)rc.rx_event_count,
@@ -383,7 +399,11 @@ static void print_sbus_status(void)
                      (unsigned)fresh,
                      (unsigned long)age,
                      (unsigned)rc.signal_lost,
-                     (unsigned)rc.failsafe);
+                     (unsigned)rc.failsafe,
+                     (unsigned long)bad_ms,
+                     (unsigned)s_sbus_link_good_frames,
+                     (unsigned)SBUS_RECOVERY_GOOD_FRAMES,
+                     (unsigned)s_sbus_failsafe_stop_sent);
     DebugUart_Printf("  CH1 turn raw=%u norm=%d  CH2 move raw=%u norm=%d  CH3 speed raw=%u norm=%d -> wheel=%ldrpm gait=%s\r\n",
                      (unsigned)rc.ch[0],
                      (int)rc.norm[0],
@@ -695,10 +715,8 @@ static void sbus_arm_update(const SbusState *rc, uint32_t now)
     const uint8_t j0_online = ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback);
     const uint8_t j1_online = ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback);
     if ((j0_online == 0U) && (j1_online == 0U)) {
-        DebugUart_Printf("SBUS arm feedback timeout: both joints offline; move main LOW to recover.\r\n");
+        DebugUart_Printf("SBUS arm feedback timeout: both joints offline; arm output stopped.\r\n");
         sbus_arm_leave();
-        s_sbus_remote_lockout = 1U;
-        s_sbus_remote_lockout_logged = 0U;
         return;
     }
 
@@ -929,6 +947,19 @@ static uint8_t sbus_quad_ensure_stand(uint32_t now)
         ((uint32_t)(now - s_sbus_gait_retry_ms) < SBUS_GAIT_RETRY_MS)) {
         return 0U;
     }
+
+    const uint8_t fault_mask = DogStand_GetFaultMask();
+    if (fault_mask != 0U) {
+        if ((s_sbus_fault_clear_last_ms == 0U) ||
+            ((uint32_t)(now - s_sbus_fault_clear_last_ms) >= SBUS_FAULT_CLEAR_RETRY_MS)) {
+            s_sbus_fault_clear_last_ms = now;
+            dog_debug_clear_errors();
+            DebugUart_Printf("SBUS leg fault=0x%02X: clear requested; stand will retry automatically.\r\n",
+                             (unsigned)fault_mask);
+        }
+        return 0U;
+    }
+    s_sbus_fault_clear_last_ms = 0U;
 
     dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
     uint8_t ok = dog_mit_stand_sequence();
@@ -1205,6 +1236,10 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
         sbus_mode_transition(requested);
     }
 
+    if (DogSafety_IsLatched() == 0U) {
+        (void)WheelDrive_TryClearLock();
+    }
+
     switch (requested) {
     case SBUS_MODE_MOTOR_CHECK:
         sbus_wheel_disable(0U);
@@ -1317,10 +1352,12 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
         if (dog_mit_fault_hold_is_active() != 0U) {
             sbus_wheel_hold();
             sbus_quad_stop_motion(0U);
-            s_sbus_active_mode = SBUS_MODE_NONE;
-            s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
-            s_sbus_block_reason = SBUS_BLOCK_LEG_FAULT;
-            break;
+            if (sbus_quad_ensure_stand(now) == 0U) {
+                s_sbus_active_mode = SBUS_MODE_NONE;
+                s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
+                s_sbus_block_reason = SBUS_BLOCK_LEG_FAULT;
+                break;
+            }
         }
         if (WheelDrive_IsAvailable() == 0U) {
             sbus_wheel_hold();
@@ -1422,6 +1459,62 @@ static void sbus_safety_trigger(void)
     DebugUart_Printf("SBUS CH9 safety: ESTOP latched; release CH9 and move main LOW to re-arm.\r\n");
 }
 
+static SbusLinkState sbus_link_state_update(const SbusState *rc, uint32_t now)
+{
+    if (rc == nullptr) {
+        return SBUS_LINK_TRANSIENT;
+    }
+
+    const uint8_t have_frame = (rc->frame_count != 0U) ? 1U : 0U;
+    const uint8_t frame_recent = ((have_frame != 0U) &&
+        ((uint32_t)(now - rc->last_update_ms) <= SBUS_REMOTE_TIMEOUT_MS)) ? 1U : 0U;
+    const uint8_t link_bad = ((frame_recent == 0U) || (rc->signal_lost != 0U) ||
+                              (rc->failsafe != 0U)) ? 1U : 0U;
+
+    if ((have_frame == 0U) &&
+        ((uint32_t)(now - s_sbus_start_ms) < SBUS_REMOTE_TIMEOUT_MS)) {
+        return SBUS_LINK_TRANSIENT;
+    }
+
+    if (link_bad != 0U) {
+        s_sbus_link_good_frames = 0U;
+        if (s_sbus_link_bad_since_ms == 0U) {
+            s_sbus_link_bad_since_ms = (now != 0U) ? now : 1U;
+        }
+        return ((uint32_t)(now - s_sbus_link_bad_since_ms) >= SBUS_FAILSAFE_CONFIRM_MS) ?
+            SBUS_LINK_LOST : SBUS_LINK_TRANSIENT;
+    }
+
+    if (s_sbus_link_bad_since_ms == 0U) {
+        s_sbus_link_last_frame = rc->frame_count;
+        s_sbus_link_good_frames = SBUS_RECOVERY_GOOD_FRAMES;
+        return SBUS_LINK_GOOD;
+    }
+
+    if (rc->frame_count != s_sbus_link_last_frame) {
+        s_sbus_link_last_frame = rc->frame_count;
+        if (s_sbus_link_good_frames < SBUS_RECOVERY_GOOD_FRAMES) {
+            s_sbus_link_good_frames++;
+        }
+    }
+    if (s_sbus_link_good_frames < SBUS_RECOVERY_GOOD_FRAMES) {
+        return SBUS_LINK_TRANSIENT;
+    }
+
+    s_sbus_link_bad_since_ms = 0U;
+    return SBUS_LINK_GOOD;
+}
+
+static void sbus_remote_transient_inhibit(uint32_t now)
+{
+    Dog_Remote_Sample sample = {};
+    sbus_wheel_hold();
+    sbus_arm_leave();
+    sbus_quad_stop_motion(0U);
+    sample.tick_ms = now;
+    DogRemote_Update(&sample);
+}
+
 static void sbus_remote_failsafe(uint32_t now)
 {
     Dog_Remote_Sample sample = {};
@@ -1431,11 +1524,11 @@ static void sbus_remote_failsafe(uint32_t now)
     }
 
     if (s_sbus_failsafe_stop_sent == 0U) {
-        DebugUart_Printf("SBUS lost/failsafe: all motors disabled; restore signal and move main LOW.\r\n");
-        DogStand_Disable();
+        DebugUart_Printf("SBUS loss confirmed: holding healthy legs and stopping auxiliary outputs; recovery is automatic.\r\n");
+        dog_mit_protect_hold();
         s_sbus_mechanical_permit = 0U;
         s_sbus_mechanical_prepare_since_ms = 0U;
-        sbus_wheel_disable(1U);
+        sbus_wheel_hold();
         sbus_arm_leave();
         sbus_quad_reset_state();
         s_sbus_active_mode = SBUS_MODE_NONE;
@@ -1445,8 +1538,6 @@ static void sbus_remote_failsafe(uint32_t now)
         s_sbus_arm_active = 0U;
         s_sbus_arm_last_ms = 0U;
         s_sbus_failsafe_stop_sent = 1U;
-        s_sbus_remote_lockout = 1U;
-        s_sbus_remote_lockout_logged = 0U;
         s_sbus_safety_recovery_since_ms = 0U;
     }
 
@@ -1464,14 +1555,13 @@ void control_task_safety_poll(void)
 
     Sbus_Process();
     (void)Sbus_GetState(&rc);
-    if (rc.frame_count == 0U) {
-        if ((uint32_t)(now - s_sbus_start_ms) >= SBUS_REMOTE_TIMEOUT_MS) {
-            sbus_remote_failsafe(now);
-        }
+    const SbusLinkState link_state = sbus_link_state_update(&rc, now);
+    if (link_state == SBUS_LINK_LOST) {
+        sbus_remote_failsafe(now);
         return;
     }
-    if (Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS) == 0U) {
-        sbus_remote_failsafe(now);
+    if (link_state == SBUS_LINK_TRANSIENT) {
+        sbus_remote_transient_inhibit(now);
         return;
     }
 
@@ -1500,15 +1590,13 @@ static void sbus_control_update(void)
     Sbus_Process();
     (void)Sbus_GetState(&rc);
 
-    if (rc.frame_count == 0U) {
-        if ((uint32_t)(now - s_sbus_start_ms) >= SBUS_REMOTE_TIMEOUT_MS) {
-            sbus_remote_failsafe(now);
-        }
+    const SbusLinkState link_state = sbus_link_state_update(&rc, now);
+    if (link_state == SBUS_LINK_LOST) {
+        sbus_remote_failsafe(now);
         return;
     }
-
-    if (Sbus_IsFresh(SBUS_REMOTE_TIMEOUT_MS) == 0U) {
-        sbus_remote_failsafe(now);
+    if (link_state == SBUS_LINK_TRANSIENT) {
+        sbus_remote_transient_inhibit(now);
         return;
     }
 
@@ -1521,8 +1609,6 @@ static void sbus_control_update(void)
         }
         s_sbus_lost_since_ms = 0U;
         s_sbus_failsafe_stop_sent = 0U;
-        s_sbus_remote_lockout = 1U;
-        s_sbus_remote_lockout_logged = 0U;
     }
 
     const uint8_t main_sw = Sbus_Switch3(SBUS_MAIN_MODE_CH);
@@ -1537,8 +1623,6 @@ static void sbus_control_update(void)
         DebugUart_Printf("SBUS online main=%s sub=%s.\r\n",
                          sbus_switch_name(main_sw),
                          sbus_switch_name(sub_sw));
-        s_sbus_remote_lockout = 1U;
-        s_sbus_remote_lockout_logged = 0U;
     }
     s_sbus_seen_fresh = 1U;
     sbus_update_speed_profile(&rc, (s_sbus_switch_valid == 0U) ? 1U : 0U);
@@ -1581,7 +1665,16 @@ static void sbus_control_update(void)
     }
 
     if (s_sbus_remote_lockout != 0U) {
-        if ((main_sw == SBUS_SWITCH_LOW) && (sub_sw == SBUS_SWITCH_LOW)) {
+        const uint8_t low_low = ((main_sw == SBUS_SWITCH_LOW) &&
+                                 (sub_sw == SBUS_SWITCH_LOW)) ? 1U : 0U;
+        const uint8_t sticks_neutral =
+            ((rc.norm[0U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
+             (rc.norm[0U] <= SBUS_MOVE_EXIT_DEADBAND) &&
+             (rc.norm[1U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
+             (rc.norm[1U] <= SBUS_MOVE_EXIT_DEADBAND)) ? 1U : 0U;
+        const uint8_t recovery_ready = (s_sbus_safety_needs_clear != 0U) ?
+            low_low : sticks_neutral;
+        if (recovery_ready != 0U) {
             if (s_sbus_safety_needs_clear != 0U) {
                 if (s_sbus_safety_recovery_since_ms == 0U) {
                     s_sbus_safety_recovery_since_ms = now;
@@ -1610,11 +1703,13 @@ static void sbus_control_update(void)
             }
             s_sbus_remote_lockout = 0U;
             s_sbus_remote_lockout_logged = 0U;
-            DebugUart_Printf("SBUS remote lockout cleared by main LOW.\r\n");
+            DebugUart_Printf("SBUS protection hold cleared with neutral sticks.\r\n");
         } else {
             s_sbus_safety_recovery_since_ms = 0U;
             if (s_sbus_remote_lockout_logged == 0U) {
-                DebugUart_Printf("SBUS remote lockout: select LOW+LOW before control resumes.\r\n");
+                DebugUart_Printf((s_sbus_safety_needs_clear != 0U) ?
+                    "SBUS ESTOP recovery: select LOW+LOW.\r\n" :
+                    "SBUS protection hold: center CH1/CH2 before control resumes.\r\n");
                 s_sbus_remote_lockout_logged = 1U;
             }
             DogRemote_Update(&sample);

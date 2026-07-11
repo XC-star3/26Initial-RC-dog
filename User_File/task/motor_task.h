@@ -291,6 +291,7 @@ uint8_t dog_debug_mit_boot_sequence(void);
 uint8_t dog_debug_teach_hold_start(void);
 uint8_t dog_mit_debug_is_active(void);
 uint8_t dog_mit_fault_hold_is_active(void);
+void dog_mit_protect_hold(void);
 uint8_t dog_debug_mit_torque_test(uint8_t bus, uint8_t node_id, float torque_nm);
 void dog_debug_mit_torque_stop(void);
 void dog_debug_start_position_tx(void);

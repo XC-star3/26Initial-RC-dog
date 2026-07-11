@@ -19,10 +19,11 @@
 #define WHEEL_RPM_TO_RAD_S               (WHEEL_TWO_PI / 60.0f)
 #define WHEEL_RAD_S_TO_RPM               (60.0f / WHEEL_TWO_PI)
 #define WHEEL_CONTROL_PERIOD_MS          2U
-#define WHEEL_FEEDBACK_TIMEOUT_MS         100U
+#define WHEEL_FEEDBACK_TIMEOUT_MS         250U
 #define WHEEL_COMMAND_TIMEOUT_MS          100U
 #define WHEEL_LOCK_CLEAR_STABLE_MS       200U
 #define WHEEL_BUS_CHECK_PERIOD_MS        100U
+#define WHEEL_TX_RETRY_BACKOFF_MS         10U
 #define WHEEL_STOP_SPEED_RAD_S           0.5f
 #define WHEEL_ACCEL_RAD_S2               30.0f
 #define WHEEL_DECEL_RAD_S2               50.0f
@@ -79,6 +80,7 @@ static uint8_t s_bus_off_active = 0U;
 static uint32_t s_init_ms = 0U;
 static uint32_t s_last_control_ms = 0U;
 static uint32_t s_last_bus_check_ms = 0U;
+static uint32_t s_next_tx_attempt_ms = 0U;
 static volatile uint32_t s_stop_stable_since_ms = 0U;
 static uint32_t s_tx_fail_count = 0U;
 static uint32_t s_bus_off_count = 0U;
@@ -194,6 +196,11 @@ static uint8_t send_currents(const int16_t current[WHEEL_MOTOR_COUNT])
         return 0U;
     }
 
+    const uint32_t now_ms = HAL_GetTick();
+    if ((int32_t)(now_ms - s_next_tx_attempt_ms) < 0) {
+        return 0U;
+    }
+
     uint8_t tx[8] = {};
     for (uint8_t id = 1U; id <= WHEEL_MOTOR_COUNT; ++id) {
         const uint8_t group = (uint8_t)((id - 1U) / 4U);
@@ -208,8 +215,10 @@ static uint8_t send_currents(const int16_t current[WHEEL_MOTOR_COUNT])
 
     if (fdcan_send_std8(s_can, WHEEL_CAN_CONTROL_ID, tx) != 0U) {
         s_tx_fail_count++;
+        s_next_tx_attempt_ms = now_ms + WHEEL_TX_RETRY_BACKOFF_MS;
         return 0U;
     }
+    s_next_tx_attempt_ms = now_ms;
     return 1U;
 }
 
@@ -260,6 +269,7 @@ void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan)
     s_init_ms = HAL_GetTick();
     s_last_control_ms = s_init_ms;
     s_last_bus_check_ms = s_init_ms;
+    s_next_tx_attempt_ms = s_init_ms;
     s_stop_stable_since_ms = 0U;
     s_tx_fail_count = 0U;
     s_bus_off_count = 0U;
@@ -414,6 +424,13 @@ void WheelDrive_SetOperatingMode(WheelDriveOperatingMode mode)
     }
 }
 
+void WheelDrive_HoldIfEnabled(void)
+{
+    if (s_operating_mode != WHEEL_OPERATING_OFF) {
+        WheelDrive_SetOperatingMode(WHEEL_OPERATING_HOLD);
+    }
+}
+
 void WheelDrive_Enable(void)
 {
     WheelDrive_SetOperatingMode(WHEEL_OPERATING_DRIVE);
@@ -508,13 +525,22 @@ static void service_bus(uint32_t now_ms)
         if (s_bus_off_active == 0U) {
             s_bus_off_active = 1U;
             s_bus_off_count++;
+            s_can_ready = 0U;
+            if (feedback_lock() != 0U) {
+                s_feedback_seen_mask = 0U;
+                feedback_unlock();
+            }
             lock_drive(0U);
         }
         if (fdcan_recover_bus_off(s_can) == FDCAN_RECOVERY_RESTARTED) {
-            s_can_ready = 1U;
-            s_zero_pending = 1U;
+            s_next_tx_attempt_ms = now_ms;
         }
     } else {
+        if (s_bus_off_active != 0U) {
+            s_can_ready = 1U;
+            s_zero_pending = 1U;
+            s_next_tx_attempt_ms = now_ms;
+        }
         s_bus_off_active = 0U;
     }
 }
@@ -532,6 +558,9 @@ void WheelDrive_Tick(uint32_t now_ms)
     if (s_reset_pending != 0U) {
         s_reset_pending = 0U;
         reset_controller();
+    }
+    if (s_can_ready == 0U) {
+        return;
     }
     if (s_zero_pending != 0U) {
         s_zero_pending = 0U;
