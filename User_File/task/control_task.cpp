@@ -110,7 +110,7 @@ static void print_wheel_status(void)
 {
     WheelDriveDiag diag = {};
     WheelDrive_GetDiag(&diag);
-    DebugUart_Printf("WHEEL: can=%u mode=%u lock=%u brake=%u online=%u stopped=%u seen=0x%X profile=%u req=%ld/%ldrpm txfail=%lu busoff=%lu timeout=%lu reject=%lu\r\n",
+    DebugUart_Printf("WHEEL: can=%u mode=%u lock=%u brake=%u online=%u stopped=%u seen=0x%X profile=%u peak=0x%X therm=0x%X hot=0x%X req=%ld/%ldrpm txfail=%lu busoff=%lu timeout=%lu reject=%lu\r\n",
                      (unsigned)diag.can_ready,
                      (unsigned)diag.mode_enabled,
                      (unsigned)diag.locked,
@@ -119,6 +119,9 @@ static void print_wheel_status(void)
                      (unsigned)diag.stopped,
                      (unsigned)diag.feedback_seen_mask,
                      (unsigned)diag.profile,
+                     (unsigned)diag.peak_limited_mask,
+                     (unsigned)diag.thermal_derated_mask,
+                     (unsigned)diag.overtemp_mask,
                      (long)diag.requested_left_rpm,
                      (long)diag.requested_right_rpm,
                      (unsigned long)diag.tx_fail_count,
@@ -126,13 +129,15 @@ static void print_wheel_status(void)
                      (unsigned long)diag.feedback_timeout_count,
                      (unsigned long)diag.rx_reject_count);
     for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
-        DebugUart_Printf("  W%u enc=%u rounds=%ld target=%ldrpm speed=%ldrpm cmd=%d iq=%d temp=%u age=%lums\r\n",
+        DebugUart_Printf("  W%u enc=%u rounds=%ld target=%ldrpm speed=%ldrpm cmd=%d lim=%d peak=%ums iq=%d temp=%u age=%lums\r\n",
                          (unsigned)(i + 1U),
                          (unsigned)diag.motor[i].encoder_raw,
                          (long)diag.motor[i].encoder_rounds,
                          (long)diag.ramped_target_rpm[i],
                          (long)diag.vehicle_speed_rpm[i],
                          (int)diag.current_cmd[i],
+                         (int)diag.current_limit_raw[i],
+                         (unsigned)diag.peak_budget_ms[i],
                          (int)diag.motor[i].torque_current_raw,
                          (unsigned)diag.motor[i].temperature_c,
                          (unsigned long)(HAL_GetTick() - diag.motor[i].last_update_ms));

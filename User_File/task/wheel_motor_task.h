@@ -37,11 +37,16 @@ typedef struct WheelDriveDiag {
     uint8_t feedback_seen_mask;
     uint8_t profile;
     uint8_t brake_active;
+    uint8_t peak_limited_mask;
+    uint8_t thermal_derated_mask;
+    uint8_t overtemp_mask;
     float requested_left_rpm;
     float requested_right_rpm;
     float ramped_target_rpm[WHEEL_MOTOR_COUNT];
     float vehicle_speed_rpm[WHEEL_MOTOR_COUNT];
     int16_t current_cmd[WHEEL_MOTOR_COUNT];
+    int16_t current_limit_raw[WHEEL_MOTOR_COUNT];
+    uint16_t peak_budget_ms[WHEEL_MOTOR_COUNT];
     uint32_t tx_fail_count;
     uint32_t bus_off_count;
     uint32_t feedback_timeout_count;
