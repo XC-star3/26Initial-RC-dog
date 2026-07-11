@@ -283,7 +283,7 @@ static void print_help(void)
     DebugUart_Printf("  Gait: CH1/CH2 blend, CH3 LOW/MID/HIGH profile, CH9 safety\r\n");
     DebugUart_Printf("  SB+SC: L+L=motor check/OFF, L+M=mechanical wheel, L+H=RX-only/HOLD\r\n");
     DebugUart_Printf("  SB+SC: M+L=stand/HOLD, M+M=stand wheel, M+H=stand arm/HOLD\r\n");
-    DebugUart_Printf("  SB+SC: H+L=gait wheel, H+M=gait only/HOLD, H+H=reserved stand/HOLD\r\n");
+    DebugUart_Printf("  SB+SC: H+L=gait only/HOLD, H+M=gait wheel, H+H=reserved stand/HOLD\r\n");
     DebugUart_Printf("  CH6/CH7 arm jog: J0 DM4310 / J1 EL05, %.0f deg/s max\r\n\r\n",
                      (double)SBUS_ARM_RATE_DEG_S);
 }
@@ -568,8 +568,8 @@ static SbusRobotMode sbus_decode_robot_mode(uint8_t main_sw, uint8_t sub_sw)
         if (sub_sw == SBUS_SWITCH_MID) return SBUS_MODE_STAND_WHEEL;
         return SBUS_MODE_STAND_ARM;
     }
-    if (sub_sw == SBUS_SWITCH_LOW) return SBUS_MODE_GAIT_WHEEL;
-    if (sub_sw == SBUS_SWITCH_MID) return SBUS_MODE_GAIT_ONLY;
+    if (sub_sw == SBUS_SWITCH_LOW) return SBUS_MODE_GAIT_ONLY;
+    if (sub_sw == SBUS_SWITCH_MID) return SBUS_MODE_GAIT_WHEEL;
     return SBUS_MODE_RESERVED_STAND;
 }
 
