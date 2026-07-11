@@ -17,6 +17,12 @@ typedef enum WheelDriveProfile {
     WHEEL_PROFILE_MECHANICAL_CRAWL,
 } WheelDriveProfile;
 
+typedef enum WheelDriveOperatingMode {
+    WHEEL_OPERATING_OFF = 0,
+    WHEEL_OPERATING_HOLD,
+    WHEEL_OPERATING_DRIVE,
+} WheelDriveOperatingMode;
+
 typedef struct WheelMotorFeedback {
     uint16_t encoder_raw;
     int32_t encoder_rounds;
@@ -36,6 +42,7 @@ typedef struct WheelDriveDiag {
     uint8_t stopped;
     uint8_t feedback_seen_mask;
     uint8_t profile;
+    uint8_t operating_mode;
     uint8_t brake_active;
     uint8_t peak_limited_mask;
     uint8_t thermal_derated_mask;
@@ -50,6 +57,7 @@ typedef struct WheelDriveDiag {
     uint32_t tx_fail_count;
     uint32_t bus_off_count;
     uint32_t feedback_timeout_count;
+    uint32_t command_timeout_count;
     uint32_t rx_reject_count;
     WheelMotorFeedback motor[WHEEL_MOTOR_COUNT];
 } WheelDriveDiag;
@@ -59,12 +67,14 @@ uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t da
 /* forward/yaw are normalized to [-1, 1]; max_rpm is an output-shaft limit. */
 void WheelDrive_SetMotion(float forward, float yaw, float max_rpm);
 void WheelDrive_SetProfile(WheelDriveProfile profile);
+void WheelDrive_SetOperatingMode(WheelDriveOperatingMode mode);
 void WheelDrive_Enable(void);
 void WheelDrive_Disable(void);
 void WheelDrive_Tick(uint32_t now_ms);
 void WheelDrive_StopAndLock(void);
 uint8_t WheelDrive_TryClearLock(void);
 uint8_t WheelDrive_AllOnline(void);
+uint8_t WheelDrive_IsAvailable(void);
 uint8_t WheelDrive_IsStopped(void);
 void WheelDrive_GetDiag(WheelDriveDiag *diag);
 

@@ -20,6 +20,7 @@
 #define WHEEL_RAD_S_TO_RPM               (60.0f / WHEEL_TWO_PI)
 #define WHEEL_CONTROL_PERIOD_MS          2U
 #define WHEEL_FEEDBACK_TIMEOUT_MS         100U
+#define WHEEL_COMMAND_TIMEOUT_MS          100U
 #define WHEEL_LOCK_CLEAR_STABLE_MS       200U
 #define WHEEL_BUS_CHECK_PERIOD_MS        100U
 #define WHEEL_STOP_SPEED_RAD_S           0.5f
@@ -65,6 +66,7 @@ static volatile uint8_t s_brake_requested = 0U;
 static volatile uint8_t s_brake_active = 0U;
 static volatile uint32_t s_motion_generation = 0U;
 static volatile uint8_t s_mode_enabled = 0U;
+static volatile WheelDriveOperatingMode s_operating_mode = WHEEL_OPERATING_OFF;
 static volatile uint8_t s_locked = 0U;
 static volatile uint8_t s_can_ready = 0U;
 static volatile uint8_t s_reset_pending = 0U;
@@ -81,7 +83,9 @@ static volatile uint32_t s_stop_stable_since_ms = 0U;
 static uint32_t s_tx_fail_count = 0U;
 static uint32_t s_bus_off_count = 0U;
 static uint32_t s_feedback_timeout_count = 0U;
+static uint32_t s_command_timeout_count = 0U;
 static uint32_t s_rx_reject_count = 0U;
+static volatile uint32_t s_last_command_ms = 0U;
 static volatile uint8_t s_peak_limited_mask = 0U;
 static volatile uint8_t s_thermal_derated_mask = 0U;
 static volatile uint8_t s_overtemp_mask = 0U;
@@ -220,6 +224,7 @@ static void lock_drive(uint8_t feedback_timeout)
     s_state_generation++;
     s_locked = 1U;
     s_mode_enabled = 0U;
+    s_operating_mode = WHEEL_OPERATING_OFF;
     clear_motion();
     s_brake_active = 0U;
     s_profile = WHEEL_PROFILE_NORMAL;
@@ -242,6 +247,7 @@ void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan)
     memset(s_peak_budget_ms, 0, sizeof(s_peak_budget_ms));
     reset_controller();
     s_mode_enabled = 0U;
+    s_operating_mode = WHEEL_OPERATING_OFF;
     s_reset_pending = 0U;
     s_zero_pending = 0U;
     s_state_generation = 0U;
@@ -258,7 +264,9 @@ void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan)
     s_tx_fail_count = 0U;
     s_bus_off_count = 0U;
     s_feedback_timeout_count = 0U;
+    s_command_timeout_count = 0U;
     s_rx_reject_count = 0U;
+    s_last_command_ms = s_init_ms;
     s_can_ready = ((hfdcan != nullptr) && (hfdcan->Instance == FDCAN3) &&
                    system_can[2] && (s_feedback_mutex != nullptr)) ? 1U : 0U;
     s_locked = (s_can_ready != 0U) ? 0U : 1U;
@@ -320,6 +328,10 @@ uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t da
 
 void WheelDrive_SetMotion(float forward, float yaw, float max_rpm)
 {
+    if (s_operating_mode != WHEEL_OPERATING_DRIVE) {
+        return;
+    }
+    s_last_command_ms = HAL_GetTick();
     if ((!isfinite(forward)) || (!isfinite(yaw)) || (!isfinite(max_rpm))) {
         commit_motion(0.0f, 0.0f, 1U);
         return;
@@ -371,24 +383,45 @@ void WheelDrive_SetProfile(WheelDriveProfile profile)
     }
 }
 
-void WheelDrive_Enable(void)
+void WheelDrive_SetOperatingMode(WheelDriveOperatingMode mode)
 {
-    if ((s_can_ready != 0U) && (s_locked == 0U)) {
+    if ((mode != WHEEL_OPERATING_OFF) &&
+        (mode != WHEEL_OPERATING_HOLD) &&
+        (mode != WHEEL_OPERATING_DRIVE)) {
+        mode = WHEEL_OPERATING_OFF;
+    }
+    s_last_command_ms = HAL_GetTick();
+    if ((s_locked != 0U) && (mode != WHEEL_OPERATING_OFF)) {
+        return;
+    }
+    if (s_operating_mode == mode) {
+        return;
+    }
+
+    s_state_generation++;
+    s_operating_mode = mode;
+    s_reset_pending = 1U;
+    s_zero_pending = 1U;
+    if (mode == WHEEL_OPERATING_OFF) {
+        s_mode_enabled = 0U;
+        clear_motion();
+        s_brake_active = 0U;
+    } else if (mode == WHEEL_OPERATING_HOLD) {
+        s_mode_enabled = 1U;
+        commit_motion(0.0f, 0.0f, 1U);
+    } else {
         s_mode_enabled = 1U;
     }
 }
 
+void WheelDrive_Enable(void)
+{
+    WheelDrive_SetOperatingMode(WHEEL_OPERATING_DRIVE);
+}
+
 void WheelDrive_Disable(void)
 {
-    const uint8_t was_enabled = s_mode_enabled;
-    s_mode_enabled = 0U;
-    clear_motion();
-    s_brake_active = 0U;
-    if (was_enabled != 0U) {
-        s_state_generation++;
-        s_reset_pending = 1U;
-        s_zero_pending = 1U;
-    }
+    WheelDrive_SetOperatingMode(WHEEL_OPERATING_OFF);
 }
 
 uint8_t WheelDrive_AllOnline(void)
@@ -400,6 +433,12 @@ uint8_t WheelDrive_AllOnline(void)
     const uint8_t online = all_online_locked(now);
     feedback_unlock();
     return online;
+}
+
+uint8_t WheelDrive_IsAvailable(void)
+{
+    return ((s_can_ready != 0U) && (s_locked == 0U) &&
+            (s_overtemp_mask == 0U) && (WheelDrive_AllOnline() != 0U)) ? 1U : 0U;
 }
 
 uint8_t WheelDrive_IsStopped(void)
@@ -522,14 +561,19 @@ void WheelDrive_Tick(uint32_t now_ms)
         s_zero_pending = (send_zero() != 0U) ? 0U : 1U;
         return;
     }
+    if ((s_operating_mode != WHEEL_OPERATING_OFF) &&
+        ((uint32_t)(now_ms - s_last_command_ms) > WHEEL_COMMAND_TIMEOUT_MS)) {
+        s_command_timeout_count++;
+        lock_drive(0U);
+        reset_controller();
+        s_reset_pending = 0U;
+        s_zero_pending = (send_zero() != 0U) ? 0U : 1U;
+        return;
+    }
     if ((s_locked != 0U) || (s_can_ready == 0U) || (s_mode_enabled == 0U)) {
         return;
     }
-    const WheelDriveProfile profile = s_profile;
-    const uint8_t mechanical_ready = DogStand_IsMechanicalLimitIdleReady();
-    if ((DogSafety_IsLatched() != 0U) ||
-        ((profile == WHEEL_PROFILE_MECHANICAL_CRAWL) && (mechanical_ready == 0U)) ||
-        ((profile != WHEEL_PROFILE_MECHANICAL_CRAWL) && (DogStand_IsDisabled() != 0U))) {
+    if (DogSafety_IsLatched() != 0U) {
         lock_drive(0U);
         reset_controller();
         s_reset_pending = 0U;
@@ -680,6 +724,7 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
     diag->all_online = WheelDrive_AllOnline();
     diag->stopped = WheelDrive_IsStopped();
     diag->profile = (uint8_t)s_profile;
+    diag->operating_mode = (uint8_t)s_operating_mode;
     diag->brake_active = s_brake_active;
     diag->peak_limited_mask = s_peak_limited_mask;
     diag->thermal_derated_mask = s_thermal_derated_mask;
@@ -689,6 +734,7 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
     diag->tx_fail_count = s_tx_fail_count;
     diag->bus_off_count = s_bus_off_count;
     diag->feedback_timeout_count = s_feedback_timeout_count;
+    diag->command_timeout_count = s_command_timeout_count;
     diag->rx_reject_count = s_rx_reject_count;
     if (feedback_lock() != 0U) {
         diag->feedback_seen_mask = s_feedback_seen_mask;

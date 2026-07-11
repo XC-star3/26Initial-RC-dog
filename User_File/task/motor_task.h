@@ -399,6 +399,7 @@ void DogStand_ExitMechanicalLimitIdle(void);
 Dog_Stand_State DogStand_GetState(void);
 uint8_t DogStand_GetOnlineMask(void);
 uint8_t DogStand_GetReadyMask(void);
+uint8_t DogStand_GetFaultMask(void);
 uint8_t DogSafety_IsLatched(void);
 void DogSafety_SetSdEstop(uint8_t active);
 uint8_t DogSafety_RequestRearm(void);

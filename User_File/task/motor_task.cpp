@@ -6564,6 +6564,15 @@ uint8_t DogStand_GetReadyMask(void)
     return mask;
 }
 
+uint8_t DogStand_GetFaultMask(void)
+{
+    uint8_t mask = 0U;
+    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_has_fault(i) != 0U) mask |= (uint8_t)(1U << i);
+    }
+    return mask;
+}
+
 static uint8_t next_online_motor_on_bus(uint8_t bus, uint8_t *cursor)
 {
     if (cursor == nullptr) {
