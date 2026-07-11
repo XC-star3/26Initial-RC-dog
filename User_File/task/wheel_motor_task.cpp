@@ -14,25 +14,34 @@
 #define WHEEL_CAN_FEEDBACK_LAST_ID       0x204U
 #define WHEEL_ENCODER_COUNTS             8192
 #define WHEEL_ENCODER_HALF_COUNTS        (WHEEL_ENCODER_COUNTS / 2)
-#define WHEEL_GEAR_RATIO                 19.0f
+#define WHEEL_GEAR_RATIO                 (268.0f / 17.0f)
 #define WHEEL_TWO_PI                     6.28318530717958647692f
+#define WHEEL_RPM_TO_RAD_S               (WHEEL_TWO_PI / 60.0f)
+#define WHEEL_RAD_S_TO_RPM               (60.0f / WHEEL_TWO_PI)
 #define WHEEL_CONTROL_PERIOD_MS          2U
 #define WHEEL_FEEDBACK_TIMEOUT_MS         100U
 #define WHEEL_LOCK_CLEAR_STABLE_MS       200U
 #define WHEEL_BUS_CHECK_PERIOD_MS        100U
 #define WHEEL_STOP_SPEED_RAD_S           0.5f
-#define WHEEL_NORMAL_SPEED_RAD_S         3.0f
-#define WHEEL_NORMAL_RAMP_RAD_S2         6.0f
-#define WHEEL_CRAWL_SPEED_RAD_S          2.0f
-#define WHEEL_CRAWL_RAMP_RAD_S2          4.0f
+#define WHEEL_NORMAL_ACCEL_RAD_S2        30.0f
+#define WHEEL_NORMAL_DECEL_RAD_S2        50.0f
+#define WHEEL_NORMAL_BRAKE_RAD_S2        60.0f
+#define WHEEL_CRAWL_ACCEL_RAD_S2         4.0f
+#define WHEEL_CRAWL_DECEL_RAD_S2         8.0f
+#define WHEEL_CRAWL_BRAKE_RAD_S2         20.0f
 #define WHEEL_PI_KP                      0.015f
 #define WHEEL_PI_KI_PER_S                0.25f
-#define WHEEL_PI_NORMALIZED_LIMIT        0.3f
 #define WHEEL_CURRENT_RAW_SCALE          10000.0f
 #define WHEEL_NORMAL_CURRENT_RAW_LIMIT   3000
 #define WHEEL_CRAWL_CURRENT_RAW_LIMIT    2000
+#define WHEEL_NORMAL_BRAKE_RAW_LIMIT     2500
+#define WHEEL_CRAWL_BRAKE_RAW_LIMIT      1500
+#define WHEEL_QUICK_TURN_FULL            0.05f
+#define WHEEL_QUICK_TURN_END             0.25f
+#define WHEEL_MOTION_ZERO_EPSILON        0.0001f
 
-static const float s_forward_sign[WHEEL_MOTOR_COUNT] = {1.0f, -1.0f, -1.0f, 1.0f};
+/* LF, RF, RB, LB motor signs for positive vehicle-forward wheel speed. */
+static const float s_forward_sign[WHEEL_MOTOR_COUNT] = {-1.0f, 1.0f, 1.0f, -1.0f};
 
 static FDCAN_HandleTypeDef *s_can = nullptr;
 static WheelMotorFeedback s_feedback[WHEEL_MOTOR_COUNT];
@@ -40,18 +49,22 @@ static StaticSemaphore_t s_feedback_mutex_storage;
 static SemaphoreHandle_t s_feedback_mutex = nullptr;
 static float s_integral[WHEEL_MOTOR_COUNT];
 static int16_t s_current_cmd[WHEEL_MOTOR_COUNT];
+static float s_ramped_target_rad_s[WHEEL_MOTOR_COUNT];
+static volatile float s_requested_left_rpm = 0.0f;
+static volatile float s_requested_right_rpm = 0.0f;
+static volatile uint8_t s_brake_requested = 0U;
+static volatile uint8_t s_brake_active = 0U;
+static volatile uint32_t s_motion_generation = 0U;
 static volatile uint8_t s_mode_enabled = 0U;
 static volatile uint8_t s_locked = 0U;
 static volatile uint8_t s_can_ready = 0U;
 static volatile uint8_t s_reset_pending = 0U;
 static volatile uint8_t s_zero_pending = 0U;
 static volatile uint32_t s_state_generation = 0U;
-static volatile WheelDriveCommand s_command = WHEEL_DRIVE_STOP;
 static volatile WheelDriveProfile s_profile = WHEEL_PROFILE_NORMAL;
 static uint8_t s_feedback_seen_mask = 0U;
 static uint8_t s_timeout_latched = 0U;
 static uint8_t s_bus_off_active = 0U;
-static float s_ramped_target_rad_s = 0.0f;
 static uint32_t s_init_ms = 0U;
 static uint32_t s_last_control_ms = 0U;
 static uint32_t s_last_bus_check_ms = 0U;
@@ -100,7 +113,39 @@ static void reset_controller(void)
 {
     memset(s_integral, 0, sizeof(s_integral));
     memset(s_current_cmd, 0, sizeof(s_current_cmd));
-    s_ramped_target_rad_s = 0.0f;
+    memset(s_ramped_target_rad_s, 0, sizeof(s_ramped_target_rad_s));
+}
+
+static void commit_motion(float left_rpm, float right_rpm, uint8_t brake)
+{
+    left_rpm = clamp_float(left_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM);
+    right_rpm = clamp_float(right_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM);
+    taskENTER_CRITICAL();
+    if ((s_requested_left_rpm != left_rpm) ||
+        (s_requested_right_rpm != right_rpm) ||
+        (s_brake_requested != brake)) {
+        s_requested_left_rpm = left_rpm;
+        s_requested_right_rpm = right_rpm;
+        s_brake_requested = brake;
+        s_motion_generation++;
+    }
+    taskEXIT_CRITICAL();
+}
+
+static void clear_motion(void)
+{
+    commit_motion(0.0f, 0.0f, 0U);
+}
+
+static void snapshot_motion(float *left_rpm, float *right_rpm,
+                            uint8_t *brake, uint32_t *generation)
+{
+    taskENTER_CRITICAL();
+    *left_rpm = s_requested_left_rpm;
+    *right_rpm = s_requested_right_rpm;
+    *brake = s_brake_requested;
+    *generation = s_motion_generation;
+    taskEXIT_CRITICAL();
 }
 
 static uint8_t send_currents(const int16_t current[WHEEL_MOTOR_COUNT])
@@ -139,7 +184,8 @@ static void lock_drive(uint8_t feedback_timeout)
     s_state_generation++;
     s_locked = 1U;
     s_mode_enabled = 0U;
-    s_command = WHEEL_DRIVE_STOP;
+    clear_motion();
+    s_brake_active = 0U;
     s_profile = WHEEL_PROFILE_NORMAL;
     s_stop_stable_since_ms = 0U;
     s_reset_pending = 1U;
@@ -162,7 +208,8 @@ void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan)
     s_reset_pending = 0U;
     s_zero_pending = 0U;
     s_state_generation = 0U;
-    s_command = WHEEL_DRIVE_STOP;
+    clear_motion();
+    s_brake_active = 0U;
     s_feedback_seen_mask = 0U;
     s_timeout_latched = 0U;
     s_bus_off_active = 0U;
@@ -227,12 +274,36 @@ uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t da
     return 1U;
 }
 
-void WheelDrive_SetCommand(WheelDriveCommand command)
+void WheelDrive_SetMotion(float forward, float yaw, float max_rpm)
 {
-    if ((command < WHEEL_DRIVE_STOP) || (command > WHEEL_DRIVE_REVERSE)) {
-        command = WHEEL_DRIVE_STOP;
+    if ((!isfinite(forward)) || (!isfinite(yaw)) || (!isfinite(max_rpm))) {
+        commit_motion(0.0f, 0.0f, 1U);
+        return;
     }
-    s_command = command;
+
+    forward = clamp_float(forward, -1.0f, 1.0f);
+    yaw = clamp_float(yaw, -1.0f, 1.0f);
+    max_rpm = clamp_float(max_rpm, 0.0f, WHEEL_MAX_OUTPUT_RPM);
+    const uint8_t brake = (((fabsf(forward) <= WHEEL_MOTION_ZERO_EPSILON) &&
+                            (fabsf(yaw) <= WHEEL_MOTION_ZERO_EPSILON)) ||
+                           (max_rpm <= WHEEL_MOTION_ZERO_EPSILON)) ? 1U : 0U;
+
+    const float speed = fabsf(forward);
+    float quick_turn_weight = 0.0f;
+    if (speed <= WHEEL_QUICK_TURN_FULL) {
+        quick_turn_weight = 1.0f;
+    } else if (speed < WHEEL_QUICK_TURN_END) {
+        quick_turn_weight = (WHEEL_QUICK_TURN_END - speed) /
+                            (WHEEL_QUICK_TURN_END - WHEEL_QUICK_TURN_FULL);
+    }
+    const float yaw_scale = speed + quick_turn_weight * (1.0f - speed);
+    const float turn = yaw * yaw_scale;
+    float left = forward + turn;
+    float right = forward - turn;
+    const float max_mix = fmaxf(1.0f, fmaxf(fabsf(left), fabsf(right)));
+    left /= max_mix;
+    right /= max_mix;
+    commit_motion(left * max_rpm, right * max_rpm, brake);
 }
 
 void WheelDrive_SetProfile(WheelDriveProfile profile)
@@ -260,7 +331,8 @@ void WheelDrive_Disable(void)
 {
     const uint8_t was_enabled = s_mode_enabled;
     s_mode_enabled = 0U;
-    s_command = WHEEL_DRIVE_STOP;
+    clear_motion();
+    s_brake_active = 0U;
     if (was_enabled != 0U) {
         s_state_generation++;
         s_reset_pending = 1U;
@@ -359,10 +431,12 @@ static void service_bus(uint32_t now_ms)
 void WheelDrive_Tick(uint32_t now_ms)
 {
     service_bus(now_ms);
-    if ((uint32_t)(now_ms - s_last_control_ms) < WHEEL_CONTROL_PERIOD_MS) {
+    const uint32_t elapsed_ms = (uint32_t)(now_ms - s_last_control_ms);
+    if (elapsed_ms < WHEEL_CONTROL_PERIOD_MS) {
         return;
     }
     s_last_control_ms = now_ms;
+    const float dt_s = clamp_float((float)elapsed_ms, 1.0f, 10.0f) * 0.001f;
 
     if (s_reset_pending != 0U) {
         s_reset_pending = 0U;
@@ -403,6 +477,16 @@ void WheelDrive_Tick(uint32_t now_ms)
     }
 
     const uint32_t state_generation = s_state_generation;
+    float requested_left_rpm = 0.0f;
+    float requested_right_rpm = 0.0f;
+    uint8_t brake_requested = 0U;
+    uint32_t motion_generation = 0U;
+    snapshot_motion(&requested_left_rpm, &requested_right_rpm,
+                    &brake_requested, &motion_generation);
+    if (brake_requested != s_brake_active) {
+        memset(s_integral, 0, sizeof(s_integral));
+        s_brake_active = brake_requested;
+    }
     float measured_speed[WHEEL_MOTOR_COUNT] = {};
     if (feedback_lock() == 0U) {
         s_zero_pending = 1U;
@@ -413,45 +497,70 @@ void WheelDrive_Tick(uint32_t now_ms)
     }
     feedback_unlock();
 
-    float desired_target = 0.0f;
-    if (s_command == WHEEL_DRIVE_FORWARD) {
-        desired_target = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
-                         WHEEL_CRAWL_SPEED_RAD_S : WHEEL_NORMAL_SPEED_RAD_S;
-    } else if (s_command == WHEEL_DRIVE_REVERSE) {
-        desired_target = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
-                         -WHEEL_CRAWL_SPEED_RAD_S : -WHEEL_NORMAL_SPEED_RAD_S;
-    }
-
-    const float ramp_rate = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
-                            WHEEL_CRAWL_RAMP_RAD_S2 : WHEEL_NORMAL_RAMP_RAD_S2;
-    const float ramp_step = ramp_rate *
-                            ((float)WHEEL_CONTROL_PERIOD_MS * 0.001f);
-    if (s_ramped_target_rad_s < desired_target) {
-        s_ramped_target_rad_s = fminf(s_ramped_target_rad_s + ramp_step, desired_target);
-    } else if (s_ramped_target_rad_s > desired_target) {
-        s_ramped_target_rad_s = fmaxf(s_ramped_target_rad_s - ramp_step, desired_target);
-    }
+    const float requested_left_rad_s =
+        clamp_float(requested_left_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM) *
+        WHEEL_RPM_TO_RAD_S;
+    const float requested_right_rad_s =
+        clamp_float(requested_right_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM) *
+        WHEEL_RPM_TO_RAD_S;
+    const float desired_target[WHEEL_MOTOR_COUNT] = {
+        requested_left_rad_s,
+        requested_right_rad_s,
+        requested_right_rad_s,
+        requested_left_rad_s,
+    };
 
     for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
-        const float motor_target = s_ramped_target_rad_s * s_forward_sign[i];
+        float ramp_target = desired_target[i];
+        float ramp_rate;
+        if (brake_requested != 0U) {
+            ramp_rate = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
+                        WHEEL_CRAWL_BRAKE_RAD_S2 : WHEEL_NORMAL_BRAKE_RAD_S2;
+        } else if ((s_ramped_target_rad_s[i] * desired_target[i] < 0.0f) &&
+                   (fabsf(s_ramped_target_rad_s[i]) > WHEEL_MOTION_ZERO_EPSILON)) {
+            ramp_target = 0.0f;
+            ramp_rate = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
+                        WHEEL_CRAWL_DECEL_RAD_S2 : WHEEL_NORMAL_DECEL_RAD_S2;
+        } else if (fabsf(desired_target[i]) > fabsf(s_ramped_target_rad_s[i])) {
+            ramp_rate = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
+                        WHEEL_CRAWL_ACCEL_RAD_S2 : WHEEL_NORMAL_ACCEL_RAD_S2;
+        } else {
+            ramp_rate = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
+                        WHEEL_CRAWL_DECEL_RAD_S2 : WHEEL_NORMAL_DECEL_RAD_S2;
+        }
+        const float ramp_step = ramp_rate * dt_s;
+        if (s_ramped_target_rad_s[i] < ramp_target) {
+            s_ramped_target_rad_s[i] =
+                fminf(s_ramped_target_rad_s[i] + ramp_step, ramp_target);
+        } else if (s_ramped_target_rad_s[i] > ramp_target) {
+            s_ramped_target_rad_s[i] =
+                fmaxf(s_ramped_target_rad_s[i] - ramp_step, ramp_target);
+        }
+        const float motor_target = s_ramped_target_rad_s[i] * s_forward_sign[i];
         const float error = motor_target - measured_speed[i];
         const float proportional = WHEEL_PI_KP * error;
-        float integral = s_integral[i] + WHEEL_PI_KI_PER_S * error *
-                         ((float)WHEEL_CONTROL_PERIOD_MS * 0.001f);
-        const float unsaturated = proportional + integral;
-        const float output = clamp_float(unsaturated,
-                                         -WHEEL_PI_NORMALIZED_LIMIT,
-                                         WHEEL_PI_NORMALIZED_LIMIT);
-        if (output != unsaturated) {
-            integral = output - proportional;
+        const int32_t current_limit = (brake_requested != 0U) ?
+            ((profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
+                WHEEL_CRAWL_BRAKE_RAW_LIMIT : WHEEL_NORMAL_BRAKE_RAW_LIMIT) :
+            ((profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
+                WHEEL_CRAWL_CURRENT_RAW_LIMIT : WHEEL_NORMAL_CURRENT_RAW_LIMIT);
+        const float output_limit = (float)current_limit / WHEEL_CURRENT_RAW_SCALE;
+        float output;
+        if ((brake_requested != 0U) &&
+            (fabsf(s_ramped_target_rad_s[i]) <= WHEEL_MOTION_ZERO_EPSILON) &&
+            (fabsf(measured_speed[i]) < WHEEL_STOP_SPEED_RAD_S)) {
+            s_integral[i] = 0.0f;
+            output = clamp_float(proportional, -output_limit, output_limit);
+        } else {
+            float integral = s_integral[i] + WHEEL_PI_KI_PER_S * error * dt_s;
+            const float unsaturated = proportional + integral;
+            output = clamp_float(unsaturated, -output_limit, output_limit);
+            if (output != unsaturated) {
+                integral = output - proportional;
+            }
+            s_integral[i] = clamp_float(integral, -output_limit, output_limit);
         }
-        s_integral[i] = clamp_float(integral,
-                                    -WHEEL_PI_NORMALIZED_LIMIT,
-                                    WHEEL_PI_NORMALIZED_LIMIT);
         int32_t raw = (int32_t)(output * WHEEL_CURRENT_RAW_SCALE);
-        const int32_t current_limit = (profile == WHEEL_PROFILE_MECHANICAL_CRAWL) ?
-                                      WHEEL_CRAWL_CURRENT_RAW_LIMIT :
-                                      WHEEL_NORMAL_CURRENT_RAW_LIMIT;
         if (raw > current_limit) raw = current_limit;
         if (raw < -current_limit) raw = -current_limit;
         s_current_cmd[i] = (int16_t)raw;
@@ -460,6 +569,9 @@ void WheelDrive_Tick(uint32_t now_ms)
         (s_mode_enabled == 0U) || (s_locked != 0U)) {
         s_reset_pending = 1U;
         s_zero_pending = 1U;
+        return;
+    }
+    if (motion_generation != s_motion_generation) {
         return;
     }
     (void)send_currents(s_current_cmd);
@@ -476,9 +588,10 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
     diag->locked = s_locked;
     diag->all_online = WheelDrive_AllOnline();
     diag->stopped = WheelDrive_IsStopped();
-    diag->command = (uint8_t)s_command;
     diag->profile = (uint8_t)s_profile;
-    diag->ramped_target_rad_s = s_ramped_target_rad_s;
+    diag->brake_active = s_brake_active;
+    diag->requested_left_rpm = s_requested_left_rpm;
+    diag->requested_right_rpm = s_requested_right_rpm;
     diag->tx_fail_count = s_tx_fail_count;
     diag->bus_off_count = s_bus_off_count;
     diag->feedback_timeout_count = s_feedback_timeout_count;
@@ -487,5 +600,11 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
         diag->feedback_seen_mask = s_feedback_seen_mask;
         memcpy(diag->motor, s_feedback, sizeof(s_feedback));
         feedback_unlock();
+    }
+    for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
+        diag->ramped_target_rpm[i] = s_ramped_target_rad_s[i] * WHEEL_RAD_S_TO_RPM;
+        diag->vehicle_speed_rpm[i] = diag->motor[i].output_speed_rad_s *
+                                     s_forward_sign[i] * WHEEL_RAD_S_TO_RPM;
+        diag->current_cmd[i] = s_current_cmd[i];
     }
 }

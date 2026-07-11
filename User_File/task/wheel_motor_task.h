@@ -10,12 +10,7 @@ extern "C" {
 #endif
 
 #define WHEEL_MOTOR_COUNT 4U
-
-typedef enum WheelDriveCommand {
-    WHEEL_DRIVE_STOP = 0,
-    WHEEL_DRIVE_FORWARD,
-    WHEEL_DRIVE_REVERSE,
-} WheelDriveCommand;
+#define WHEEL_MAX_OUTPUT_RPM 200.0f
 
 typedef enum WheelDriveProfile {
     WHEEL_PROFILE_NORMAL = 0,
@@ -40,9 +35,13 @@ typedef struct WheelDriveDiag {
     uint8_t all_online;
     uint8_t stopped;
     uint8_t feedback_seen_mask;
-    uint8_t command;
     uint8_t profile;
-    float ramped_target_rad_s;
+    uint8_t brake_active;
+    float requested_left_rpm;
+    float requested_right_rpm;
+    float ramped_target_rpm[WHEEL_MOTOR_COUNT];
+    float vehicle_speed_rpm[WHEEL_MOTOR_COUNT];
+    int16_t current_cmd[WHEEL_MOTOR_COUNT];
     uint32_t tx_fail_count;
     uint32_t bus_off_count;
     uint32_t feedback_timeout_count;
@@ -52,7 +51,8 @@ typedef struct WheelDriveDiag {
 
 void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan);
 uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t data[8]);
-void WheelDrive_SetCommand(WheelDriveCommand command);
+/* forward/yaw are normalized to [-1, 1]; max_rpm is an output-shaft limit. */
+void WheelDrive_SetMotion(float forward, float yaw, float max_rpm);
 void WheelDrive_SetProfile(WheelDriveProfile profile);
 void WheelDrive_Enable(void);
 void WheelDrive_Disable(void);

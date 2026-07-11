@@ -38,7 +38,6 @@
 #define SBUS_SAFETY_RELEASE_NORM 20
 #define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
-#define SBUS_WHEEL_REVERSE_NEUTRAL_MS 200U
 #define SBUS_MECHANICAL_PREPARE_MS     200U
 
 #define SBUS_SAFETY_RELEASED   0U
@@ -92,9 +91,6 @@ static uint32_t s_sbus_gait_retry_ms = 0U;
 static uint8_t s_sbus_gait_rearm_required = 0U;
 static uint8_t s_sbus_drive_reverse_pending = 0U;
 static uint8_t s_sbus_speed_profile = DOG_GAIT_SPEED_DEFAULT;
-static WheelDriveCommand s_sbus_wheel_cmd = WHEEL_DRIVE_STOP;
-static uint8_t s_sbus_wheel_reverse_rearm = 0U;
-static uint32_t s_sbus_wheel_neutral_since_ms = 0U;
 static uint8_t s_sbus_mechanical_permit = 0U;
 static uint32_t s_sbus_mechanical_prepare_since_ms = 0U;
 
@@ -105,33 +101,38 @@ static uint8_t sbus_safety_raw_is_high(const SbusState *rc);
 static uint8_t sbus_safety_raw_is_released(const SbusState *rc);
 static uint8_t sbus_safety_update(const SbusState *rc);
 static void sbus_update_switch_state(uint8_t main_sw, uint8_t sub_sw);
+static float sbus_axis_to_drive(int16_t value);
+static float sbus_wheel_max_rpm(const SbusState *rc);
 static void sbus_wheel_disable(uint8_t lock);
-static void sbus_wheel_update(const SbusState *rc, uint32_t now);
+static void sbus_wheel_update(const SbusState *rc);
 
 static void print_wheel_status(void)
 {
     WheelDriveDiag diag = {};
     WheelDrive_GetDiag(&diag);
-    DebugUart_Printf("WHEEL: can=%u mode=%u lock=%u online=%u stopped=%u seen=0x%X cmd=%u profile=%u ramp=%ldmrad/s txfail=%lu busoff=%lu timeout=%lu reject=%lu\r\n",
+    DebugUart_Printf("WHEEL: can=%u mode=%u lock=%u brake=%u online=%u stopped=%u seen=0x%X profile=%u req=%ld/%ldrpm txfail=%lu busoff=%lu timeout=%lu reject=%lu\r\n",
                      (unsigned)diag.can_ready,
                      (unsigned)diag.mode_enabled,
                      (unsigned)diag.locked,
+                     (unsigned)diag.brake_active,
                      (unsigned)diag.all_online,
                      (unsigned)diag.stopped,
                      (unsigned)diag.feedback_seen_mask,
-                     (unsigned)diag.command,
                      (unsigned)diag.profile,
-                     (long)(diag.ramped_target_rad_s * 1000.0f),
+                     (long)diag.requested_left_rpm,
+                     (long)diag.requested_right_rpm,
                      (unsigned long)diag.tx_fail_count,
                      (unsigned long)diag.bus_off_count,
                      (unsigned long)diag.feedback_timeout_count,
                      (unsigned long)diag.rx_reject_count);
     for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
-        DebugUart_Printf("  W%u enc=%u rounds=%ld vel=%ldmrad/s iq=%d temp=%u age=%lums\r\n",
+        DebugUart_Printf("  W%u enc=%u rounds=%ld target=%ldrpm speed=%ldrpm cmd=%d iq=%d temp=%u age=%lums\r\n",
                          (unsigned)(i + 1U),
                          (unsigned)diag.motor[i].encoder_raw,
                          (long)diag.motor[i].encoder_rounds,
-                         (long)(diag.motor[i].output_speed_rad_s * 1000.0f),
+                         (long)diag.ramped_target_rpm[i],
+                         (long)diag.vehicle_speed_rpm[i],
+                         (int)diag.current_cmd[i],
                          (int)diag.motor[i].torque_current_raw,
                          (unsigned)diag.motor[i].temperature_c,
                          (unsigned long)(HAL_GetTick() - diag.motor[i].last_update_ms));
@@ -223,7 +224,8 @@ static void print_help(void)
     DebugUart_Printf("  W : cycle VOFA watch motor M0..M7\r\n");
     DebugUart_Printf("  ? : print this help\r\n\r\n");
     DebugUart_Printf("SBUS remote on UART5:\r\n");
-    DebugUart_Printf("  CH1 yaw + CH2 forward/reverse blend, CH3 speed profile, CH9 safety\r\n");
+    DebugUart_Printf("  Wheel: CH1 differential yaw, CH2 forward/reverse, CH3 0..200rpm limit\r\n");
+    DebugUart_Printf("  Gait: CH1/CH2 blend, CH3 LOW/MID/HIGH profile, CH9 safety\r\n");
     DebugUart_Printf("  CH5 LOW + CH8 LOW=RX-only/prep, MID=mechanical crawl, HIGH=wheel off\r\n");
     DebugUart_Printf("  CH5 main: MID=MIT stand, HIGH=gait\r\n");
     DebugUart_Printf("  CH8 sub: HIGH with CH5 MID enables arm jog mode\r\n");
@@ -233,8 +235,8 @@ static void print_help(void)
 
 static void enter_rx_only(void)
 {
+    WheelDrive_SetMotion(0.0f, 0.0f, 0.0f);
     WheelDrive_Disable();
-    WheelDrive_SetCommand(WHEEL_DRIVE_STOP);
     dog_debug_rx_only();
     s_mode = MODE_RX_ONLY;
     DebugUart_SetLogVerbose(0U);
@@ -328,13 +330,14 @@ static void print_sbus_status(void)
                      (unsigned long)age,
                      (unsigned)rc.signal_lost,
                      (unsigned)rc.failsafe);
-    DebugUart_Printf("  CH1 turn raw=%u norm=%d  CH2 move raw=%u norm=%d  CH3 speed raw=%u norm=%d -> %s\r\n",
+    DebugUart_Printf("  CH1 turn raw=%u norm=%d  CH2 move raw=%u norm=%d  CH3 speed raw=%u norm=%d -> wheel=%ldrpm gait=%s\r\n",
                      (unsigned)rc.ch[0],
                      (int)rc.norm[0],
                      (unsigned)rc.ch[1],
                      (int)rc.norm[1],
                      (unsigned)rc.ch[SBUS_SPEED_CH],
                      (int)rc.norm[SBUS_SPEED_CH],
+                     (long)sbus_wheel_max_rpm(&rc),
                      (speed == DOG_GAIT_SPEED_LOW) ? "LOW" :
                      ((speed == DOG_GAIT_SPEED_HIGH) ? "HIGH" : "MID"));
     DebugUart_Printf("  CH5 main raw=%u -> %s  CH8 sub raw=%u -> %s  CH9 safety raw=%u norm=%d high=%u armed=%u\r\n",
@@ -658,17 +661,11 @@ static void sbus_quad_reset_state(void)
     s_sbus_gait_retry_ms = 0U;
     s_sbus_gait_rearm_required = 0U;
     s_sbus_drive_reverse_pending = 0U;
-    s_sbus_wheel_cmd = WHEEL_DRIVE_STOP;
-    s_sbus_wheel_reverse_rearm = 0U;
-    s_sbus_wheel_neutral_since_ms = 0U;
 }
 
 static void sbus_wheel_disable(uint8_t lock)
 {
-    s_sbus_wheel_cmd = WHEEL_DRIVE_STOP;
-    s_sbus_wheel_reverse_rearm = 0U;
-    s_sbus_wheel_neutral_since_ms = 0U;
-    WheelDrive_SetCommand(WHEEL_DRIVE_STOP);
+    WheelDrive_SetMotion(0.0f, 0.0f, 0.0f);
     if (lock != 0U) {
         WheelDrive_StopAndLock();
     } else {
@@ -686,6 +683,8 @@ static void sbus_mechanical_cancel(void)
 static void sbus_mechanical_prepare(const SbusState *rc, uint32_t now)
 {
     const uint8_t neutral = ((rc != nullptr) &&
+        (rc->norm[0U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
+        (rc->norm[0U] <= SBUS_MOVE_EXIT_DEADBAND) &&
         (rc->norm[1U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
         (rc->norm[1U] <= SBUS_MOVE_EXIT_DEADBAND)) ? 1U : 0U;
     if ((neutral == 0U) || (WheelDrive_AllOnline() == 0U) ||
@@ -704,50 +703,26 @@ static void sbus_mechanical_prepare(const SbusState *rc, uint32_t now)
     }
 }
 
-static void sbus_wheel_update(const SbusState *rc, uint32_t now)
+static float sbus_wheel_max_rpm(const SbusState *rc)
+{
+    if (rc == nullptr) {
+        return 0.0f;
+    }
+    const float rpm = (float)rc->norm[SBUS_SPEED_CH] + 100.0f;
+    return fminf(fmaxf(rpm, 0.0f), WHEEL_MAX_OUTPUT_RPM);
+}
+
+static void sbus_wheel_update(const SbusState *rc)
 {
     if (rc == nullptr) {
         sbus_wheel_disable(0U);
         return;
     }
 
-    const int16_t move = rc->norm[1U];
-    const uint8_t neutral = ((move >= -SBUS_MOVE_EXIT_DEADBAND) &&
-                             (move <= SBUS_MOVE_EXIT_DEADBAND)) ? 1U : 0U;
-    WheelDriveCommand requested = s_sbus_wheel_cmd;
-    if (move > SBUS_MOVE_ENTER_DEADBAND) {
-        requested = WHEEL_DRIVE_FORWARD;
-    } else if (move < -SBUS_MOVE_ENTER_DEADBAND) {
-        requested = WHEEL_DRIVE_REVERSE;
-    } else if (neutral != 0U) {
-        requested = WHEEL_DRIVE_STOP;
-    }
-
-    if ((requested != WHEEL_DRIVE_STOP) &&
-        (s_sbus_wheel_cmd != WHEEL_DRIVE_STOP) &&
-        (requested != s_sbus_wheel_cmd)) {
-        s_sbus_wheel_reverse_rearm = 1U;
-        s_sbus_wheel_neutral_since_ms = 0U;
-        requested = WHEEL_DRIVE_STOP;
-    }
-
-    if (s_sbus_wheel_reverse_rearm != 0U) {
-        requested = WHEEL_DRIVE_STOP;
-        if (neutral != 0U) {
-            if (s_sbus_wheel_neutral_since_ms == 0U) {
-                s_sbus_wheel_neutral_since_ms = now;
-            } else if ((uint32_t)(now - s_sbus_wheel_neutral_since_ms) >=
-                       SBUS_WHEEL_REVERSE_NEUTRAL_MS) {
-                s_sbus_wheel_reverse_rearm = 0U;
-                s_sbus_wheel_neutral_since_ms = 0U;
-            }
-        } else {
-            s_sbus_wheel_neutral_since_ms = 0U;
-        }
-    }
-
-    s_sbus_wheel_cmd = requested;
-    WheelDrive_SetCommand(requested);
+    const float forward = sbus_axis_to_drive(rc->norm[1U]);
+    const float turn = sbus_axis_to_drive(rc->norm[0U]);
+    const float max_rpm = sbus_wheel_max_rpm(rc);
+    WheelDrive_SetMotion(forward, turn, max_rpm);
     WheelDrive_Enable();
 }
 
@@ -856,7 +831,7 @@ static void sbus_quad_low_mode(const SbusState *rc, uint8_t main_sw,
             }
         }
         if (DogStand_IsMechanicalLimitIdleReady() != 0U) {
-            sbus_wheel_update(rc, now);
+            sbus_wheel_update(rc);
         } else {
             sbus_wheel_disable(0U);
         }
@@ -1329,7 +1304,7 @@ static void sbus_control_update(void)
                 DebugUart_Printf("SBUS main MID: MIT stand mode.\r\n");
             }
             if (sbus_quad_ensure_stand(now) != 0U) {
-                sbus_wheel_update(&rc, now);
+                sbus_wheel_update(&rc);
             } else {
                 sbus_wheel_disable(0U);
             }
