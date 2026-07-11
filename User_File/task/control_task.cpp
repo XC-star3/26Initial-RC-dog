@@ -135,7 +135,6 @@ static uint8_t s_sbus_quad_standing = 0U;
 static uint8_t s_sbus_quad_cmd = SBUS_QUAD_STOP;
 static uint8_t s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
 static uint32_t s_sbus_gait_retry_ms = 0U;
-static uint8_t s_sbus_gait_rearm_required = 0U;
 static uint8_t s_sbus_drive_reverse_pending = 0U;
 static uint8_t s_sbus_speed_profile = DOG_GAIT_SPEED_DEFAULT;
 static uint8_t s_sbus_mechanical_permit = 0U;
@@ -796,7 +795,6 @@ static void sbus_quad_reset_state(void)
     s_sbus_quad_cmd = SBUS_QUAD_STOP;
     s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
     s_sbus_gait_retry_ms = 0U;
-    s_sbus_gait_rearm_required = 0U;
     s_sbus_drive_reverse_pending = 0U;
 }
 
@@ -1010,8 +1008,7 @@ static void sbus_drive_input_from_sticks(const SbusState *rc, SbusDriveInput *in
     const int32_t abs_turn = (turn < 0) ? -(int32_t)turn : (int32_t)turn;
     const int32_t abs_move = (move < 0) ? -(int32_t)move : (int32_t)move;
     const uint8_t drive_active = ((s_sbus_quad_cmd == SBUS_QUAD_DRIVE) ||
-                                  (s_sbus_gait_rearm_required != 0U) ||
-                                  (dog_mit_march_in_place_is_active() != 0U)) ? 1U : 0U;
+                                   (dog_mit_march_in_place_is_active() != 0U)) ? 1U : 0U;
     const int32_t threshold = (drive_active != 0U) ?
         SBUS_MOVE_EXIT_DEADBAND : SBUS_MOVE_ENTER_DEADBAND;
     if ((abs_turn <= threshold) && (abs_move <= threshold)) {
@@ -1026,16 +1023,11 @@ static void sbus_drive_input_from_sticks(const SbusState *rc, SbusDriveInput *in
 static uint8_t sbus_quad_drive_command(const SbusDriveInput *drive, uint32_t now)
 {
     if ((drive == nullptr) || (drive->active == 0U)) {
-        s_sbus_gait_rearm_required = 0U;
         s_sbus_drive_reverse_pending = 0U;
         s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
         s_sbus_gait_retry_ms = 0U;
         sbus_quad_stop_motion(1U);
         return 1U;
-    }
-
-    if (s_sbus_gait_rearm_required != 0U) {
-        return 0U;
     }
 
     if (dog_mit_march_in_place_is_active() != 0U) {
@@ -1063,8 +1055,9 @@ static uint8_t sbus_quad_drive_command(const SbusDriveInput *drive, uint32_t now
     if ((s_sbus_quad_cmd == SBUS_QUAD_DRIVE) &&
         (s_sbus_drive_reverse_pending == 0U)) {
         s_sbus_quad_cmd = SBUS_QUAD_STOP;
-        s_sbus_gait_rearm_required = 1U;
-        DebugUart_Printf("SBUS gait stopped by stability gate; center sticks before retry.\r\n");
+        s_sbus_gait_retry_cmd = SBUS_QUAD_DRIVE;
+        s_sbus_gait_retry_ms = now;
+        DebugUart_Printf("SBUS gait stopped by stability gate; retrying current stick command.\r\n");
         return 0U;
     }
     if ((s_sbus_gait_retry_cmd == SBUS_QUAD_DRIVE) &&
@@ -1077,9 +1070,8 @@ static uint8_t sbus_quad_drive_command(const SbusDriveInput *drive, uint32_t now
         s_sbus_quad_cmd = SBUS_QUAD_STOP;
         s_sbus_gait_retry_cmd = SBUS_QUAD_DRIVE;
         s_sbus_gait_retry_ms = now;
-        s_sbus_gait_rearm_required = 1U;
         s_sbus_drive_reverse_pending = 0U;
-        DebugUart_Printf("SBUS drive FAIL; center sticks before retry.\r\n");
+        DebugUart_Printf("SBUS drive FAIL; retrying current stick command.\r\n");
         return 0U;
     }
 
@@ -1295,13 +1287,7 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
         WheelDrive_SetProfile(WHEEL_PROFILE_NORMAL);
         sbus_wheel_hold();
         if (sbus_mode_prepare_stand(now) != 0U) {
-            if (WheelDrive_IsAvailable() != 0U) {
-                sbus_mode_set_active(requested);
-            } else {
-                s_sbus_active_mode = SBUS_MODE_NONE;
-                s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
-                s_sbus_block_reason = SBUS_BLOCK_WHEEL_FAULT;
-            }
+            sbus_mode_set_active(requested);
         }
         break;
 
@@ -1359,7 +1345,7 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
                 break;
             }
         }
-        if (WheelDrive_IsAvailable() == 0U) {
+        if ((wheel_drive_enabled != 0U) && (WheelDrive_IsAvailable() == 0U)) {
             sbus_wheel_hold();
             sbus_quad_stop_motion(0U);
             s_sbus_active_mode = SBUS_MODE_NONE;
