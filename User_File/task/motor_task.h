@@ -46,6 +46,8 @@ extern "C" {
 #define DOG_STAND_FOOT_Z_START_MM       150.0f   /* front legs stand rise IK start Z */
 #define DOG_STAND_FOOT_Z_MM             300.0f   /* front legs stand rise IK end Z */
 #define DOG_STAND_RISE_MS               1500U
+#define DOG_STAND_LOWER_SETTLE_MS        200U
+#define DOG_STAND_LOWER_SETTLE_VEL_DPS     8.0f
 #define DOG_JUMP_FOOT_X_MM              DOG_STAND_FOOT_X_MM
 #define DOG_JUMP_APEX_Z_MM              400.0f
 #define DOG_JUMP_LAND_Z_MM              DOG_STAND_FOOT_Z_MM
@@ -200,6 +202,13 @@ enum Dog_Stand_State {
     DOG_STAND_FAULT,
 };
 
+enum Dog_Lower_State {
+    DOG_LOWER_IDLE = 0U,
+    DOG_LOWER_ACTIVE,
+    DOG_LOWER_COMPLETE,
+    DOG_LOWER_FAILED,
+};
+
 enum Dog_Control_Loop_Mode {
     DOG_CTRL_LOOP_POSITION = 0U,
     DOG_CTRL_LOOP_MIT_PID = 1U,
@@ -349,6 +358,9 @@ uint8_t dog_mit_goto_motor_pose(float hip_motor_deg, float knee_motor_deg);
 uint8_t dog_mit_goto_stand_pose(void);
 uint8_t dog_mit_stand_sequence(void);
 uint8_t dog_mit_return_to_stand_start_pose(void);
+uint8_t dog_mit_lower_to_start_pose_start(void);
+uint8_t dog_mit_lower_to_start_pose_state(void);
+void dog_mit_lower_to_start_pose_cancel(void);
 uint8_t dog_mit_jump_test_sequence(void);
 uint8_t dog_mit_goto_foot_xz(float x_mm, float z_mm);
 uint8_t dog_mit_march_in_place_start(uint8_t cycles);

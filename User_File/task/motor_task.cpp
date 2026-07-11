@@ -194,6 +194,9 @@ static float s_mit_ang_err_prev_deg[DOG_MOTOR_COUNT];
 static uint8_t s_mit_pid_profile = DOG_MIT_PID_SWING;
 static uint8_t s_mit_mixed_pid_active = 0U;
 static uint8_t s_mit_swing_motor_mask = 0U;
+static volatile uint8_t s_lower_state = DOG_LOWER_IDLE;
+static uint32_t s_lower_t0_ms = 0U;
+static uint32_t s_lower_settle_since_ms = 0U;
 
 enum Dog_March_Phase {
     DOG_MARCH_PHASE_ENTRY_SETTLE = 0U,
@@ -274,9 +277,9 @@ struct Dog_Gait_Speed_Profile {
 };
 
 static const Dog_Gait_Speed_Profile s_gait_speed_profiles[] = {
-    {"LOW",  1.0f, 25.0f, DOG_TURN_STRIDE_X_MM, 18.0f, 160U, 40U},
-    {"MID",  2.0f, 55.0f, DOG_TURN_STRIDE_X_MM, 30.0f,  60U,  0U},
-    {"HIGH", 2.5f, 70.0f, DOG_TURN_STRIDE_X_MM, 40.0f,  30U,  0U},
+    {"LOW",  1.0f, 25.0f, DOG_TURN_STRIDE_X_MM, 30.0f, 160U, 40U},
+    {"MID",  2.0f, 55.0f, DOG_TURN_STRIDE_X_MM, 60.0f,  60U,  0U},
+    {"HIGH", 2.5f, 70.0f, DOG_TURN_STRIDE_X_MM, 100.0f, 30U,  0U},
 };
 
 static float s_leg_foot_x_offset[DOG_LEG_COUNT] = {};
@@ -757,6 +760,9 @@ static void mit_set_all_stand_pid_mode(void)
 
 static void mit_debug_stop_tx(void)
 {
+    s_lower_state = DOG_LOWER_IDLE;
+    s_lower_t0_ms = 0U;
+    s_lower_settle_since_ms = 0U;
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
         if ((s_mit_boot_ok[i] != 0U) && (s_encoder_turn_valid[i] != 0U)) {
             send_mit_zero_effort(i, user_rad(i));
@@ -3492,6 +3498,118 @@ static uint8_t mit_stand_rise_interpolate(void)
     }
 
     return mit_stand_wait_target_legs_settled(DOG_STAND_MOVE_MS);
+}
+
+uint8_t dog_mit_lower_to_start_pose_start(void)
+{
+    if (s_lower_state == DOG_LOWER_ACTIVE) {
+        return 1U;
+    }
+    if ((dog_mit_debug_is_active() == 0U) ||
+        (dog_mit_fault_hold_is_active() != 0U) ||
+        (s_debug_target != DOG_DEBUG_TARGET_ALL)) {
+        s_lower_state = DOG_LOWER_FAILED;
+        DebugUart_Printf("Lower stand FAIL: need active all-leg MIT stand.\r\n");
+        return 0U;
+    }
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if ((dog_leg_foot_xz_is_reachable(DOG_STAND_FOOT_X_MM,
+                                           dog_leg_stand_foot_z_start_mm(leg)) == 0U) ||
+            (dog_leg_foot_xz_to_motor_deg(leg, DOG_STAND_FOOT_X_MM,
+                                          dog_leg_stand_foot_z_start_mm(leg),
+                                          nullptr, nullptr) == 0U)) {
+            s_lower_state = DOG_LOWER_FAILED;
+            DebugUart_Printf("Lower stand FAIL: %s target (%ld,%ld)mm unreachable.\r\n",
+                             dog_leg_name(leg),
+                             (long)DOG_STAND_FOOT_X_MM,
+                             (long)dog_leg_stand_foot_z_start_mm(leg));
+            return 0U;
+        }
+    }
+
+    dog_mit_march_in_place_stop();
+    mit_set_all_stand_pid_mode();
+    dog_mit_reset_integrators();
+    s_lower_t0_ms = HAL_GetTick();
+    s_lower_settle_since_ms = 0U;
+    s_lower_state = DOG_LOWER_ACTIVE;
+    DebugUart_Printf("Lower stand start: front %ld->%ld rear %ld->%ldmm smooth=%lums.\r\n",
+                     (long)DOG_STAND_FOOT_Z_MM,
+                     (long)DOG_STAND_FOOT_Z_START_MM,
+                     (long)dog_leg_stand_foot_z_mm(DOG_LEG_LB),
+                     (long)dog_leg_stand_foot_z_start_mm(DOG_LEG_LB),
+                     (unsigned long)DOG_STAND_RISE_MS);
+    return 1U;
+}
+
+uint8_t dog_mit_lower_to_start_pose_state(void)
+{
+    return s_lower_state;
+}
+
+void dog_mit_lower_to_start_pose_cancel(void)
+{
+    s_lower_state = DOG_LOWER_IDLE;
+    s_lower_t0_ms = 0U;
+    s_lower_settle_since_ms = 0U;
+}
+
+static void dog_mit_lower_to_start_pose_tick(uint32_t now)
+{
+    if (s_lower_state != DOG_LOWER_ACTIVE) {
+        return;
+    }
+    if ((dog_mit_debug_is_active() == 0U) ||
+        (dog_mit_fault_hold_is_active() != 0U) ||
+        (s_debug_target != DOG_DEBUG_TARGET_ALL)) {
+        s_lower_state = DOG_LOWER_FAILED;
+        DebugUart_Printf("Lower stand FAIL: leg closed loop lost.\r\n");
+        return;
+    }
+
+    const uint32_t elapsed_ms = (uint32_t)(now - s_lower_t0_ms);
+    const float raw_progress = (DOG_STAND_RISE_MS == 0U) ? 1.0f :
+        clampf((float)elapsed_ms / (float)DOG_STAND_RISE_MS, 0.0f, 1.0f);
+    const float stand_progress = 1.0f - smoothstep5_01(raw_progress);
+    if (mit_stand_set_rise_pose(DOG_STAND_FOOT_X_MM, stand_progress) == 0U) {
+        s_lower_state = DOG_LOWER_FAILED;
+        DebugUart_Printf("Lower stand FAIL: IK update rejected.\r\n");
+        return;
+    }
+
+    if (raw_progress < 1.0f) {
+        s_lower_settle_since_ms = 0U;
+        return;
+    }
+
+    uint8_t all_settled = 1U;
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        const uint8_t hip = leg_joint_index(leg, DOG_JOINT_HIP);
+        const uint8_t knee = leg_joint_index(leg, DOG_JOINT_KNEE);
+        if ((march_leg_joints_settled(leg, DOG_STAND_JOINT_SETTLE_ERR_DEG) == 0U) ||
+            (hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT) ||
+            (fabsf(user_vel_dps(hip)) > DOG_STAND_LOWER_SETTLE_VEL_DPS) ||
+            (fabsf(user_vel_dps(knee)) > DOG_STAND_LOWER_SETTLE_VEL_DPS)) {
+            all_settled = 0U;
+        }
+    }
+    if (all_settled != 0U) {
+        if (s_lower_settle_since_ms == 0U) {
+            s_lower_settle_since_ms = now;
+        } else if ((uint32_t)(now - s_lower_settle_since_ms) >=
+                   DOG_STAND_LOWER_SETTLE_MS) {
+            s_lower_state = DOG_LOWER_COMPLETE;
+            DebugUart_Printf("Lower stand complete; LOW mode may release leg torque.\r\n");
+        }
+    } else {
+        s_lower_settle_since_ms = 0U;
+    }
+
+    if ((s_lower_state == DOG_LOWER_ACTIVE) &&
+        (elapsed_ms >= (DOG_STAND_RISE_MS + DOG_STAND_MOVE_MS))) {
+        s_lower_state = DOG_LOWER_FAILED;
+        DebugUart_Printf("Lower stand FAIL: settle timeout; keeping leg control.\r\n");
+    }
 }
 
 [[maybe_unused]] static uint8_t dog_leg_stand_foot_ik_motor_deg(uint8_t leg, float *hip_motor_deg, float *knee_motor_deg)
@@ -7007,7 +7125,10 @@ void motor_task(void)
 
     if (s_mechanical_idle_requested == 0U) {
         stand_state_tick(now);
-        march_in_place_tick(now);
+        dog_mit_lower_to_start_pose_tick(now);
+        if (s_lower_state == DOG_LOWER_IDLE) {
+            march_in_place_tick(now);
+        }
     }
 
     static uint32_t s_closed_loop_retry_last_ms = 0U;
