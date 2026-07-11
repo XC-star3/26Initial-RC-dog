@@ -460,10 +460,11 @@ static void print_sbus_status(void)
                      (unsigned)DogSafety_IsLatched(),
                      (unsigned)DogStand_IsDisabled(),
                       dog_mit_gait_speed_profile_name());
-    DebugUart_Printf("  mechanical: request=%u idle_mask=0x%02X settle_ready=%u permit=%u prep_ms=%lu\r\n",
-                     (unsigned)DogStand_IsMechanicalLimitIdle(),
-                     (unsigned)DogStand_GetMechanicalLimitIdleMask(),
-                     (unsigned)DogStand_IsMechanicalLimitIdleReady(),
+    DebugUart_Printf("  mechanical: pose=%u pose_mask=0x%02X pose_ready=%u hip_lift=%ldmdeg permit=%u prep_ms=%lu\r\n",
+                     (unsigned)DogStand_IsMechanicalLimitPose(),
+                     (unsigned)DogStand_GetMechanicalLimitPoseMask(),
+                     (unsigned)DogStand_IsMechanicalLimitPoseReady(),
+                     (long)(DOG_LOW_WHEEL_HIP_LIFT_DEG * 1000.0f),
                      (unsigned)s_sbus_mechanical_permit,
                      (unsigned long)((s_sbus_mechanical_prepare_since_ms == 0U) ? 0U :
                                      (now - s_sbus_mechanical_prepare_since_ms)));
@@ -869,6 +870,7 @@ static void sbus_mechanical_cancel(void)
     s_sbus_mechanical_permit = 0U;
     s_sbus_mechanical_prepare_since_ms = 0U;
     DogStand_ExitMechanicalLimitIdle();
+    DogStand_ExitMechanicalLimitPose();
 }
 
 static void sbus_mechanical_prepare(const SbusState *rc, uint32_t now)
@@ -1438,6 +1440,7 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
     case SBUS_MODE_MOTOR_CHECK:
         sbus_wheel_disable(0U);
         DogStand_ExitMechanicalLimitIdle();
+        DogStand_ExitMechanicalLimitPose();
         WheelDrive_SetProfile(WHEEL_PROFILE_NORMAL);
         (void)DogStand_ClearDisable();
         (void)WheelDrive_TryClearLock();
@@ -1449,14 +1452,19 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
     case SBUS_MODE_LOW_WHEEL:
         WheelDrive_SetProfile(WHEEL_PROFILE_MECHANICAL_CRAWL);
         s_sbus_mechanical_prepare_since_ms = 0U;
-        if ((DogStand_IsMechanicalLimitIdle() == 0U) &&
+        if ((DogStand_IsMechanicalLimitPose() == 0U) &&
             (s_sbus_mechanical_permit != 0U)) {
             s_sbus_mechanical_permit = 0U;
             sbus_quad_stop_motion_immediate(0U);
             sbus_quad_reset_state();
-            (void)DogStand_EnterMechanicalLimitIdle();
+            if (DogStand_EnterMechanicalLimitPose() == 0U) {
+                s_sbus_active_mode = SBUS_MODE_NONE;
+                s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
+                s_sbus_block_reason = SBUS_BLOCK_LEG_FAULT;
+                break;
+            }
         }
-        if (DogStand_IsMechanicalLimitIdleReady() != 0U) {
+        if (DogStand_IsMechanicalLimitPoseReady() != 0U) {
             if (sbus_wheel_update(rc) != 0U) {
                 sbus_mode_set_active(requested);
             } else {

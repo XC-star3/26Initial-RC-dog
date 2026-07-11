@@ -48,6 +48,8 @@ extern "C" {
 #define DOG_STAND_RISE_MS               1500U
 #define DOG_STAND_LOWER_SETTLE_MS        200U
 #define DOG_STAND_LOWER_SETTLE_VEL_DPS     8.0f
+#define DOG_LOW_WHEEL_HIP_LIFT_DEG         15.0f
+#define DOG_LOW_WHEEL_HIP_LIFT_MS         800U
 #define DOG_JUMP_FOOT_X_MM              DOG_STAND_FOOT_X_MM
 #define DOG_JUMP_APEX_Z_MM              400.0f
 #define DOG_JUMP_LAND_Z_MM              DOG_STAND_FOOT_Z_MM
@@ -451,6 +453,11 @@ uint8_t DogStand_IsMechanicalLimitIdle(void);
 uint8_t DogStand_IsMechanicalLimitIdleReady(void);
 uint8_t DogStand_GetMechanicalLimitIdleMask(void);
 void DogStand_ExitMechanicalLimitIdle(void);
+uint8_t DogStand_EnterMechanicalLimitPose(void);
+uint8_t DogStand_IsMechanicalLimitPose(void);
+uint8_t DogStand_IsMechanicalLimitPoseReady(void);
+uint8_t DogStand_GetMechanicalLimitPoseMask(void);
+void DogStand_ExitMechanicalLimitPose(void);
 Dog_Stand_State DogStand_GetState(void);
 uint8_t DogStand_GetOnlineMask(void);
 uint8_t DogStand_GetReadyMask(void);

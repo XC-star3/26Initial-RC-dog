@@ -320,6 +320,9 @@ static volatile uint8_t s_mechanical_idle_ready = 0U;
 static volatile uint8_t s_mechanical_idle_mask = 0U;
 static uint32_t s_mechanical_idle_settle_since_ms = 0U;
 static uint32_t s_mechanical_idle_heartbeat_baseline[DOG_MOTOR_COUNT];
+static volatile uint8_t s_mechanical_pose_requested = 0U;
+static volatile uint8_t s_mechanical_pose_ready = 0U;
+static volatile uint8_t s_mechanical_pose_mask = 0U;
 static volatile uint8_t s_safety_rearm_requested = 0U;
 static volatile uint32_t s_safety_generation = 0U;
 static uint32_t s_safety_latched_ms = 0U;
@@ -760,6 +763,9 @@ static void mit_set_all_stand_pid_mode(void)
 
 static void mit_debug_stop_tx(void)
 {
+    s_mechanical_pose_requested = 0U;
+    s_mechanical_pose_ready = 0U;
+    s_mechanical_pose_mask = 0U;
     s_lower_state = DOG_LOWER_IDLE;
     s_lower_t0_ms = 0U;
     s_lower_settle_since_ms = 0U;
@@ -6504,6 +6510,9 @@ void DogStand_Disable(void)
     s_mechanical_idle_requested = 0U;
     s_mechanical_idle_ready = 0U;
     s_mechanical_idle_mask = 0U;
+    s_mechanical_pose_requested = 0U;
+    s_mechanical_pose_ready = 0U;
+    s_mechanical_pose_mask = 0U;
     s_mechanical_idle_settle_since_ms = 0U;
     s_control_disabled = 1U;
     s_position_tx_enabled = 0U;
@@ -6569,6 +6578,102 @@ uint8_t DogStand_ClearDisable(void)
 uint8_t DogStand_IsDisabled(void)
 {
     return s_control_disabled;
+}
+
+uint8_t DogStand_EnterMechanicalLimitPose(void)
+{
+    if ((s_safety_latched != 0U) || (s_safety_external_inhibit != 0U) ||
+        (s_control_disabled != 0U)) {
+        return 0U;
+    }
+
+    s_mechanical_pose_requested = 1U;
+    s_mechanical_pose_ready = 0U;
+    s_mechanical_pose_mask = 0U;
+    dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
+    if (dog_debug_mit_boot_sequence() != DOG_MOTOR_COUNT) {
+        s_mechanical_pose_requested = 0U;
+        dog_mit_protect_hold();
+        DebugUart_Printf("Mechanical wheel pose FAIL: MIT boot incomplete.\r\n");
+        return 0U;
+    }
+
+    float hip_start_deg[DOG_LEG_COUNT] = {};
+    float knee_hold_deg[DOG_LEG_COUNT] = {};
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        const uint8_t hip = leg_joint_index(leg, DOG_JOINT_HIP);
+        const uint8_t knee = leg_joint_index(leg, DOG_JOINT_KNEE);
+        if ((hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT) ||
+            (!isfinite(user_deg(hip))) || (!isfinite(user_deg(knee)))) {
+            s_mechanical_pose_requested = 0U;
+            dog_mit_protect_hold();
+            return 0U;
+        }
+        hip_start_deg[leg] = user_deg(hip);
+        knee_hold_deg[leg] = user_deg(knee);
+    }
+
+    mit_set_all_stand_pid_mode();
+    dog_mit_reset_integrators();
+    const uint32_t t0 = HAL_GetTick();
+    while (1) {
+        const uint32_t now = HAL_GetTick();
+        const float raw_progress = (DOG_LOW_WHEEL_HIP_LIFT_MS == 0U) ? 1.0f :
+            clampf((float)(now - t0) / (float)DOG_LOW_WHEEL_HIP_LIFT_MS,
+                   0.0f, 1.0f);
+        const float progress = smoothstep5_01(raw_progress);
+        for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+            dog_leg_set_motor_user_deg_for_leg(
+                leg,
+                hip_start_deg[leg] + DOG_LOW_WHEEL_HIP_LIFT_DEG * progress,
+                knee_hold_deg[leg]);
+        }
+        if (mit_pump_control() == 0U) {
+            s_mechanical_pose_requested = 0U;
+            dog_mit_protect_hold();
+            DebugUart_Printf("Mechanical wheel pose FAIL: control interrupted.\r\n");
+            return 0U;
+        }
+        if (raw_progress >= 1.0f) {
+            break;
+        }
+        HAL_Delay(1U);
+    }
+
+    if (mit_stand_wait_target_legs_settled(DOG_STAND_MOVE_MS) == 0U) {
+        s_mechanical_pose_requested = 0U;
+        dog_mit_protect_hold();
+        DebugUart_Printf("Mechanical wheel pose FAIL: joint settle timeout.\r\n");
+        return 0U;
+    }
+    s_mechanical_pose_mask = 0xFFU;
+    s_mechanical_pose_ready = 1U;
+    DebugUart_Printf("Mechanical wheel pose ready: hip=%+ldmdeg knee=hold.\r\n",
+                     (long)(DOG_LOW_WHEEL_HIP_LIFT_DEG * 1000.0f));
+    return 1U;
+}
+
+uint8_t DogStand_IsMechanicalLimitPose(void)
+{
+    return s_mechanical_pose_requested;
+}
+
+uint8_t DogStand_IsMechanicalLimitPoseReady(void)
+{
+    return ((s_mechanical_pose_requested != 0U) &&
+            (s_mechanical_pose_ready != 0U)) ? 1U : 0U;
+}
+
+uint8_t DogStand_GetMechanicalLimitPoseMask(void)
+{
+    return s_mechanical_pose_mask;
+}
+
+void DogStand_ExitMechanicalLimitPose(void)
+{
+    s_mechanical_pose_requested = 0U;
+    s_mechanical_pose_ready = 0U;
+    s_mechanical_pose_mask = 0U;
 }
 
 uint8_t DogStand_EnterMechanicalLimitIdle(void)
@@ -7068,6 +7173,9 @@ void motor_task_init(void)
     s_mechanical_idle_ready = 0U;
     s_mechanical_idle_mask = 0U;
     s_mechanical_idle_settle_since_ms = 0U;
+    s_mechanical_pose_requested = 0U;
+    s_mechanical_pose_ready = 0U;
+    s_mechanical_pose_mask = 0U;
     memset(s_mechanical_idle_heartbeat_baseline, 0,
            sizeof(s_mechanical_idle_heartbeat_baseline));
     s_safety_rearm_requested = 0U;
