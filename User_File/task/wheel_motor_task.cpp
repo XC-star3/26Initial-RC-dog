@@ -61,8 +61,11 @@ static int16_t s_current_cmd[WHEEL_MOTOR_COUNT];
 static int16_t s_active_current_limit_raw[WHEEL_MOTOR_COUNT];
 static float s_peak_budget_ms[WHEEL_MOTOR_COUNT];
 static float s_ramped_target_rad_s[WHEEL_MOTOR_COUNT];
+static volatile float s_requested_target_rpm[WHEEL_MOTOR_COUNT];
+static volatile float s_phase_scale[WHEEL_MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
 static volatile float s_requested_left_rpm = 0.0f;
 static volatile float s_requested_right_rpm = 0.0f;
+static volatile uint8_t s_hybrid_mode = 0U;
 static volatile uint8_t s_brake_requested = 0U;
 static volatile uint8_t s_brake_active = 0U;
 static volatile uint32_t s_motion_generation = 0U;
@@ -158,17 +161,34 @@ static int32_t thermal_peak_limit_raw(uint8_t temperature_c)
                                       WHEEL_CONTINUOUS_CURRENT_RAW));
 }
 
-static void commit_motion(float left_rpm, float right_rpm, uint8_t brake)
+static void commit_motion(const float target_rpm[WHEEL_MOTOR_COUNT],
+                          const float phase_scale[WHEEL_MOTOR_COUNT],
+                          uint8_t brake, uint8_t hybrid_mode)
 {
-    left_rpm = clamp_float(left_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM);
-    right_rpm = clamp_float(right_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM);
+    float targets[WHEEL_MOTOR_COUNT] = {};
+    float scales[WHEEL_MOTOR_COUNT] = {};
+    for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
+        targets[i] = clamp_float(target_rpm[i], -WHEEL_MAX_OUTPUT_RPM,
+                                 WHEEL_MAX_OUTPUT_RPM);
+        scales[i] = clamp_float(phase_scale[i], 0.0f, 1.0f);
+    }
+
     taskENTER_CRITICAL();
-    if ((s_requested_left_rpm != left_rpm) ||
-        (s_requested_right_rpm != right_rpm) ||
-        (s_brake_requested != brake)) {
-        s_requested_left_rpm = left_rpm;
-        s_requested_right_rpm = right_rpm;
+    uint8_t changed = ((s_brake_requested != brake) ||
+                       (s_hybrid_mode != hybrid_mode)) ? 1U : 0U;
+    for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
+        if ((s_requested_target_rpm[i] != targets[i]) ||
+            (s_phase_scale[i] != scales[i])) {
+            changed = 1U;
+        }
+        s_requested_target_rpm[i] = targets[i];
+        s_phase_scale[i] = scales[i];
+    }
+    if (changed != 0U) {
+        s_requested_left_rpm = targets[0U];
+        s_requested_right_rpm = targets[1U];
         s_brake_requested = brake;
+        s_hybrid_mode = hybrid_mode;
         s_motion_generation++;
     }
     taskEXIT_CRITICAL();
@@ -176,16 +196,23 @@ static void commit_motion(float left_rpm, float right_rpm, uint8_t brake)
 
 static void clear_motion(void)
 {
-    commit_motion(0.0f, 0.0f, 0U);
+    const float zero[WHEEL_MOTOR_COUNT] = {};
+    const float unity[WHEEL_MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
+    commit_motion(zero, unity, 0U, 0U);
 }
 
-static void snapshot_motion(float *left_rpm, float *right_rpm,
-                            uint8_t *brake, uint32_t *generation)
+static void snapshot_motion(float target_rpm[WHEEL_MOTOR_COUNT],
+                            float phase_scale[WHEEL_MOTOR_COUNT],
+                            uint8_t *brake, uint8_t *hybrid_mode,
+                            uint32_t *generation)
 {
     taskENTER_CRITICAL();
-    *left_rpm = s_requested_left_rpm;
-    *right_rpm = s_requested_right_rpm;
+    for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
+        target_rpm[i] = s_requested_target_rpm[i];
+        phase_scale[i] = s_phase_scale[i];
+    }
     *brake = s_brake_requested;
+    *hybrid_mode = s_hybrid_mode;
     *generation = s_motion_generation;
     taskEXIT_CRITICAL();
 }
@@ -336,14 +363,18 @@ uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t da
     return 1U;
 }
 
-void WheelDrive_SetMotion(float forward, float yaw, float max_rpm)
+static void set_motion_scaled(float forward, float yaw, float max_rpm,
+                              const float phase_scale[WHEEL_MOTOR_COUNT],
+                              uint8_t hybrid_mode)
 {
     if (s_operating_mode != WHEEL_OPERATING_DRIVE) {
         return;
     }
     s_last_command_ms = HAL_GetTick();
     if ((!isfinite(forward)) || (!isfinite(yaw)) || (!isfinite(max_rpm))) {
-        commit_motion(0.0f, 0.0f, 1U);
+        const float zero[WHEEL_MOTOR_COUNT] = {};
+        const float unity[WHEEL_MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
+        commit_motion(zero, unity, 1U, hybrid_mode);
         return;
     }
 
@@ -376,7 +407,54 @@ void WheelDrive_SetMotion(float forward, float yaw, float max_rpm)
     const float max_mix = fmaxf(1.0f, fmaxf(fabsf(left), fabsf(right)));
     left /= max_mix;
     right /= max_mix;
-    commit_motion(left * max_rpm, right * max_rpm, brake);
+    const float targets[WHEEL_MOTOR_COUNT] = {
+        left * max_rpm,
+        right * max_rpm,
+        right * max_rpm,
+        left * max_rpm,
+    };
+    const float unity[WHEEL_MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
+    commit_motion(targets, (phase_scale != nullptr) ? phase_scale : unity,
+                  brake, hybrid_mode);
+}
+
+void WheelDrive_SetMotion(float forward, float yaw, float max_rpm)
+{
+    set_motion_scaled(forward, yaw, max_rpm, nullptr, 0U);
+}
+
+void WheelDrive_SetMotionScaled(float forward, float yaw, float max_rpm,
+                                const float phase_scale[WHEEL_MOTOR_COUNT])
+{
+    set_motion_scaled(forward, yaw, max_rpm, phase_scale, 1U);
+}
+
+void WheelDrive_SetWheelTargets(const float target_rpm[WHEEL_MOTOR_COUNT],
+                                const float phase_scale[WHEEL_MOTOR_COUNT])
+{
+    if (s_operating_mode != WHEEL_OPERATING_DRIVE) {
+        return;
+    }
+    s_last_command_ms = HAL_GetTick();
+    const float unity[WHEEL_MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if ((target_rpm == nullptr) || (phase_scale == nullptr)) {
+        const float zero[WHEEL_MOTOR_COUNT] = {};
+        commit_motion(zero, unity, 1U, 1U);
+        return;
+    }
+
+    uint8_t brake = 1U;
+    for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
+        if ((!isfinite(target_rpm[i])) || (!isfinite(phase_scale[i]))) {
+            const float zero[WHEEL_MOTOR_COUNT] = {};
+            commit_motion(zero, unity, 1U, 1U);
+            return;
+        }
+        if (fabsf(target_rpm[i] * phase_scale[i]) > WHEEL_MOTION_ZERO_EPSILON) {
+            brake = 0U;
+        }
+    }
+    commit_motion(target_rpm, phase_scale, brake, 1U);
 }
 
 void WheelDrive_SetProfile(WheelDriveProfile profile)
@@ -418,7 +496,9 @@ void WheelDrive_SetOperatingMode(WheelDriveOperatingMode mode)
         s_brake_active = 0U;
     } else if (mode == WHEEL_OPERATING_HOLD) {
         s_mode_enabled = 1U;
-        commit_motion(0.0f, 0.0f, 1U);
+        const float zero[WHEEL_MOTOR_COUNT] = {};
+        const float unity[WHEEL_MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
+        commit_motion(zero, unity, 1U, 0U);
     } else {
         s_mode_enabled = 1U;
     }
@@ -611,12 +691,14 @@ void WheelDrive_Tick(uint32_t now_ms)
     }
 
     const uint32_t state_generation = s_state_generation;
-    float requested_left_rpm = 0.0f;
-    float requested_right_rpm = 0.0f;
+    float requested_target_rpm[WHEEL_MOTOR_COUNT] = {};
+    float phase_scale[WHEEL_MOTOR_COUNT] = {};
     uint8_t brake_requested = 0U;
+    uint8_t hybrid_mode = 0U;
     uint32_t motion_generation = 0U;
-    snapshot_motion(&requested_left_rpm, &requested_right_rpm,
-                    &brake_requested, &motion_generation);
+    snapshot_motion(requested_target_rpm, phase_scale, &brake_requested,
+                    &hybrid_mode, &motion_generation);
+    (void)hybrid_mode;
     if (brake_requested != s_brake_active) {
         memset(s_integral, 0, sizeof(s_integral));
         s_brake_active = brake_requested;
@@ -633,18 +715,14 @@ void WheelDrive_Tick(uint32_t now_ms)
     }
     feedback_unlock();
 
-    const float requested_left_rad_s =
-        clamp_float(requested_left_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM) *
-        WHEEL_RPM_TO_RAD_S;
-    const float requested_right_rad_s =
-        clamp_float(requested_right_rpm, -WHEEL_MAX_OUTPUT_RPM, WHEEL_MAX_OUTPUT_RPM) *
-        WHEEL_RPM_TO_RAD_S;
-    const float desired_target[WHEEL_MOTOR_COUNT] = {
-        requested_left_rad_s,
-        requested_right_rad_s,
-        requested_right_rad_s,
-        requested_left_rad_s,
-    };
+    float desired_target[WHEEL_MOTOR_COUNT] = {};
+    for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
+        desired_target[i] = clamp_float(requested_target_rpm[i],
+                                        -WHEEL_MAX_OUTPUT_RPM,
+                                        WHEEL_MAX_OUTPUT_RPM) *
+                            clamp_float(phase_scale[i], 0.0f, 1.0f) *
+                            WHEEL_RPM_TO_RAD_S;
+    }
 
     uint8_t peak_limited_mask = 0U;
     uint8_t thermal_derated_mask = 0U;
@@ -760,6 +838,7 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
     diag->overtemp_mask = s_overtemp_mask;
     diag->requested_left_rpm = s_requested_left_rpm;
     diag->requested_right_rpm = s_requested_right_rpm;
+    diag->hybrid_mode = s_hybrid_mode;
     diag->tx_fail_count = s_tx_fail_count;
     diag->bus_off_count = s_bus_off_count;
     diag->feedback_timeout_count = s_feedback_timeout_count;
@@ -771,6 +850,9 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
         feedback_unlock();
     }
     for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
+        diag->requested_target_rpm[i] = s_requested_target_rpm[i];
+        diag->phase_scale[i] = s_phase_scale[i];
+        diag->final_target_rpm[i] = s_requested_target_rpm[i] * s_phase_scale[i];
         diag->ramped_target_rpm[i] = s_ramped_target_rad_s[i] * WHEEL_RAD_S_TO_RPM;
         diag->vehicle_speed_rpm[i] = diag->motor[i].output_speed_rad_s *
                                      s_forward_sign[i] * WHEEL_RAD_S_TO_RPM;

@@ -100,10 +100,14 @@ extern "C" {
 #define DOG_GAIT_LOW_ENTRY_TIMEOUT_MS  2000U
 #define DOG_TROT_TOUCHDOWN_VEL_DPS      10.0f
 #define DOG_TROT_TOUCHDOWN_IQ_RISE_A     1.5f
+#define DOG_TROT_TOUCHDOWN_IQ_EXIT_A     0.8f
 #define DOG_TROT_TOUCHDOWN_IQ_ALPHA      0.10f
 #define DOG_TROT_TOUCHDOWN_IQ_START      0.80f
+#define DOG_TROT_TOUCHDOWN_CONFIRM_MS    20U
 #define DOG_TROT_TOUCHDOWN_FALLBACK_MS   40U
 #define DOG_TROT_TOUCHDOWN_TIMEOUT_MS   200U
+#define DOG_TROT_TOUCHDOWN_SEARCH_MM      8.0f
+#define DOG_TROT_TOUCHDOWN_SEARCH_MM_S   40.0f
 #define DOG_GAIT_LOW_TOUCHDOWN_ERR_DEG    4.0f
 #define DOG_GAIT_LOW_TOUCHDOWN_VEL_DPS    8.0f
 #define DOG_GAIT_LOW_TOUCHDOWN_STABLE_MS 80U
@@ -119,6 +123,42 @@ enum Dog_March_Mode {
     DOG_MARCH_MODE_TROT = 1U,
     DOG_MARCH_MODE_TURN_LEFT = 2U,
     DOG_MARCH_MODE_TURN_RIGHT = 3U,
+};
+
+enum Dog_Gait_Phase {
+    DOG_GAIT_PHASE_ENTRY_SETTLE = 0U,
+    DOG_GAIT_PHASE_SWING,
+    DOG_GAIT_PHASE_HOLD,
+    DOG_GAIT_PHASE_SWING_DOWN,
+    DOG_GAIT_PHASE_TOUCHDOWN,
+    DOG_GAIT_PHASE_STOP_NEUTRAL,
+    DOG_GAIT_PHASE_PAUSE,
+};
+
+struct DogGaitSyncState {
+    uint8_t active;
+    uint8_t stopping;
+    uint8_t phase;
+    uint8_t speed_profile;
+    uint8_t swing_mask;
+    uint8_t contact_mask;
+    uint8_t contact_search_mask;
+    uint8_t contact_failure_mask;
+    uint32_t half_step_generation;
+    uint32_t active_swing_ms;
+    float swing_progress[DOG_LEG_COUNT];
+    float contact_search_mm[DOG_LEG_COUNT];
+    float requested_forward;
+    float requested_yaw;
+    float applied_forward;
+    float applied_yaw;
+    float requested_wheel_contribution;
+    float active_wheel_contribution;
+    float active_leg_contribution;
+    float compatible_wheel_rpm;
+    float active_forward_stride_x_mm;
+    float active_turn_stride_x_mm;
+    float stop_progress;
 };
 
 enum Dog_Leg_Kin_Mode {
@@ -320,6 +360,8 @@ uint8_t dog_mit_drive_start(uint8_t cycles, float forward, float yaw);
 uint8_t dog_mit_drive_update(float forward, float yaw);
 void dog_mit_drive_get_command(float *requested_forward, float *requested_yaw,
                                float *applied_forward, float *applied_yaw);
+void dog_mit_set_gait_wheel_contribution(float contribution);
+void dog_mit_get_gait_sync_state(DogGaitSyncState *state);
 void dog_mit_march_in_place_stop(void);
 void dog_mit_march_request_stop(void);
 uint8_t dog_mit_march_in_place_is_active(void);

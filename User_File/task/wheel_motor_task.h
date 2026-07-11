@@ -49,6 +49,10 @@ typedef struct WheelDriveDiag {
     uint8_t overtemp_mask;
     float requested_left_rpm;
     float requested_right_rpm;
+    float requested_target_rpm[WHEEL_MOTOR_COUNT];
+    float phase_scale[WHEEL_MOTOR_COUNT];
+    float final_target_rpm[WHEEL_MOTOR_COUNT];
+    uint8_t hybrid_mode;
     float ramped_target_rpm[WHEEL_MOTOR_COUNT];
     float vehicle_speed_rpm[WHEEL_MOTOR_COUNT];
     int16_t current_cmd[WHEEL_MOTOR_COUNT];
@@ -66,6 +70,10 @@ void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan);
 uint8_t WheelDrive_OnCanRx(const FDCAN_RxHeaderTypeDef *header, const uint8_t data[8]);
 /* forward/yaw are normalized to [-1, 1]; max_rpm is an output-shaft limit. */
 void WheelDrive_SetMotion(float forward, float yaw, float max_rpm);
+void WheelDrive_SetMotionScaled(float forward, float yaw, float max_rpm,
+                                const float phase_scale[WHEEL_MOTOR_COUNT]);
+void WheelDrive_SetWheelTargets(const float target_rpm[WHEEL_MOTOR_COUNT],
+                                const float phase_scale[WHEEL_MOTOR_COUNT]);
 void WheelDrive_SetProfile(WheelDriveProfile profile);
 void WheelDrive_SetOperatingMode(WheelDriveOperatingMode mode);
 void WheelDrive_HoldIfEnabled(void);

@@ -12,6 +12,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define DEBUG_LF_STATUS_MS 1000U
 #define STEP_DEG           30.0f
@@ -43,6 +44,9 @@
 #define SBUS_GAIT_RETRY_MS     500U
 #define SBUS_FAULT_CLEAR_RETRY_MS 1000U
 #define SBUS_MECHANICAL_PREPARE_MS     200U
+#define SBUS_HYBRID_MAX_WHEEL_CONTRIBUTION 0.30f
+#define SBUS_WHEEL_DIAMETER_MM          116.0f
+#define SBUS_PI                         3.14159265358979323846f
 
 #define SBUS_SAFETY_RELEASED   0U
 #define SBUS_SAFETY_INHIBIT    1U
@@ -145,6 +149,7 @@ static SbusModeEntryState s_sbus_entry_state = SBUS_ENTRY_INACTIVE;
 static SbusModeBlockReason s_sbus_block_reason = SBUS_BLOCK_NONE;
 static uint32_t s_sbus_motor_check_last_ms = 0U;
 static uint32_t s_sbus_fault_clear_last_ms = 0U;
+static uint8_t s_sbus_hybrid_wheel_degraded = 0U;
 
 static const char *sbus_switch_name(uint8_t sw);
 static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc);
@@ -159,6 +164,10 @@ static float sbus_wheel_max_rpm(const SbusState *rc);
 static void sbus_wheel_hold(void);
 static void sbus_wheel_disable(uint8_t lock);
 static uint8_t sbus_wheel_update(const SbusState *rc);
+static float sbus_hybrid_wheel_contribution(const SbusState *rc,
+                                             float forward, float yaw);
+static void sbus_hybrid_wheel_update(const SbusState *rc,
+                                     const DogGaitSyncState *sync);
 static SbusRobotMode sbus_decode_robot_mode(uint8_t main_sw, uint8_t sub_sw);
 static const char *sbus_robot_mode_name(SbusRobotMode mode);
 static const char *sbus_entry_state_name(SbusModeEntryState state);
@@ -171,12 +180,13 @@ static void print_wheel_status(void)
 {
     WheelDriveDiag diag = {};
     WheelDrive_GetDiag(&diag);
-    DebugUart_Printf("WHEEL: can=%u mode=%u op=%u lock=%u brake=%u online=%u stopped=%u seen=0x%X profile=%u peak=0x%X therm=0x%X hot=0x%X req=%ld/%ldrpm txfail=%lu busoff=%lu timeout=%lu cmdtimeout=%lu reject=%lu\r\n",
+    DebugUart_Printf("WHEEL: can=%u mode=%u op=%u lock=%u brake=%u hybrid=%u online=%u stopped=%u seen=0x%X profile=%u peak=0x%X therm=0x%X hot=0x%X req=%ld/%ldrpm txfail=%lu busoff=%lu timeout=%lu cmdtimeout=%lu reject=%lu\r\n",
                      (unsigned)diag.can_ready,
                      (unsigned)diag.mode_enabled,
                      (unsigned)diag.operating_mode,
                      (unsigned)diag.locked,
                      (unsigned)diag.brake_active,
+                     (unsigned)diag.hybrid_mode,
                      (unsigned)diag.all_online,
                      (unsigned)diag.stopped,
                      (unsigned)diag.feedback_seen_mask,
@@ -192,10 +202,13 @@ static void print_wheel_status(void)
                      (unsigned long)diag.command_timeout_count,
                      (unsigned long)diag.rx_reject_count);
     for (uint8_t i = 0U; i < WHEEL_MOTOR_COUNT; ++i) {
-        DebugUart_Printf("  W%u enc=%u rounds=%ld target=%ldrpm speed=%ldrpm cmd=%d lim=%d peak=%ums iq=%d temp=%u age=%lums\r\n",
+        DebugUart_Printf("  W%u enc=%u rounds=%ld req=%ld scale=%ld final=%ld target=%ldrpm speed=%ldrpm cmd=%d lim=%d peak=%ums iq=%d temp=%u age=%lums\r\n",
                          (unsigned)(i + 1U),
                          (unsigned)diag.motor[i].encoder_raw,
                          (long)diag.motor[i].encoder_rounds,
+                         (long)diag.requested_target_rpm[i],
+                         (long)(diag.phase_scale[i] * 1000.0f),
+                         (long)diag.final_target_rpm[i],
                          (long)diag.ramped_target_rpm[i],
                          (long)diag.vehicle_speed_rpm[i],
                          (int)diag.current_cmd[i],
@@ -385,6 +398,8 @@ static void print_sbus_status(void)
     float applied_yaw = 0.0f;
     dog_mit_drive_get_command(&requested_forward, &requested_yaw,
                               &applied_forward, &applied_yaw);
+    DogGaitSyncState gait = {};
+    dog_mit_get_gait_sync_state(&gait);
 
     DebugUart_Printf("SBUS stat: frames=%lu parse_err=%lu rx_evt=%lu rx_bytes=%lu last_size=%u flag=0x%02X online=%u get=%u fresh=%u age=%lums lost=%u failsafe=%u debounce=%lums good=%u/%u confirmed=%u\r\n",
                      (unsigned long)rc.frame_count,
@@ -449,6 +464,25 @@ static void print_sbus_status(void)
                      (unsigned)s_sbus_mechanical_permit,
                      (unsigned long)((s_sbus_mechanical_prepare_since_ms == 0U) ? 0U :
                                      (now - s_sbus_mechanical_prepare_since_ms)));
+    DebugUart_Printf("  gait sync: phase=%u gen=%lu swing=0x%X contact=0x%X search=0x%X fail=0x%X progress=%ld/%ld/%ld/%ld wheel=%ld leg=%ld compat=%ldrpm search_um=%ld/%ld/%ld/%ld degraded=%u\r\n",
+                     (unsigned)gait.phase,
+                     (unsigned long)gait.half_step_generation,
+                     (unsigned)gait.swing_mask,
+                     (unsigned)gait.contact_mask,
+                     (unsigned)gait.contact_search_mask,
+                     (unsigned)gait.contact_failure_mask,
+                     (long)(gait.swing_progress[0U] * 1000.0f),
+                     (long)(gait.swing_progress[1U] * 1000.0f),
+                     (long)(gait.swing_progress[2U] * 1000.0f),
+                     (long)(gait.swing_progress[3U] * 1000.0f),
+                     (long)(gait.active_wheel_contribution * 1000.0f),
+                     (long)(gait.active_leg_contribution * 1000.0f),
+                     (long)gait.compatible_wheel_rpm,
+                     (long)(gait.contact_search_mm[0U] * 1000.0f),
+                     (long)(gait.contact_search_mm[1U] * 1000.0f),
+                     (long)(gait.contact_search_mm[2U] * 1000.0f),
+                     (long)(gait.contact_search_mm[3U] * 1000.0f),
+                     (unsigned)s_sbus_hybrid_wheel_degraded);
     print_wheel_status();
     print_arm_status();
 }
@@ -865,6 +899,102 @@ static uint8_t sbus_wheel_update(const SbusState *rc)
     return 1U;
 }
 
+static float sbus_smoothstep5(float value)
+{
+    const float x = fminf(fmaxf(value, 0.0f), 1.0f);
+    return x * x * x * (x * (x * 6.0f - 15.0f) + 10.0f);
+}
+
+static float sbus_gait_compatible_rpm(float forward, float yaw,
+                                      float forward_stride_mm,
+                                      float turn_stride_mm,
+                                      uint32_t swing_ms)
+{
+    if (swing_ms == 0U) {
+        return 0.0f;
+    }
+    const float left_mm = forward * forward_stride_mm + yaw * turn_stride_mm;
+    const float right_mm = forward * forward_stride_mm - yaw * turn_stride_mm;
+    const float travel_mm = fmaxf(fabsf(left_mm), fabsf(right_mm));
+    return travel_mm * 1000.0f / (float)swing_ms * 60.0f /
+           (SBUS_PI * SBUS_WHEEL_DIAMETER_MM);
+}
+
+static float sbus_hybrid_wheel_contribution(const SbusState *rc,
+                                             float forward, float yaw)
+{
+    const float requested_rpm = sbus_gait_compatible_rpm(
+        forward, yaw, dog_mit_gait_forward_stride_x_mm(),
+        dog_mit_gait_turn_stride_x_mm(), dog_mit_gait_trot_swing_ms());
+    DogGaitSyncState sync = {};
+    dog_mit_get_gait_sync_state(&sync);
+    const float limiting_rpm = fmaxf(requested_rpm, sync.compatible_wheel_rpm);
+    if (limiting_rpm <= 1.0e-3f) {
+        return 0.0f;
+    }
+    return fminf(SBUS_HYBRID_MAX_WHEEL_CONTRIBUTION,
+                 sbus_wheel_max_rpm(rc) / limiting_rpm);
+}
+
+static void sbus_hybrid_wheel_update(const SbusState *rc,
+                                     const DogGaitSyncState *sync)
+{
+    if ((rc == nullptr) || (sync == nullptr) || (sync->active == 0U) ||
+        (sync->active_wheel_contribution <= 1.0e-3f) ||
+        (WheelDrive_IsAvailable() == 0U)) {
+        sbus_wheel_hold();
+        return;
+    }
+
+    float phase_scale[WHEEL_MOTOR_COUNT] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (sync->phase == DOG_GAIT_PHASE_ENTRY_SETTLE) {
+        memset(phase_scale, 0, sizeof(phase_scale));
+    } else if (sync->phase == DOG_GAIT_PHASE_SWING) {
+        static const uint8_t leg_to_wheel[DOG_LEG_COUNT] = {0U, 1U, 3U, 2U};
+        for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+            if ((sync->swing_mask & (uint8_t)(1U << leg)) == 0U) {
+                continue;
+            }
+            const float progress = sync->swing_progress[leg];
+            float scale = 0.0f;
+            if (progress >= 0.90f) {
+                scale = 1.0f;
+            } else if (progress > 0.60f) {
+                scale = sbus_smoothstep5((progress - 0.60f) / 0.30f);
+            }
+            phase_scale[leg_to_wheel[leg]] = scale;
+        }
+    } else if (sync->phase == DOG_GAIT_PHASE_STOP_NEUTRAL) {
+        const float stop_scale = 1.0f - sync->stop_progress;
+        for (uint8_t wheel = 0U; wheel < WHEEL_MOTOR_COUNT; ++wheel) {
+            phase_scale[wheel] = stop_scale;
+        }
+    }
+
+    const float swing_s = (float)sync->active_swing_ms * 0.001f;
+    if (swing_s <= 0.0f) {
+        sbus_wheel_hold();
+        return;
+    }
+    const float rpm_per_mm = 60.0f /
+        (swing_s * SBUS_PI * SBUS_WHEEL_DIAMETER_MM);
+    const float left_rpm = (sync->applied_forward * sync->active_forward_stride_x_mm +
+                            sync->applied_yaw * sync->active_turn_stride_x_mm) *
+                           rpm_per_mm * sync->active_wheel_contribution;
+    const float right_rpm = (sync->applied_forward * sync->active_forward_stride_x_mm -
+                             sync->applied_yaw * sync->active_turn_stride_x_mm) *
+                            rpm_per_mm * sync->active_wheel_contribution;
+    const float limit_rpm = sbus_wheel_max_rpm(rc);
+    const float targets[WHEEL_MOTOR_COUNT] = {
+        fminf(fmaxf(left_rpm, -limit_rpm), limit_rpm),
+        fminf(fmaxf(right_rpm, -limit_rpm), limit_rpm),
+        fminf(fmaxf(right_rpm, -limit_rpm), limit_rpm),
+        fminf(fmaxf(left_rpm, -limit_rpm), limit_rpm),
+    };
+    WheelDrive_SetOperatingMode(WHEEL_OPERATING_DRIVE);
+    WheelDrive_SetWheelTargets(targets, phase_scale);
+}
+
 static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc)
 {
     if (rc == nullptr) {
@@ -1165,6 +1295,9 @@ static void sbus_motor_check_print(uint32_t now)
 static void sbus_mode_transition(SbusRobotMode requested)
 {
     const SbusRobotMode previous = s_sbus_requested_mode;
+    const uint8_t gait_to_gait =
+        (((previous == SBUS_MODE_GAIT_WHEEL) || (previous == SBUS_MODE_GAIT_ONLY)) &&
+         ((requested == SBUS_MODE_GAIT_WHEEL) || (requested == SBUS_MODE_GAIT_ONLY))) ? 1U : 0U;
     s_sbus_requested_mode = requested;
     s_sbus_active_mode = SBUS_MODE_NONE;
     s_sbus_entry_state = SBUS_ENTRY_ENTERING;
@@ -1172,6 +1305,11 @@ static void sbus_mode_transition(SbusRobotMode requested)
     s_sbus_motor_check_last_ms = 0U;
 
     sbus_arm_leave();
+    if ((requested != SBUS_MODE_GAIT_WHEEL) &&
+        (requested != SBUS_MODE_GAIT_ONLY)) {
+        dog_mit_set_gait_wheel_contribution(0.0f);
+        s_sbus_hybrid_wheel_degraded = 0U;
+    }
     if (requested == SBUS_MODE_MOTOR_CHECK) {
         sbus_quad_stop_motion_immediate(0U);
         sbus_mechanical_cancel();
@@ -1181,7 +1319,9 @@ static void sbus_mode_transition(SbusRobotMode requested)
         sbus_quad_reset_state();
         sbus_wheel_disable(0U);
     } else {
-        sbus_wheel_hold();
+        if (gait_to_gait == 0U) {
+            sbus_wheel_hold();
+        }
         if (requested != SBUS_MODE_LOW_WHEEL) {
             sbus_mechanical_cancel();
         }
@@ -1345,14 +1485,6 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
                 break;
             }
         }
-        if ((wheel_drive_enabled != 0U) && (WheelDrive_IsAvailable() == 0U)) {
-            sbus_wheel_hold();
-            sbus_quad_stop_motion(0U);
-            s_sbus_active_mode = SBUS_MODE_NONE;
-            s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
-            s_sbus_block_reason = SBUS_BLOCK_WHEEL_FAULT;
-            break;
-        }
         if ((dog_mit_march_in_place_is_active() == 0U) &&
             (sbus_quad_ensure_stand(now) == 0U)) {
             sbus_wheel_hold();
@@ -1363,6 +1495,28 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
 
         SbusDriveInput drive = {};
         sbus_drive_input_from_sticks(rc, &drive);
+        DogGaitSyncState pre_sync = {};
+        dog_mit_get_gait_sync_state(&pre_sync);
+        float requested_wheel_contribution = 0.0f;
+        if (wheel_drive_enabled != 0U) {
+            if (WheelDrive_IsAvailable() == 0U) {
+                s_sbus_hybrid_wheel_degraded = 1U;
+            } else if (s_sbus_hybrid_wheel_degraded != 0U) {
+                if ((pre_sync.active == 0U) ||
+                    (pre_sync.active_wheel_contribution <= 1.0e-3f)) {
+                    s_sbus_hybrid_wheel_degraded = 0U;
+                    requested_wheel_contribution = sbus_hybrid_wheel_contribution(
+                        rc, drive.forward, drive.yaw);
+                }
+            } else {
+                requested_wheel_contribution = sbus_hybrid_wheel_contribution(
+                    rc, drive.forward, drive.yaw);
+            }
+        } else {
+            s_sbus_hybrid_wheel_degraded = 0U;
+        }
+        dog_mit_set_gait_wheel_contribution(requested_wheel_contribution);
+
         if (drive.active != 0U) {
             (void)sbus_quad_drive_command(&drive, now);
         } else if (dog_mit_trot_march_is_active() != 0U) {
@@ -1371,13 +1525,12 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
             (void)sbus_quad_start_in_place(now);
         }
 
-        float applied_forward = 0.0f;
-        float applied_yaw = 0.0f;
+        DogGaitSyncState sync = {};
+        dog_mit_get_gait_sync_state(&sync);
         if (dog_mit_march_in_place_is_active() != 0U) {
-            dog_mit_drive_get_command(nullptr, nullptr, &applied_forward, &applied_yaw);
-            if (wheel_drive_enabled != 0U) {
-                WheelDrive_SetOperatingMode(WHEEL_OPERATING_DRIVE);
-                WheelDrive_SetMotion(applied_forward, applied_yaw, sbus_wheel_max_rpm(rc));
+            if ((s_sbus_hybrid_wheel_degraded == 0U) &&
+                (sync.active_wheel_contribution > 1.0e-3f)) {
+                sbus_hybrid_wheel_update(rc, &sync);
             } else {
                 sbus_wheel_hold();
             }

@@ -38,6 +38,9 @@ extern FDCAN_HandleTypeDef hfdcan3;
 #define DOG_STAND_MOVE_MS              2500U
 #define DOG_GAIT_STOP_NEUTRAL_MS        200U
 #define DOG_DRIVE_COMMAND_SLEW_PER_HALF_STEP 0.25f
+#define DOG_GAIT_WHEEL_MAX_CONTRIBUTION 0.30f
+#define DOG_WHEEL_DIAMETER_MM           116.0f
+#define DOG_GAIT_SWING_APEX_PROGRESS    0.45f
 #define DOG_JUMP_SETTLE_MS             500U
 #define DOG_ENCODER_FEEDBACK_PERIOD_MS  DOG_CMD_PERIOD_MS
 #define DOG_SLOW_FEEDBACK_SLOT_MS       25U
@@ -215,8 +218,20 @@ static struct {
     uint8_t trot_stride_applied;
     uint8_t stop_requested;
     uint32_t entry_stable_since_ms;
-    float contact_iq_baseline_a[2U];
-    float contact_iq_filtered_a[2U];
+    float contact_iq_baseline_a[DOG_LEG_COUNT];
+    float contact_iq_filtered_a[DOG_LEG_COUNT];
+    uint32_t contact_candidate_since_ms[DOG_LEG_COUNT];
+    uint32_t contact_stable_since_ms[DOG_LEG_COUNT];
+    uint32_t search_limit_since_ms[DOG_LEG_COUNT];
+    float swing_progress[DOG_LEG_COUNT];
+    float contact_search_mm[DOG_LEG_COUNT];
+    float frozen_x_mm[DOG_LEG_COUNT];
+    float frozen_z_mm[DOG_LEG_COUNT];
+    uint8_t swing_mask;
+    uint8_t contact_mask;
+    uint8_t contact_search_mask;
+    uint8_t contact_failure_mask;
+    uint32_t half_step_generation;
     uint32_t active_swing_ms;
     uint32_t active_touchdown_dwell_ms;
     uint32_t active_diagonal_stagger_ms;
@@ -229,10 +244,15 @@ static struct {
     float applied_yaw;
     float active_forward;
     float active_yaw;
+    float active_wheel_contribution;
+    float active_leg_contribution;
+    float compatible_wheel_rpm;
+    float stop_progress;
     float active_stride_delta_mm[DOG_LEG_COUNT];
     uint8_t active_speed_profile;
     uint32_t touchdown_stable_since_ms;
     float stop_start_x_mm[DOG_LEG_COUNT];
+    float stop_start_z_mm[DOG_LEG_COUNT];
     float stable_velocity_lpf_dps[DOG_MOTOR_COUNT];
     uint32_t stable_velocity_filter_ms;
     uint32_t contact_iq_query_ms;
@@ -260,9 +280,12 @@ static const Dog_Gait_Speed_Profile s_gait_speed_profiles[] = {
 };
 
 static float s_leg_foot_x_offset[DOG_LEG_COUNT] = {};
+static float s_leg_touchdown_z_offset[DOG_LEG_COUNT] = {};
 static float s_leg_command_x_mm[DOG_LEG_COUNT] = {};
+static float s_leg_command_z_mm[DOG_LEG_COUNT] = {};
 static float s_leg_hip_offset_deg[DOG_LEG_COUNT] = {};
 static uint8_t s_gait_speed_profile = DOG_GAIT_SPEED_DEFAULT;
+static volatile float s_requested_gait_wheel_contribution = 0.0f;
 static uint8_t s_diag_support_active = 0U;
 static uint32_t s_mit_last_pid_ms = 0U;
 static uint32_t s_parsed_frame_count[2];
@@ -2234,6 +2257,21 @@ static void march_compute_drive_stride_deltas(float forward, float yaw,
     }
 }
 
+static float march_compatible_wheel_rpm(float forward, float yaw,
+                                        float forward_stride_x_mm,
+                                        float turn_stride_x_mm,
+                                        uint32_t swing_ms)
+{
+    if (swing_ms == 0U) {
+        return 0.0f;
+    }
+    const float left_stride_mm = forward * forward_stride_x_mm + yaw * turn_stride_x_mm;
+    const float right_stride_mm = forward * forward_stride_x_mm - yaw * turn_stride_x_mm;
+    const float travel_mm = fmaxf(fabsf(left_stride_mm), fabsf(right_stride_mm));
+    const float travel_mm_s = travel_mm * 1000.0f / (float)swing_ms;
+    return travel_mm_s * 60.0f / (DOG_PI * DOG_WHEEL_DIAMETER_MM);
+}
+
 static void march_snapshot_drive_command(void)
 {
     s_march.applied_forward = march_slew_command(s_march.applied_forward,
@@ -2249,8 +2287,22 @@ static void march_snapshot_drive_command(void)
     s_march.active_forward_stride_x_mm = dog_mit_gait_forward_stride_x_mm();
     s_march.active_turn_stride_x_mm = dog_mit_gait_turn_stride_x_mm();
     s_march.active_swing_height_mm = dog_mit_gait_swing_height_mm();
-    march_compute_drive_stride_deltas(s_march.active_forward,
-                                      s_march.active_yaw,
+    taskENTER_CRITICAL();
+    s_march.active_wheel_contribution = clampf(
+        s_requested_gait_wheel_contribution, 0.0f,
+        DOG_GAIT_WHEEL_MAX_CONTRIBUTION);
+    taskEXIT_CRITICAL();
+    s_march.active_leg_contribution = 1.0f - s_march.active_wheel_contribution;
+    s_march.compatible_wheel_rpm = march_compatible_wheel_rpm(
+        s_march.active_forward, s_march.active_yaw,
+        s_march.active_forward_stride_x_mm,
+        s_march.active_turn_stride_x_mm,
+        s_march.active_swing_ms);
+    s_march.half_step_generation++;
+    march_compute_drive_stride_deltas(s_march.active_forward *
+                                          s_march.active_leg_contribution,
+                                      s_march.active_yaw *
+                                          s_march.active_leg_contribution,
                                       s_march.active_forward_stride_x_mm,
                                       s_march.active_turn_stride_x_mm,
                                       s_march.active_stride_delta_mm);
@@ -2271,7 +2323,8 @@ static float march_trot_swing_peak_z_mm(uint8_t leg)
 {
     const float swing_height_mm = (s_march.active_swing_ms != 0U) ?
         s_march.active_swing_height_mm : dog_mit_gait_swing_height_mm();
-    return dog_leg_stand_foot_z_mm(leg) + DOG_TROT_FOOT_Z1_MM - swing_height_mm;
+    return dog_leg_stand_foot_z_mm(leg) + DOG_TROT_FOOT_Z1_MM +
+           s_leg_touchdown_z_offset[leg] - swing_height_mm;
 }
 
 static uint8_t dog_leg_inverse_xz_mm(float x_mm, float z_mm, float *hip_motor_deg, float *knee_motor_deg)
@@ -3680,6 +3733,7 @@ static void march_set_leg_foot_xz(uint8_t leg, float x_mm, float z_mm)
     }
     dog_leg_set_motor_user_deg_for_leg(leg, hip, knee);
     s_leg_command_x_mm[leg] = x_mm;
+    s_leg_command_z_mm[leg] = z_mm;
 }
 
 static void march_set_all_legs_stand_pose(void)
@@ -3783,7 +3837,8 @@ static uint8_t march_trot_leg_corners(uint8_t leg, float *x1, float *x2, float *
         *x2 = base_x + x_delta;
     }
     if (z1 != nullptr) {
-        *z1 = dog_leg_stand_foot_z_mm(leg) + DOG_TROT_FOOT_Z1_MM;
+        *z1 = dog_leg_stand_foot_z_mm(leg) + DOG_TROT_FOOT_Z1_MM +
+              s_leg_touchdown_z_offset[leg];
     }
     if (z2 != nullptr) {
         *z2 = march_trot_swing_peak_z_mm(leg);
@@ -3887,8 +3942,8 @@ static void march_trot_update_swing_pid_mask(uint32_t now)
     mit_set_mixed_swing_leg_mask(leg_mask);
 }
 
-static void march_trot_trajectory1_cycloid(float t_s, const March_Trot_Traj_Params *params,
-                                           float *x_mm, float *z_mm)
+static void march_trot_trajectory_smooth(float t_s, const March_Trot_Traj_Params *params,
+                                         float *x_mm, float *z_mm)
 {
     if ((params == nullptr) || (x_mm == nullptr) || (z_mm == nullptr)) {
         return;
@@ -3906,11 +3961,17 @@ static void march_trot_trajectory1_cycloid(float t_s, const March_Trot_Traj_Para
         return;
     }
 
-    const float tau = t_s / params->period_s;
-    const float two_pi_tau = 2.0f * DOG_PI * tau;
-    *x_mm = params->start_x +
-            (params->step_length * (tau - (sinf(two_pi_tau) / (2.0f * DOG_PI))));
-    *z_mm = params->start_z + (params->step_height * (1.0f - cosf(two_pi_tau)) * 0.5f);
+    const float tau = clampf(t_s / params->period_s, 0.0f, 1.0f);
+    *x_mm = params->start_x + params->step_length * smoothstep5_01(tau);
+    if (tau <= DOG_GAIT_SWING_APEX_PROGRESS) {
+        const float rise = tau / DOG_GAIT_SWING_APEX_PROGRESS;
+        *z_mm = params->start_z + params->step_height * smoothstep5_01(rise);
+    } else {
+        const float descend = (tau - DOG_GAIT_SWING_APEX_PROGRESS) /
+                              (1.0f - DOG_GAIT_SWING_APEX_PROGRESS);
+        *z_mm = params->start_z + params->step_height *
+                (1.0f - smoothstep5_01(descend));
+    }
 }
 
 static uint8_t march_is_swing_leg(uint8_t leg, uint8_t swing_a, uint8_t swing_b)
@@ -3953,7 +4014,8 @@ static void march_trot_apply_swing_trajectory(uint32_t now)
     for (uint8_t i = 0U; i < 2U; ++i) {
         const uint8_t leg = swing_legs[i];
         float period_s = 0.0f;
-        const float t_s = march_trot_leg_elapsed_s(now, leg, &period_s, nullptr);
+        float progress = 0.0f;
+        const float t_s = march_trot_leg_elapsed_s(now, leg, &period_s, &progress);
         float x1 = 0.0f;
         float x2 = 0.0f;
         float z1 = 0.0f;
@@ -3975,8 +4037,16 @@ static void march_trot_apply_swing_trajectory(uint32_t now)
         };
         float foot_x = x1;
         float foot_z = z1;
-        march_trot_trajectory1_cycloid(t_s, &params, &foot_x, &foot_z);
-        march_trot_set_swing_foot(leg, foot_x, foot_z);
+        march_trot_trajectory_smooth(t_s, &params, &foot_x, &foot_z);
+        s_march.swing_progress[leg] = progress;
+        if ((s_march.contact_mask & (uint8_t)(1U << leg)) == 0U) {
+            s_march.frozen_x_mm[leg] = foot_x;
+            s_march.frozen_z_mm[leg] = foot_z;
+            march_trot_set_swing_foot(leg, foot_x, foot_z);
+        } else {
+            march_trot_set_swing_foot(leg, s_march.frozen_x_mm[leg],
+                                      s_march.frozen_z_mm[leg]);
+        }
     }
 }
 
@@ -4014,7 +4084,7 @@ static void march_trot_apply_support_stance(uint32_t now)
         };
         float foot_x = x1;
         float foot_z = z1;
-        march_trot_trajectory1_cycloid(t_s, &params, &foot_x, &foot_z);
+        march_trot_trajectory_smooth(t_s, &params, &foot_x, &foot_z);
         march_set_leg_foot_xz(leg, foot_x, foot_z);
     }
 }
@@ -4041,7 +4111,9 @@ static void march_trot_finish_stride(uint32_t now)
     for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
         const float delta = march_stride_x_delta(leg);
         if (march_is_swing_leg(leg, swing_a, swing_b) != 0U) {
-            s_leg_foot_x_offset[leg] += delta;
+            if ((s_march.contact_mask & (uint8_t)(1U << leg)) == 0U) {
+                s_leg_foot_x_offset[leg] += delta;
+            }
         } else {
             s_leg_foot_x_offset[leg] -= delta;
         }
@@ -4093,10 +4165,28 @@ static uint8_t march_swing_legs_settled(float err_threshold_deg)
 static void march_contact_samples_begin(uint8_t leg_a, uint8_t leg_b)
 {
     const uint8_t legs[2U] = {leg_a, leg_b};
+    s_march.swing_mask = 0U;
+    s_march.contact_mask = 0x0FU;
+    s_march.contact_search_mask = 0U;
+    s_march.contact_failure_mask = 0U;
+    memset(s_march.contact_candidate_since_ms, 0,
+           sizeof(s_march.contact_candidate_since_ms));
+    memset(s_march.contact_stable_since_ms, 0,
+           sizeof(s_march.contact_stable_since_ms));
+    memset(s_march.search_limit_since_ms, 0,
+           sizeof(s_march.search_limit_since_ms));
+    memset(s_march.contact_search_mm, 0, sizeof(s_march.contact_search_mm));
+    memset(s_march.swing_progress, 0, sizeof(s_march.swing_progress));
     for (uint8_t i = 0U; i < 2U; ++i) {
         const float iq_a = (legs[i] < DOG_LEG_COUNT) ? march_leg_abs_iq_a(legs[i]) : 0.0f;
-        s_march.contact_iq_baseline_a[i] = iq_a;
-        s_march.contact_iq_filtered_a[i] = iq_a;
+        if (legs[i] >= DOG_LEG_COUNT) {
+            continue;
+        }
+        const uint8_t bit = (uint8_t)(1U << legs[i]);
+        s_march.swing_mask |= bit;
+        s_march.contact_mask &= (uint8_t)~bit;
+        s_march.contact_iq_baseline_a[legs[i]] = iq_a;
+        s_march.contact_iq_filtered_a[legs[i]] = iq_a;
     }
     s_march.contact_iq_query_ms = 0U;
 }
@@ -4138,53 +4228,104 @@ static void march_contact_samples_update(uint32_t now)
         }
         float progress = 1.0f;
         (void)march_trot_leg_elapsed_s(now, legs[i], nullptr, &progress);
-        const float iq_a = march_leg_abs_iq_a(legs[i]);
+        const uint8_t leg = legs[i];
+        const uint8_t bit = (uint8_t)(1U << leg);
+        const float iq_a = march_leg_abs_iq_a(leg);
         if (progress < DOG_TROT_TOUCHDOWN_IQ_START) {
-            if (iq_a < s_march.contact_iq_baseline_a[i]) {
-                s_march.contact_iq_baseline_a[i] = iq_a;
+            if (iq_a < s_march.contact_iq_baseline_a[leg]) {
+                s_march.contact_iq_baseline_a[leg] = iq_a;
             }
-            s_march.contact_iq_filtered_a[i] = iq_a;
+            s_march.contact_iq_filtered_a[leg] = iq_a;
+            s_march.contact_candidate_since_ms[leg] = 0U;
         } else {
-            s_march.contact_iq_filtered_a[i] += DOG_TROT_TOUCHDOWN_IQ_ALPHA *
-                (iq_a - s_march.contact_iq_filtered_a[i]);
+            s_march.contact_iq_filtered_a[leg] += DOG_TROT_TOUCHDOWN_IQ_ALPHA *
+                (iq_a - s_march.contact_iq_filtered_a[leg]);
+            if ((s_march.contact_mask & bit) != 0U) {
+                continue;
+            }
+            const float iq_rise = s_march.contact_iq_filtered_a[leg] -
+                                  s_march.contact_iq_baseline_a[leg];
+            if (iq_rise >= DOG_TROT_TOUCHDOWN_IQ_RISE_A) {
+                if (s_march.contact_candidate_since_ms[leg] == 0U) {
+                    s_march.contact_candidate_since_ms[leg] = now;
+                } else if ((uint32_t)(now - s_march.contact_candidate_since_ms[leg]) >=
+                           DOG_TROT_TOUCHDOWN_CONFIRM_MS) {
+                    s_march.contact_mask |= bit;
+                    s_march.contact_search_mask &= (uint8_t)~bit;
+                    s_leg_foot_x_offset[leg] = s_march.frozen_x_mm[leg];
+                    s_leg_touchdown_z_offset[leg] = clampf(
+                        s_march.frozen_z_mm[leg] - dog_leg_stand_foot_z_mm(leg) -
+                            DOG_TROT_FOOT_Z1_MM,
+                        -DOG_TROT_TOUCHDOWN_SEARCH_MM,
+                        DOG_TROT_TOUCHDOWN_SEARCH_MM);
+                }
+            } else if (iq_rise <= DOG_TROT_TOUCHDOWN_IQ_EXIT_A) {
+                s_march.contact_candidate_since_ms[leg] = 0U;
+            }
         }
     }
 }
 
 static uint8_t march_swing_legs_contact_detected(void)
 {
-    uint8_t leg_a = 0U;
-    uint8_t leg_b = DOG_LEG_COUNT;
-    march_get_swing_legs(&leg_a, &leg_b);
-    const uint8_t legs[2U] = {leg_a, leg_b};
-
-    for (uint8_t i = 0U; i < 2U; ++i) {
-        if (legs[i] >= DOG_LEG_COUNT) {
-            continue;
-        }
-        if ((s_march.contact_iq_filtered_a[i] - s_march.contact_iq_baseline_a[i]) <
-            DOG_TROT_TOUCHDOWN_IQ_RISE_A) {
-            return 0U;
-        }
-    }
-    return 1U;
+    return ((s_march.contact_mask & s_march.swing_mask) == s_march.swing_mask) ? 1U : 0U;
 }
 
-static uint8_t march_swing_legs_stable(void)
+static void march_touchdown_search_update(uint32_t now)
 {
-    uint8_t leg_a = 0U;
-    uint8_t leg_b = DOG_LEG_COUNT;
-    march_get_swing_legs(&leg_a, &leg_b);
-    if (march_leg_joints_stable(leg_a, DOG_TROT_SETTLE_ERR_DEG,
-                                DOG_TROT_TOUCHDOWN_VEL_DPS) == 0U) {
-        return 0U;
+    const uint32_t elapsed_ms = (uint32_t)(now - s_march.phase_t0_ms);
+    const float requested_search_mm = fminf(
+        (float)elapsed_ms * DOG_TROT_TOUCHDOWN_SEARCH_MM_S * 0.001f,
+        DOG_TROT_TOUCHDOWN_SEARCH_MM);
+
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        const uint8_t bit = (uint8_t)(1U << leg);
+        if ((s_march.swing_mask & bit) == 0U) {
+            continue;
+        }
+        s_march.swing_progress[leg] = 1.0f;
+        if ((s_march.contact_mask & bit) != 0U) {
+            s_march.contact_search_mask &= (uint8_t)~bit;
+            continue;
+        }
+
+        s_march.contact_search_mask |= bit;
+        s_march.contact_search_mm[leg] = requested_search_mm;
+        float nominal_z = dog_leg_stand_foot_z_mm(leg) + DOG_TROT_FOOT_Z1_MM +
+                          s_leg_touchdown_z_offset[leg];
+        s_march.frozen_z_mm[leg] = nominal_z + requested_search_mm;
+        march_trot_set_swing_foot(leg, s_march.frozen_x_mm[leg],
+                                  s_march.frozen_z_mm[leg]);
+
+        if ((requested_search_mm >= DOG_TROT_TOUCHDOWN_SEARCH_MM) &&
+            (march_leg_joints_stable(leg, DOG_TROT_SETTLE_ERR_DEG,
+                                     DOG_TROT_TOUCHDOWN_VEL_DPS) != 0U)) {
+            if (s_march.contact_stable_since_ms[leg] == 0U) {
+                s_march.contact_stable_since_ms[leg] = now;
+            } else if ((uint32_t)(now - s_march.contact_stable_since_ms[leg]) >=
+                       DOG_TROT_TOUCHDOWN_FALLBACK_MS) {
+                s_march.contact_mask |= bit;
+                s_march.contact_search_mask &= (uint8_t)~bit;
+                s_leg_foot_x_offset[leg] = s_march.frozen_x_mm[leg];
+                s_leg_touchdown_z_offset[leg] = clampf(
+                    s_leg_touchdown_z_offset[leg] + requested_search_mm,
+                    -DOG_TROT_TOUCHDOWN_SEARCH_MM,
+                    DOG_TROT_TOUCHDOWN_SEARCH_MM);
+                continue;
+            }
+        } else {
+            s_march.contact_stable_since_ms[leg] = 0U;
+        }
+
+        if (requested_search_mm >= DOG_TROT_TOUCHDOWN_SEARCH_MM) {
+            if (s_march.search_limit_since_ms[leg] == 0U) {
+                s_march.search_limit_since_ms[leg] = now;
+            } else if ((uint32_t)(now - s_march.search_limit_since_ms[leg]) >=
+                       DOG_TROT_TOUCHDOWN_FALLBACK_MS) {
+                s_march.contact_failure_mask |= bit;
+            }
+        }
     }
-    if ((leg_b < DOG_LEG_COUNT) &&
-        (march_leg_joints_stable(leg_b, DOG_TROT_SETTLE_ERR_DEG,
-                                 DOG_TROT_TOUCHDOWN_VEL_DPS) == 0U)) {
-        return 0U;
-    }
-    return 1U;
 }
 
 static void march_begin_stop_neutral(uint32_t now);
@@ -4196,6 +4337,7 @@ static void march_begin_swing_up(uint32_t now)
     march_get_swing_legs(&leg_a, &leg_b);
 
     if (march_mode_uses_cycloid(s_march.mode) != 0U) {
+        s_march.stop_progress = 0.0f;
         march_snapshot_drive_command();
         if (march_gait_corners_reachable() == 0U) {
             DebugUart_Printf("Drive target unreachable; stopping at neutral.\r\n");
@@ -4255,6 +4397,7 @@ void dog_mit_march_in_place_stop(void)
 
     memset(&s_march, 0, sizeof(s_march));
     memset(s_leg_foot_x_offset, 0, sizeof(s_leg_foot_x_offset));
+    memset(s_leg_touchdown_z_offset, 0, sizeof(s_leg_touchdown_z_offset));
     memset(s_leg_hip_offset_deg, 0, sizeof(s_leg_hip_offset_deg));
     mit_set_all_stand_pid_mode();
     march_set_all_legs_stand_pose();
@@ -4277,10 +4420,12 @@ static void march_begin_stop_neutral(uint32_t now)
 {
     for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
         s_march.stop_start_x_mm[leg] = s_leg_command_x_mm[leg];
+        s_march.stop_start_z_mm[leg] = s_leg_command_z_mm[leg];
     }
     mit_set_all_stand_pid_mode();
     s_march.phase = DOG_MARCH_PHASE_STOP_NEUTRAL;
     s_march.phase_t0_ms = now;
+    s_march.stop_progress = 0.0f;
 }
 
 static void march_stop_neutral_tick(uint32_t now)
@@ -4289,10 +4434,14 @@ static void march_stop_neutral_tick(uint32_t now)
     const float raw_progress = (elapsed_ms >= DOG_GAIT_STOP_NEUTRAL_MS) ? 1.0f :
         ((float)elapsed_ms / (float)DOG_GAIT_STOP_NEUTRAL_MS);
     const float progress = smoothstep5_01(raw_progress);
+    s_march.stop_progress = progress;
 
     for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
         const float x_mm = s_march.stop_start_x_mm[leg] * (1.0f - progress);
-        march_set_leg_foot_xz(leg, x_mm, dog_leg_stand_foot_z_mm(leg));
+        const float stand_z_mm = dog_leg_stand_foot_z_mm(leg);
+        const float z_mm = s_march.stop_start_z_mm[leg] +
+                           (stand_z_mm - s_march.stop_start_z_mm[leg]) * progress;
+        march_set_leg_foot_xz(leg, x_mm, z_mm);
     }
 
     if (elapsed_ms >= DOG_GAIT_STOP_NEUTRAL_MS) {
@@ -4414,9 +4563,18 @@ static void march_in_place_tick(uint32_t now)
     case DOG_MARCH_PHASE_TOUCHDOWN: {
         const uint32_t elapsed_ms = (uint32_t)(now - s_march.phase_t0_ms);
         const uint32_t dwell_ms = s_march.active_touchdown_dwell_ms;
+        march_touchdown_search_update(now);
+        if (s_march.contact_failure_mask != 0U) {
+            DebugUart_Printf("Trot no contact mask=0x%02X search=%ld/%ld/%ld/%ld um; stopping neutral.\r\n",
+                             (unsigned)s_march.contact_failure_mask,
+                             (long)(s_march.contact_search_mm[0U] * 1000.0f),
+                             (long)(s_march.contact_search_mm[1U] * 1000.0f),
+                             (long)(s_march.contact_search_mm[2U] * 1000.0f),
+                             (long)(s_march.contact_search_mm[3U] * 1000.0f));
+            march_begin_stop_neutral(now);
+            break;
+        }
         const uint8_t current_contact = march_swing_legs_contact_detected();
-        const uint8_t fallback_ready =
-            (elapsed_ms >= (dwell_ms + DOG_TROT_TOUCHDOWN_FALLBACK_MS)) ? 1U : 0U;
         if (s_march.active_speed_profile == DOG_GAIT_SPEED_LOW) {
             const uint8_t stable = march_all_legs_stable(DOG_GAIT_LOW_TOUCHDOWN_ERR_DEG,
                                                           DOG_GAIT_LOW_TOUCHDOWN_VEL_DPS);
@@ -4434,19 +4592,14 @@ static void march_in_place_tick(uint32_t now)
                  ((uint32_t)(now - s_march.touchdown_stable_since_ms) >=
                   DOG_GAIT_LOW_TOUCHDOWN_STABLE_MS)) ? 1U : 0U;
             if ((elapsed_ms >= dwell_ms) && (stable_window_ready != 0U) &&
-                ((current_contact != 0U) || (fallback_ready != 0U))) {
+                (current_contact != 0U)) {
                 march_advance_step(now);
             } else if (elapsed_ms >= DOG_GAIT_LOW_TOUCHDOWN_TIMEOUT_MS) {
                 DebugUart_Printf("LOW support settle timeout; stopping at neutral.\r\n");
                 march_begin_stop_neutral(now);
             }
         } else {
-            const uint8_t stable = march_swing_legs_stable();
-            if ((elapsed_ms >= dwell_ms) && (stable != 0U) &&
-                ((current_contact != 0U) || (fallback_ready != 0U))) {
-                march_advance_step(now);
-            } else if (elapsed_ms >= DOG_TROT_TOUCHDOWN_TIMEOUT_MS) {
-                DebugUart_Printf("Trot touchdown timeout pair=%u.\r\n", (unsigned)s_march.leg);
+            if ((elapsed_ms >= dwell_ms) && (current_contact != 0U)) {
                 march_advance_step(now);
             }
         }
@@ -4564,6 +4717,7 @@ static uint8_t march_in_place_start_mode(uint8_t mode, uint8_t cycles,
     s_march.active_speed_profile = dog_mit_get_gait_speed_profile();
     s_march.requested_forward = forward;
     s_march.requested_yaw = yaw;
+    s_march.active_leg_contribution = 1.0f;
     s_march.phase = DOG_MARCH_PHASE_ENTRY_SETTLE;
     s_march.phase_t0_ms = HAL_GetTick();
     s_march.entry_stable_since_ms = 0U;
@@ -4625,6 +4779,54 @@ void dog_mit_drive_get_command(float *requested_forward, float *requested_yaw,
     if (applied_yaw != nullptr) {
         *applied_yaw = s_march.applied_yaw;
     }
+}
+
+void dog_mit_set_gait_wheel_contribution(float contribution)
+{
+    if (!isfinite(contribution)) {
+        contribution = 0.0f;
+    }
+    contribution = clampf(contribution, 0.0f, DOG_GAIT_WHEEL_MAX_CONTRIBUTION);
+    taskENTER_CRITICAL();
+    s_requested_gait_wheel_contribution = contribution;
+    taskEXIT_CRITICAL();
+}
+
+void dog_mit_get_gait_sync_state(DogGaitSyncState *state)
+{
+    if (state == nullptr) {
+        return;
+    }
+    memset(state, 0, sizeof(*state));
+    taskENTER_CRITICAL();
+    state->active = s_march.active;
+    state->stopping = ((s_march.stop_requested != 0U) ||
+                       (s_march.phase == DOG_MARCH_PHASE_STOP_NEUTRAL)) ? 1U : 0U;
+    state->phase = s_march.phase;
+    state->speed_profile = s_march.active_speed_profile;
+    state->swing_mask = s_march.swing_mask;
+    state->contact_mask = s_march.contact_mask;
+    state->contact_search_mask = s_march.contact_search_mask;
+    state->contact_failure_mask = s_march.contact_failure_mask;
+    state->half_step_generation = s_march.half_step_generation;
+    state->active_swing_ms = s_march.active_swing_ms;
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        state->swing_progress[leg] = s_march.swing_progress[leg];
+        state->contact_search_mm[leg] = s_march.contact_search_mm[leg];
+    }
+    state->requested_forward = s_march.requested_forward;
+    state->requested_yaw = s_march.requested_yaw;
+    state->applied_forward = s_march.active_forward;
+    state->applied_yaw = s_march.active_yaw;
+    state->requested_wheel_contribution = s_requested_gait_wheel_contribution;
+    state->active_wheel_contribution = s_march.active_wheel_contribution;
+    state->active_leg_contribution = (s_march.active != 0U) ?
+        s_march.active_leg_contribution : 1.0f;
+    state->compatible_wheel_rpm = s_march.compatible_wheel_rpm;
+    state->active_forward_stride_x_mm = s_march.active_forward_stride_x_mm;
+    state->active_turn_stride_x_mm = s_march.active_turn_stride_x_mm;
+    state->stop_progress = s_march.stop_progress;
+    taskEXIT_CRITICAL();
 }
 
 uint8_t dog_mit_trot_in_place_start(uint8_t cycles)
