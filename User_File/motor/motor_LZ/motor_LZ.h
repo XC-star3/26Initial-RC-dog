@@ -89,6 +89,7 @@ public:
 
     void enable();
     void lose();
+    uint8_t probe_device_id();
     void active_recv(uint8_t enable);
     void zero();
     void motor_set_CAN_ID(uint8_t set_id);

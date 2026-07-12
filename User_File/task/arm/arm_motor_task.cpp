@@ -12,6 +12,9 @@ static constexpr fp32 kRadSToRpm = 60.0f / (2.0f * kPi);
 static constexpr fp32 kControlNominalDtSec = 0.005f;
 static constexpr fp32 kControlMaxDtSec = 0.050f;
 static constexpr uint32_t kFeedbackTimeoutMs = 100U;
+static constexpr uint32_t kPresentTimeoutMs = 1000U;
+static constexpr uint32_t kDiagnosticPeriodMs = 300U;
+static constexpr uint8_t kEl05DeviceIdResponseTarget = 0xFEU;
 
 struct J0PidState {
     ArmMotorPidConfig config;
@@ -59,8 +62,13 @@ static uint16_t s_j0_dm_feedback_id = 0U;
 static uint16_t s_j1_lz_id = 0U;
 static uint8_t s_initialized = 0U;
 static uint32_t s_last_send_ms = 0U;
-static uint32_t s_last_feedback_ms[ARM_JOINT_COUNT] = {};
+static uint32_t s_last_status_feedback_ms[ARM_JOINT_COUNT] = {};
+static uint32_t s_last_present_ms[ARM_JOINT_COUNT] = {};
+static uint32_t s_last_diagnostic_ms[ARM_JOINT_COUNT] = {};
 static uint32_t s_enable_request_ms[ARM_JOINT_COUNT] = {};
+static uint8_t s_status_feedback_seen[ARM_JOINT_COUNT] = {};
+static uint8_t s_present_seen[ARM_JOINT_COUNT] = {};
+static uint8_t s_diagnostic_sent[ARM_JOINT_COUNT] = {};
 static ArmMotorFeedback s_feedback[ARM_JOINT_COUNT] = {};
 static J0Controller s_j0_ctrl = {
     0.0f,
@@ -102,12 +110,39 @@ static fp32 clamp_fp32(fp32 value, fp32 min_value, fp32 max_value)
 static void refresh_feedback_age(uint32_t now)
 {
     for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
+        if (s_status_feedback_seen[joint] != 0U) {
+            s_feedback[joint].feedback_age_ms = now - s_last_status_feedback_ms[joint];
+        } else {
+            s_feedback[joint].feedback_age_ms = ARM_MOTOR_FEEDBACK_AGE_INVALID;
+        }
+
+        if ((s_present_seen[joint] == 0U) ||
+            ((uint32_t)(now - s_last_present_ms[joint]) > kPresentTimeoutMs)) {
+            s_feedback[joint].present = 0U;
+        }
+
         if ((s_feedback[joint].online != 0U) &&
-            ((s_last_feedback_ms[joint] == 0U) ||
-             ((uint32_t)(now - s_last_feedback_ms[joint]) > kFeedbackTimeoutMs))) {
+            ((s_feedback[joint].enabled == 0U) ||
+             (s_status_feedback_seen[joint] == 0U) ||
+             ((uint32_t)(now - s_last_status_feedback_ms[joint]) > kFeedbackTimeoutMs))) {
             s_feedback[joint].online = 0U;
         }
     }
+}
+
+static void mark_present(uint8_t joint, uint32_t now)
+{
+    s_present_seen[joint] = 1U;
+    s_last_present_ms[joint] = now;
+    s_feedback[joint].present = 1U;
+}
+
+static void mark_status_feedback(uint8_t joint, uint32_t now)
+{
+    mark_present(joint, now);
+    s_status_feedback_seen[joint] = 1U;
+    s_last_status_feedback_ms[joint] = now;
+    s_feedback[joint].feedback_age_ms = 0U;
 }
 
 static void pid_clear(J0PidState *pid)
@@ -211,18 +246,28 @@ static void j0_lock_target_to_measure(void)
 
 static void j0_disable(void)
 {
+    const uint8_t was_enabled = s_j0_ctrl.enabled;
     s_j0_ctrl.enabled = 0U;
+    s_feedback[ARM_J0_DM4310].enabled = 0U;
+    s_feedback[ARM_J0_DM4310].online = 0U;
     s_enable_request_ms[ARM_J0_DM4310] = 0U;
     j0_lock_target_to_measure();
-    s_j0_dm4310.lose();
+    if (was_enabled != 0U) {
+        s_j0_dm4310.lose();
+    }
 }
 
 static void j1_disable(void)
 {
+    const uint8_t was_enabled = s_j1_ctrl.enabled;
     s_j1_ctrl.enabled = 0U;
+    s_feedback[ARM_J1_LZ].enabled = 0U;
+    s_feedback[ARM_J1_LZ].online = 0U;
     s_enable_request_ms[ARM_J1_LZ] = 0U;
     j1_lock_target_to_measure();
-    s_j1_lz.lose();
+    if (was_enabled != 0U) {
+        s_j1_lz.lose();
+    }
 }
 
 static void copy_dm_feedback(void)
@@ -231,8 +276,10 @@ static void copy_dm_feedback(void)
     const fp32 speed_rad_s = j0_correct_signed(s_j0_dm4310.Get_Now_W());
     const fp32 torque_nm = j0_correct_signed(s_j0_dm4310.Get_Now_T());
 
-    s_feedback[ARM_J0_DM4310].online = 1U;
+    s_feedback[ARM_J0_DM4310].online = s_feedback[ARM_J0_DM4310].enabled;
     s_feedback[ARM_J0_DM4310].error = s_j0_dm4310.Get_MError();
+    s_feedback[ARM_J0_DM4310].fault = s_j0_dm4310.Get_MError();
+    s_feedback[ARM_J0_DM4310].fault_valid = 1U;
     s_feedback[ARM_J0_DM4310].mode = s_j0_dm4310.Get_mode();
     s_feedback[ARM_J0_DM4310].pos_rad = angle_deg * kDegToRad;
     s_feedback[ARM_J0_DM4310].angle_deg = angle_deg;
@@ -247,8 +294,10 @@ static void copy_lz_feedback(void)
     const fp32 speed_rad_s = j1_joint_to_motor_signed(s_j1_lz.Get_Now_W());
     const fp32 torque_nm = j1_joint_to_motor_signed(s_j1_lz.Get_Now_T());
 
-    s_feedback[ARM_J1_LZ].online = 1U;
+    s_feedback[ARM_J1_LZ].online = s_feedback[ARM_J1_LZ].enabled;
     s_feedback[ARM_J1_LZ].error = s_j1_lz.Get_MError();
+    s_feedback[ARM_J1_LZ].fault = s_j1_lz.Get_MError();
+    s_feedback[ARM_J1_LZ].fault_valid = 1U;
     s_feedback[ARM_J1_LZ].mode = s_j1_lz.Get_mode();
     s_feedback[ARM_J1_LZ].pos_rad = angle_deg * kDegToRad;
     s_feedback[ARM_J1_LZ].angle_deg = angle_deg;
@@ -282,10 +331,17 @@ void ArmMotor_Init(FDCAN_HandleTypeDef *j0_dm_can,
     j0_lock_target_to_measure();
     j1_lock_target_to_measure();
     s_last_send_ms = 0U;
-    s_last_feedback_ms[ARM_J0_DM4310] = 0U;
-    s_last_feedback_ms[ARM_J1_LZ] = 0U;
-    s_enable_request_ms[ARM_J0_DM4310] = 0U;
-    s_enable_request_ms[ARM_J1_LZ] = 0U;
+    for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
+        s_feedback[joint] = {};
+        s_feedback[joint].feedback_age_ms = ARM_MOTOR_FEEDBACK_AGE_INVALID;
+        s_last_status_feedback_ms[joint] = 0U;
+        s_last_present_ms[joint] = 0U;
+        s_last_diagnostic_ms[joint] = 0U;
+        s_enable_request_ms[joint] = 0U;
+        s_status_feedback_seen[joint] = 0U;
+        s_present_seen[joint] = 0U;
+        s_diagnostic_sent[joint] = 0U;
+    }
     s_initialized = 1U;
 }
 
@@ -294,19 +350,27 @@ void ArmMotor_Enable(void)
     if (s_initialized == 0U) {
         return;
     }
-    s_j0_ctrl.enabled = 1U;
-    s_j0_ctrl.first_set_angle = 1U;
-    s_j1_ctrl.enabled = 1U;
-    s_j1_ctrl.first_set_angle = 1U;
     const uint32_t now = HAL_GetTick();
-    s_enable_request_ms[ARM_J0_DM4310] = now;
-    s_enable_request_ms[ARM_J1_LZ] = now;
-    j0_lock_target_to_measure();
-    j1_lock_target_to_measure();
-    s_j0_dm4310.enable();
-    s_j1_lz.set_run_mode(MOTOR_LZ_EL05_RUN_MODE_MIT);
-    s_j1_lz.enable();
-    s_j1_lz.active_recv(1U);
+    if (s_j0_ctrl.enabled == 0U) {
+        s_j0_ctrl.enabled = 1U;
+        s_feedback[ARM_J0_DM4310].enabled = 1U;
+        s_feedback[ARM_J0_DM4310].online = 0U;
+        s_j0_ctrl.first_set_angle = 1U;
+        s_enable_request_ms[ARM_J0_DM4310] = now;
+        j0_lock_target_to_measure();
+        s_j0_dm4310.enable();
+    }
+    if (s_j1_ctrl.enabled == 0U) {
+        s_j1_ctrl.enabled = 1U;
+        s_feedback[ARM_J1_LZ].enabled = 1U;
+        s_feedback[ARM_J1_LZ].online = 0U;
+        s_j1_ctrl.first_set_angle = 1U;
+        s_enable_request_ms[ARM_J1_LZ] = now;
+        j1_lock_target_to_measure();
+        s_j1_lz.set_run_mode(MOTOR_LZ_EL05_RUN_MODE_MIT);
+        s_j1_lz.enable();
+        s_j1_lz.active_recv(1U);
+    }
 }
 
 void ArmMotor_Disable(void)
@@ -536,6 +600,35 @@ void ArmMotor_Send(void)
     }
 }
 
+void ArmMotor_DiagnosticPoll(uint32_t now_ms, uint8_t tx_allowed_mask)
+{
+    if (s_initialized == 0U) {
+        return;
+    }
+
+    refresh_feedback_age(now_ms);
+    for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
+        const uint8_t joint_mask = (uint8_t)(1U << joint);
+        if ((s_feedback[joint].enabled != 0U) ||
+            ((tx_allowed_mask & joint_mask) == 0U) ||
+            ((s_diagnostic_sent[joint] != 0U) &&
+             ((uint32_t)(now_ms - s_last_diagnostic_ms[joint]) < kDiagnosticPeriodMs))) {
+            continue;
+        }
+
+        uint8_t sent = 0U;
+        if (joint == ARM_J0_DM4310) {
+            sent = s_j0_dm4310.probe_disable();
+        } else if (joint == ARM_J1_LZ) {
+            sent = s_j1_lz.probe_device_id();
+        }
+        if (sent != 0U) {
+            s_diagnostic_sent[joint] = 1U;
+            s_last_diagnostic_ms[joint] = now_ms;
+        }
+    }
+}
+
 uint8_t ArmMotor_OnCanRx(FDCAN_HandleTypeDef *hfdcan, const FDCAN_RxHeaderTypeDef *header, uint8_t *data)
 {
     if ((s_initialized == 0U) || (hfdcan == nullptr) || (header == nullptr) || (data == nullptr)) {
@@ -549,7 +642,7 @@ uint8_t ArmMotor_OnCanRx(FDCAN_HandleTypeDef *hfdcan, const FDCAN_RxHeaderTypeDe
             (feedback_node == (uint8_t)(s_j0_dm_id & 0x0FU))) {
             s_j0_dm4310.can_recv(data);
             copy_dm_feedback();
-            s_last_feedback_ms[ARM_J0_DM4310] = HAL_GetTick();
+            mark_status_feedback(ARM_J0_DM4310, HAL_GetTick());
             return 1U;
         }
     }
@@ -558,13 +651,20 @@ uint8_t ArmMotor_OnCanRx(FDCAN_HandleTypeDef *hfdcan, const FDCAN_RxHeaderTypeDe
         const uint8_t host_id = (uint8_t)(header->Identifier & 0xFFU);
         const uint8_t lz_id = (uint8_t)((header->Identifier >> 8) & 0xFFU);
         const uint8_t lz_mode = (uint8_t)((header->Identifier >> 24) & 0x1FU);
+        if ((lz_mode == CANCOM_ANNOUNCE_DEVID) &&
+            (host_id == kEl05DeviceIdResponseTarget) &&
+            (lz_id == s_j1_lz_id) &&
+            (fdcan_dlc_to_bytes(header->DataLength) == 8U)) {
+            mark_present(ARM_J1_LZ, HAL_GetTick());
+            return 1U;
+        }
         if ((host_id == s_j1_ctrl.master_id) &&
             (lz_id == s_j1_lz_id) &&
             (fdcan_dlc_to_bytes(header->DataLength) == 8U) &&
             ((lz_mode == CANCOM_MODE_ACTIVE_RECV) || (lz_mode == CANCOM_MOTOR_FEEDBACK))) {
             s_j1_lz.can_recv(header->Identifier, data);
             copy_lz_feedback();
-            s_last_feedback_ms[ARM_J1_LZ] = HAL_GetTick();
+            mark_status_feedback(ARM_J1_LZ, HAL_GetTick());
             return 1U;
         }
     }

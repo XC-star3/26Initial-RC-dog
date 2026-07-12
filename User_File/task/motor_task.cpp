@@ -7288,6 +7288,19 @@ void motor_task(void)
         ArmMotor_Send();
     }
 
+    uint8_t arm_diagnostic_tx_mask = 0U;
+    if ((system_can[0] != false) &&
+        (mit_probe_bus_tx_busy(DOG_CAN_FRONT_BUS) == 0U) &&
+        (fdcan_tx_free_level(&hfdcan1) >= 1U)) {
+        arm_diagnostic_tx_mask |= ARM_J0_DM4310_MASK;
+    }
+    if ((system_can[1] != false) &&
+        (mit_probe_bus_tx_busy(DOG_CAN_REAR_BUS) == 0U) &&
+        (fdcan_tx_free_level(&hfdcan2) >= 1U)) {
+        arm_diagnostic_tx_mask |= ARM_J1_LZ_MASK;
+    }
+    ArmMotor_DiagnosticPoll(now, arm_diagnostic_tx_mask);
+
     static uint32_t s_slow_feedback_last_ms = 0U;
     if ((s_mechanical_idle_requested == 0U) &&
         ((uint32_t)(now - s_slow_feedback_last_ms) >= DOG_SLOW_FEEDBACK_SLOT_MS)) {

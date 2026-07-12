@@ -82,6 +82,17 @@ void Class_Motor_LZ::lose()
     (void)fdcan_send_data_Exten(FDcan, make_ext_id(Master_id), tx, 8U);
 }
 
+uint8_t Class_Motor_LZ::probe_device_id()
+{
+    if (FDcan == nullptr) {
+        return 0U;
+    }
+
+    uint8_t tx[8] = {};
+    const uint32_t ext_id = ((uint32_t)Master_id << 8) | (CAN_id & 0xFFU);
+    return (fdcan_send_data_Exten(FDcan, ext_id, tx, 8U) == 0U) ? 1U : 0U;
+}
+
 void Class_Motor_LZ::active_recv(uint8_t enable)
 {
     if (FDcan == nullptr) {

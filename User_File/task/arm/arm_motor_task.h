@@ -13,11 +13,19 @@ extern "C" {
 #define ARM_JOINT_COUNT 2U
 #define ARM_J0_DM4310 0U
 #define ARM_J1_LZ 1U
+#define ARM_J0_DM4310_MASK (1U << ARM_J0_DM4310)
+#define ARM_J1_LZ_MASK (1U << ARM_J1_LZ)
+#define ARM_MOTOR_FEEDBACK_AGE_INVALID 0xFFFFFFFFUL
 
 struct ArmMotorFeedback {
+    uint8_t present;
+    uint8_t enabled;
     uint8_t online;
     uint8_t error;
+    uint8_t fault;
+    uint8_t fault_valid;
     uint8_t mode;
+    uint32_t feedback_age_ms;
     fp32 pos_rad;
     fp32 angle_deg;
     fp32 vel_rad_s;
@@ -55,6 +63,7 @@ void ArmMotor_SetJ1OffsetDeg(fp32 offset_deg);
 void ArmMotor_SetJ1Invert(uint8_t enable);
 void ArmMotor_SetJ1MasterId(uint8_t master_id);
 void ArmMotor_Send(void);
+void ArmMotor_DiagnosticPoll(uint32_t now_ms, uint8_t tx_allowed_mask);
 uint8_t ArmMotor_OnCanRx(FDCAN_HandleTypeDef *hfdcan, const FDCAN_RxHeaderTypeDef *header, uint8_t *data);
 uint8_t ArmMotor_GetFeedback(uint8_t joint, ArmMotorFeedback *feedback);
 uint8_t ArmMotor_IsInitialized(void);

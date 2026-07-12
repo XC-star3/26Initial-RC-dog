@@ -58,6 +58,7 @@ public:
 
     void enable();
     void lose();
+    uint8_t probe_disable();
     void zero();
     void can_send();
     void can_send_torque_only(fp32 torque_nm, uint8_t invert);

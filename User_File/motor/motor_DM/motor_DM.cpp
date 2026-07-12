@@ -72,13 +72,18 @@ void Class_Motor_DM::enable()
 
 void Class_Motor_DM::lose()
 {
+    (void)probe_disable();
+}
+
+uint8_t Class_Motor_DM::probe_disable()
+{
+    Motor_DM_Status = Motor_DM_Status_DISABLE;
     if (FDcan == nullptr) {
-        return;
+        return 0U;
     }
 
     uint8_t tx[8] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFDU};
-    (void)fdcan_send_data_stand(FDcan, CAN_id, tx, 8U);
-    Motor_DM_Status = Motor_DM_Status_DISABLE;
+    return (fdcan_send_data_stand(FDcan, CAN_id, tx, 8U) == 0U) ? 1U : 0U;
 }
 
 void Class_Motor_DM::zero()

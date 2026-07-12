@@ -259,18 +259,31 @@ static void print_arm_status(void)
     static const uint8_t buses[ARM_JOINT_COUNT] = {1U, 2U};
     static const uint16_t ids[ARM_JOINT_COUNT] = {0x10U, 0x7FU};
 
-    DebugUart_Printf("ARM: init=%u feedback_timeout=100ms\r\n",
+    DebugUart_Printf("ARM: init=%u diag_period=300ms present_timeout=1000ms feedback_timeout=100ms\r\n",
                      (unsigned)ArmMotor_IsInitialized());
     for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
         ArmMotorFeedback feedback = {};
         const uint8_t online = ArmMotor_GetFeedback(joint, &feedback);
-        DebugUart_Printf("  %s CAN%u %s %s=0x%02X online=%u err=%u mode=%u angle=%ldmdeg vel=%ldmrad/s torque=%ldmNm temp=%lddC\r\n",
+        DebugUart_Printf("  %s CAN%u %s %s=0x%02X present=%u enabled=%u online=%u feedback_age_ms=",
                          names[joint],
                          (unsigned)buses[joint],
                          frame_types[joint],
                          id_names[joint],
                          (unsigned)ids[joint],
-                         (unsigned)online,
+                         (unsigned)feedback.present,
+                         (unsigned)feedback.enabled,
+                         (unsigned)online);
+        if (feedback.feedback_age_ms == ARM_MOTOR_FEEDBACK_AGE_INVALID) {
+            DebugUart_Printf("NA fault=");
+        } else {
+            DebugUart_Printf("%lu fault=", (unsigned long)feedback.feedback_age_ms);
+        }
+        if (feedback.fault_valid == 0U) {
+            DebugUart_Printf("NA");
+        } else {
+            DebugUart_Printf("%u", (unsigned)feedback.fault);
+        }
+        DebugUart_Printf(" err=%u mode=%u angle=%ldmdeg vel=%ldmrad/s torque=%ldmNm temp=%lddC\r\n",
                          (unsigned)feedback.error,
                          (unsigned)feedback.mode,
                          (long)(feedback.angle_deg * 1000.0f),
