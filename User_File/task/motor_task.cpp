@@ -4,6 +4,7 @@
 #include "bsp_fdcan.h"
 #include "control_task.h"
 #include "debug_uart.h"
+#include "obstacle_task.h"
 #include "vofa_pid.h"
 #include "wheel_motor_task.h"
 
@@ -40,7 +41,8 @@ extern FDCAN_HandleTypeDef hfdcan3;
 #define DOG_DRIVE_COMMAND_SLEW_PER_HALF_STEP 0.25f
 #define DOG_GAIT_WHEEL_MAX_CONTRIBUTION 0.30f
 #define DOG_WHEEL_DIAMETER_MM           116.0f
-#define DOG_GAIT_SWING_APEX_PROGRESS    0.45f
+/* Peak early so the final descent occupies 68% of the swing trajectory. */
+#define DOG_GAIT_SWING_APEX_PROGRESS    0.32f
 #define DOG_JUMP_SETTLE_MS             500U
 #define DOG_ENCODER_FEEDBACK_PERIOD_MS  DOG_CMD_PERIOD_MS
 #define DOG_SLOW_FEEDBACK_SLOT_MS       25U
@@ -53,7 +55,6 @@ extern FDCAN_HandleTypeDef hfdcan3;
 #define DOG_CLOSED_LOOP_RETRY_SLOT_MS  (DOG_CLOSED_LOOP_RETRY_MS / DOG_MOTOR_COUNT)
 #define DOG_SAFETY_RETRY_PERIOD_MS     100U
 #define DOG_SAFETY_CLEAR_CONFIRM_MS    200U
-#define DOG_MECHANICAL_IDLE_SETTLE_MS  500U
 
 #define DOG_FINAL_MODE_NONE                    0U
 #define DOG_FINAL_POSITION_WAIT_IDLE           1U
@@ -87,6 +88,15 @@ extern FDCAN_HandleTypeDef hfdcan3;
 #define DOG_STAND_OUTPUT_LIMIT_A        18.0f
 #define DOG_MIT_ANG_PID_INTEGRAL_LIMIT_A 3.0f
 #define DOG_GAIT_STABILITY_VEL_TAU_MS      40.0f
+#define DOG_FOOT_MOTION_SETTLE_MS          100U
+#define DOG_FOOT_MOTION_SETTLE_ERR_DEG       4.0f
+#define DOG_FOOT_MOTION_SETTLE_VEL_DPS      12.0f
+#define DOG_FOOT_MOTION_VALIDATION_STEPS     16U
+#define DOG_FOOT_MOTION_SUPPORT_ERR_DEG        8.0f
+#define DOG_FOOT_MOTION_SUPPORT_VEL_DPS       20.0f
+#define DOG_FOOT_MOTION_SUPPORT_FAULT_MS     100U
+#define DOG_FOOT_MOTION_SATURATION_A          17.5f
+#define DOG_FOOT_MOTION_SATURATION_FAULT_MS  100U
 
 #define DOG_SWING_KP_A_PER_DEG          1.7f
 #define DOG_SWING_KI_A_PER_DEG_S        0.00f
@@ -256,10 +266,28 @@ static struct {
     uint32_t touchdown_stable_since_ms;
     float stop_start_x_mm[DOG_LEG_COUNT];
     float stop_start_z_mm[DOG_LEG_COUNT];
-    float stable_velocity_lpf_dps[DOG_MOTOR_COUNT];
-    uint32_t stable_velocity_filter_ms;
     uint32_t contact_iq_query_ms;
 } s_march = {};
+
+static float s_joint_stability_velocity_lpf_dps[DOG_MOTOR_COUNT] = {};
+static uint32_t s_joint_stability_velocity_filter_ms = 0U;
+
+struct DogFootMotionContext {
+    uint8_t state;
+    uint8_t leg_mask;
+    uint32_t start_ms;
+    uint32_t duration_ms;
+    uint32_t timeout_ms;
+    uint32_t settle_since_ms;
+    uint32_t support_unstable_since_ms;
+    uint32_t saturation_since_ms;
+    float clearance_mm;
+    Dog_Foot_Target start[DOG_LEG_COUNT];
+    Dog_Foot_Target target[DOG_LEG_COUNT];
+};
+
+static DogFootMotionContext s_foot_motion = {};
+static uint32_t s_foot_motion_generation = 0U;
 
 static const uint8_t s_trot_swing_pairs[2U][2U] = {
     {DOG_LEG_LF, DOG_LEG_RB},
@@ -315,11 +343,6 @@ static volatile uint8_t s_mit_probe_tx_busy_mask = 0U;
 static volatile uint8_t s_safety_latched = 0U;
 static volatile uint8_t s_safety_external_inhibit = 0U;
 static volatile uint8_t s_control_disabled = 0U;
-static volatile uint8_t s_mechanical_idle_requested = 0U;
-static volatile uint8_t s_mechanical_idle_ready = 0U;
-static volatile uint8_t s_mechanical_idle_mask = 0U;
-static uint32_t s_mechanical_idle_settle_since_ms = 0U;
-static uint32_t s_mechanical_idle_heartbeat_baseline[DOG_MOTOR_COUNT];
 static volatile uint8_t s_mechanical_pose_requested = 0U;
 static volatile uint8_t s_mechanical_pose_ready = 0U;
 static volatile uint8_t s_mechanical_pose_mask = 0U;
@@ -469,20 +492,6 @@ static float sqrt_newton(float v)
     return x;
 }
 
-[[maybe_unused]] static float acos_approx(float x)
-{
-    x = clampf(x, -1.0f, 1.0f);
-    float negate = (x < 0.0f) ? 1.0f : 0.0f;
-    float ax = (x < 0.0f) ? -x : x;
-    float ret = -0.0187293f;
-    ret = ret * ax + 0.0742610f;
-    ret = ret * ax - 0.2121144f;
-    ret = ret * ax + 1.5707288f;
-    ret = ret * sqrt_newton(1.0f - ax);
-    ret = ret - (2.0f * negate * ret);
-    return (negate * DOG_PI) + ret;
-}
-
 static uint8_t bus_to_diag_index(uint8_t bus)
 {
     return (bus == DOG_CAN_REAR_BUS) ? 1U : 0U;
@@ -517,8 +526,7 @@ static uint8_t motor_safety_token_acquire(uint32_t *generation)
     }
     const uint8_t allowed = ((s_safety_latched == 0U) &&
                              (s_safety_external_inhibit == 0U) &&
-                             (s_control_disabled == 0U) &&
-                             (s_mechanical_idle_requested == 0U)) ? 1U : 0U;
+                             (s_control_disabled == 0U)) ? 1U : 0U;
     *generation = s_safety_generation;
     motor_tx_guard_give();
     return allowed;
@@ -532,7 +540,6 @@ static uint8_t motor_safety_token_valid(uint32_t generation)
     const uint8_t valid = ((s_safety_latched == 0U) &&
                            (s_safety_external_inhibit == 0U) &&
                            (s_control_disabled == 0U) &&
-                           (s_mechanical_idle_requested == 0U) &&
                            (s_safety_generation == generation)) ? 1U : 0U;
     motor_tx_guard_give();
     return valid;
@@ -544,8 +551,7 @@ static uint8_t motor_safety_token_guard_take(uint32_t generation)
         return 0U;
     }
     if ((s_safety_latched != 0U) || (s_safety_external_inhibit != 0U) ||
-        (s_control_disabled != 0U) || (s_mechanical_idle_requested != 0U) ||
-        (s_safety_generation != generation)) {
+        (s_control_disabled != 0U) || (s_safety_generation != generation)) {
         motor_tx_guard_give();
         return 0U;
     }
@@ -750,11 +756,6 @@ static void mit_set_mixed_swing_legs(uint8_t leg_a, uint8_t leg_b)
     mit_set_mixed_swing_leg_mask(leg_mask);
 }
 
-[[maybe_unused]] static void mit_set_mixed_swing_leg(uint8_t leg)
-{
-    mit_set_mixed_swing_legs(leg, DOG_LEG_COUNT);
-}
-
 static void mit_set_all_stand_pid_mode(void)
 {
     mit_clear_mixed_pid();
@@ -769,6 +770,10 @@ static void mit_debug_stop_tx(void)
     s_lower_state = DOG_LOWER_IDLE;
     s_lower_t0_ms = 0U;
     s_lower_settle_since_ms = 0U;
+    taskENTER_CRITICAL();
+    memset(&s_foot_motion, 0, sizeof(s_foot_motion));
+    s_foot_motion_generation++;
+    taskEXIT_CRITICAL();
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
         if ((s_mit_boot_ok[i] != 0U) && (s_encoder_turn_valid[i] != 0U)) {
             send_mit_zero_effort(i, user_rad(i));
@@ -948,9 +953,6 @@ static uint8_t mw_tx_allowed_locked(uint8_t cmd)
 {
     if (cmd == (uint8_t)MW_ESTOP_CMD) {
         return 1U;
-    }
-    if (s_mechanical_idle_requested != 0U) {
-        return (cmd == (uint8_t)MW_SET_AXIS_STATE_CMD) ? 1U : 0U;
     }
     if (s_estop_pending_mask != 0U) {
         return 0U;
@@ -3032,7 +3034,6 @@ static void restart_bus_off(FDCAN_HandleTypeDef *h)
     if (recovery != FDCAN_RECOVERY_RESTARTED) {
         return;
     }
-    DogStand_ExitMechanicalLimitIdle();
     if (s_safety_latched == 0U) {
         return;
     }
@@ -3150,47 +3151,6 @@ static uint8_t mit_pump_control(void)
             (s_mit_debug_active != 0U) && (s_mit_fault_hold_active == 0U)) ? 1U : 0U;
 }
 
-static uint8_t mit_wait_joint_settle(uint8_t joint, float err_threshold_deg, uint32_t timeout_ms)
-{
-    uint32_t t0 = HAL_GetTick();
-    while ((uint32_t)(HAL_GetTick() - t0) < timeout_ms) {
-        if (dog_mit_fault_hold_is_active() != 0U) {
-            return 0U;
-        }
-
-        if (mit_pump_control() == 0U) {
-            return 0U;
-        }
-
-        uint8_t all_settled = 1U;
-        for (uint8_t i = 0U; i < selected_count(); ++i) {
-            uint8_t idx = selected_index(i);
-            if (idx >= DOG_MOTOR_COUNT) {
-                continue;
-            }
-            if (g_dog_motor_config[idx].joint != joint) {
-                continue;
-            }
-            if (s_encoder_est_fresh[idx] == 0U) {
-                all_settled = 0U;
-                continue;
-            }
-            if (fabsf(s_target_deg[idx] - user_deg(idx)) > err_threshold_deg) {
-                all_settled = 0U;
-            }
-        }
-
-        if (all_settled != 0U) {
-            return 1U;
-        }
-        HAL_Delay(5U);
-    }
-
-    DebugUart_Printf("MIT settle timeout joint=%s err>%ldmdeg\r\n",
-                     joint_name(joint), (long)(err_threshold_deg * 1000.0f));
-    return 0U;
-}
-
 uint8_t dog_mit_goto_motor_pose(float hip_motor_deg, float knee_motor_deg)
 {
     if (dog_mit_debug_is_active() == 0U) {
@@ -3279,39 +3239,6 @@ static uint8_t mit_move_motor_pose_sequential_for_leg(uint8_t leg, float hip_mot
     return 1U;
 }
 
-[[maybe_unused]] static uint8_t mit_move_motor_pose_sequential(float hip_motor_deg, float knee_motor_deg)
-{
-    if (s_debug_target != DOG_DEBUG_TARGET_SINGLE_KNEE) {
-        float knee_cmd = knee_motor_deg;
-        if (s_debug_target == DOG_DEBUG_TARGET_SINGLE) {
-            uint8_t knee_idx = leg_joint_index(s_target_leg, DOG_JOINT_KNEE);
-            knee_cmd = (knee_idx < DOG_MOTOR_COUNT) ? s_target_deg[knee_idx] : knee_motor_deg;
-        }
-        dog_leg_set_target_motor_user_deg(hip_motor_deg, knee_cmd);
-        dog_mit_reset_integrators();
-        dog_mit_send_control_now();
-        if (mit_wait_joint_settle(DOG_JOINT_HIP, DOG_STAND_HIP_SETTLE_ERR_DEG, DOG_STAND_HIP_MOVE_MS) == 0U) {
-            return 0U;
-        }
-    }
-
-    if (s_debug_target != DOG_DEBUG_TARGET_SINGLE) {
-        float hip_cmd = hip_motor_deg;
-        if (s_debug_target == DOG_DEBUG_TARGET_SINGLE_KNEE) {
-            uint8_t hip_idx = leg_joint_index(s_target_leg, DOG_JOINT_HIP);
-            hip_cmd = (hip_idx < DOG_MOTOR_COUNT) ? s_target_deg[hip_idx] : hip_motor_deg;
-        }
-        dog_leg_set_target_motor_user_deg(hip_cmd, knee_motor_deg);
-        dog_mit_reset_integrators();
-        dog_mit_send_control_now();
-        if (mit_wait_joint_settle(DOG_JOINT_KNEE, DOG_STAND_KNEE_SETTLE_ERR_DEG, DOG_STAND_KNEE_MOVE_MS) == 0U) {
-            return 0U;
-        }
-    }
-
-    return 1U;
-}
-
 static uint8_t march_leg_joints_settled(uint8_t leg, float err_threshold_deg);
 
 static uint8_t leg_is_in_debug_target(uint8_t leg)
@@ -3352,16 +3279,6 @@ static uint8_t mit_stand_set_leg_foot_xz(uint8_t leg, float x_mm, float z_mm)
         return 0U;
     }
     dog_leg_set_motor_user_deg_for_leg(leg, hip_motor, knee_motor);
-    return 1U;
-}
-
-[[maybe_unused]] static uint8_t mit_stand_set_all_legs_foot_xz(float x_mm)
-{
-    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
-        if (mit_stand_set_leg_foot_xz(leg, x_mm, dog_leg_stand_foot_z_mm(leg)) == 0U) {
-            return 0U;
-        }
-    }
     return 1U;
 }
 
@@ -3618,12 +3535,6 @@ static void dog_mit_lower_to_start_pose_tick(uint32_t now)
     }
 }
 
-[[maybe_unused]] static uint8_t dog_leg_stand_foot_ik_motor_deg(uint8_t leg, float *hip_motor_deg, float *knee_motor_deg)
-{
-    return dog_leg_foot_xz_to_motor_deg(leg, DOG_STAND_FOOT_X_MM, dog_leg_stand_foot_z_mm(leg),
-                                        hip_motor_deg, knee_motor_deg);
-}
-
 static uint8_t mit_stand_move_sequential(void)
 {
     return mit_stand_rise_interpolate();
@@ -3741,19 +3652,19 @@ static uint8_t march_leg_joints_settled(uint8_t leg, float err_threshold_deg)
     return 1U;
 }
 
-static void march_stability_velocity_filter_reset(uint32_t now)
+static void joint_stability_velocity_filter_reset(uint32_t now)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
         const float velocity_dps = user_vel_dps(i);
-        s_march.stable_velocity_lpf_dps[i] =
+        s_joint_stability_velocity_lpf_dps[i] =
             isfinite(velocity_dps) ? fabsf(velocity_dps) : INFINITY;
     }
-    s_march.stable_velocity_filter_ms = now;
+    s_joint_stability_velocity_filter_ms = now;
 }
 
-static void march_stability_velocity_filter_update(uint32_t now)
+static void joint_stability_velocity_filter_update(uint32_t now)
 {
-    uint32_t dt_ms = (uint32_t)(now - s_march.stable_velocity_filter_ms);
+    uint32_t dt_ms = (uint32_t)(now - s_joint_stability_velocity_filter_ms);
     if (dt_ms == 0U) {
         return;
     }
@@ -3765,14 +3676,14 @@ static void march_stability_velocity_filter_update(uint32_t now)
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
         const float velocity_dps = user_vel_dps(i);
         if (!isfinite(velocity_dps)) {
-            s_march.stable_velocity_lpf_dps[i] = INFINITY;
+            s_joint_stability_velocity_lpf_dps[i] = INFINITY;
             continue;
         }
         const float abs_velocity_dps = fabsf(velocity_dps);
-        s_march.stable_velocity_lpf_dps[i] += alpha *
-            (abs_velocity_dps - s_march.stable_velocity_lpf_dps[i]);
+        s_joint_stability_velocity_lpf_dps[i] += alpha *
+            (abs_velocity_dps - s_joint_stability_velocity_lpf_dps[i]);
     }
-    s_march.stable_velocity_filter_ms = now;
+    s_joint_stability_velocity_filter_ms = now;
 }
 
 static uint8_t march_leg_joints_stable(uint8_t leg, float err_threshold_deg,
@@ -3787,8 +3698,8 @@ static uint8_t march_leg_joints_stable(uint8_t leg, float err_threshold_deg,
     if ((hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT)) {
         return 0U;
     }
-    const float hip_velocity_dps = s_march.stable_velocity_lpf_dps[hip];
-    const float knee_velocity_dps = s_march.stable_velocity_lpf_dps[knee];
+    const float hip_velocity_dps = s_joint_stability_velocity_lpf_dps[hip];
+    const float knee_velocity_dps = s_joint_stability_velocity_lpf_dps[knee];
     if ((!isfinite(hip_velocity_dps)) || (!isfinite(knee_velocity_dps))) {
         return 0U;
     }
@@ -3848,16 +3759,17 @@ static uint8_t march_foot_to_motor_deg(uint8_t leg, float x_mm, float z_mm,
     return dog_leg_foot_xz_to_motor_deg(leg, x_mm, z_mm, hip_motor_deg, knee_motor_deg);
 }
 
-static void march_set_leg_foot_xz(uint8_t leg, float x_mm, float z_mm)
+static uint8_t march_set_leg_foot_xz(uint8_t leg, float x_mm, float z_mm)
 {
     float hip = 0.0f;
     float knee = 0.0f;
     if (march_foot_to_motor_deg(leg, x_mm, z_mm, &hip, &knee) == 0U) {
-        return;
+        return 0U;
     }
     dog_leg_set_motor_user_deg_for_leg(leg, hip, knee);
     s_leg_command_x_mm[leg] = x_mm;
     s_leg_command_z_mm[leg] = z_mm;
+    return 1U;
 }
 
 static void march_set_all_legs_stand_pose(void)
@@ -3865,6 +3777,412 @@ static void march_set_all_legs_stand_pose(void)
     for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
         march_set_leg_foot_xz(leg, DOG_STAND_FOOT_X_MM, dog_leg_stand_foot_z_mm(leg));
     }
+}
+
+static uint8_t foot_motion_leg_ready(uint8_t leg)
+{
+    const uint8_t hip = leg_joint_index(leg, DOG_JOINT_HIP);
+    const uint8_t knee = leg_joint_index(leg, DOG_JOINT_KNEE);
+    if ((hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT)) {
+        return 0U;
+    }
+    const uint8_t motors[2U] = {hip, knee};
+    for (uint8_t i = 0U; i < 2U; ++i) {
+        const uint8_t motor = motors[i];
+        if ((s_motor_online[motor] == 0U) || (s_encoder_est_fresh[motor] == 0U) ||
+            (s_mit_boot_ok[motor] == 0U) || (motor_closed_loop(motor) == 0U) ||
+            (motor_has_fault(motor) != 0U) || (!isfinite(user_deg(motor))) ||
+            (!isfinite(user_vel_dps(motor)))) {
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
+static uint8_t foot_motion_mask_ready(uint8_t leg_mask)
+{
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if (((leg_mask & (uint8_t)(1U << leg)) != 0U) &&
+            (foot_motion_leg_ready(leg) == 0U)) {
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
+static uint8_t foot_motion_environment_ready(void)
+{
+    return ((s_safety_latched == 0U) && (s_safety_external_inhibit == 0U) &&
+            (s_control_disabled == 0U) &&
+            (s_control_loop_mode == DOG_CTRL_LOOP_MIT_PID) &&
+            (s_position_tx_enabled != 0U) && (s_mit_debug_active != 0U) &&
+            (s_mit_fault_hold_active == 0U) &&
+            (s_debug_target == DOG_DEBUG_TARGET_ALL) && (s_march.active == 0U) &&
+            (foot_motion_mask_ready(DOG_LEG_MASK_ALL) != 0U)) ? 1U : 0U;
+}
+
+uint8_t dog_foot_motion_prepare(void)
+{
+    uint32_t generation = 0U;
+    taskENTER_CRITICAL();
+    generation = s_foot_motion_generation;
+    const uint8_t motion_active =
+        (s_foot_motion.state == DOG_FOOT_MOTION_ACTIVE) ? 1U : 0U;
+    taskEXIT_CRITICAL();
+    if ((motion_active != 0U) || (foot_motion_environment_ready() == 0U)) {
+        return 0U;
+    }
+
+    float measured_x_mm[DOG_LEG_COUNT] = {};
+    float measured_z_mm[DOG_LEG_COUNT] = {};
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        const uint8_t hip = leg_joint_index(leg, DOG_JOINT_HIP);
+        const uint8_t knee = leg_joint_index(leg, DOG_JOINT_KNEE);
+        if ((hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT) ||
+            (dog_leg_foot_xz_from_motor_deg(leg, user_deg(hip), user_deg(knee),
+                                            &measured_x_mm[leg],
+                                            &measured_z_mm[leg]) == 0U) ||
+            (!isfinite(measured_x_mm[leg])) ||
+            (!isfinite(measured_z_mm[leg]))) {
+            return 0U;
+        }
+    }
+
+    taskENTER_CRITICAL();
+    if ((s_foot_motion_generation != generation) ||
+        (s_foot_motion.state == DOG_FOOT_MOTION_ACTIVE) ||
+        (foot_motion_environment_ready() == 0U)) {
+        taskEXIT_CRITICAL();
+        return 0U;
+    }
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        s_leg_command_x_mm[leg] = measured_x_mm[leg];
+        s_leg_command_z_mm[leg] = measured_z_mm[leg];
+    }
+    dog_mit_diag_support_stop();
+    mit_set_all_stand_pid_mode();
+    dog_mit_reset_integrators();
+    memset(&s_foot_motion, 0, sizeof(s_foot_motion));
+    s_foot_motion.state = DOG_FOOT_MOTION_IDLE;
+    s_foot_motion_generation++;
+    taskEXIT_CRITICAL();
+    return 1U;
+}
+
+static uint8_t dog_foot_motion_validate(uint8_t leg_mask,
+                                        const Dog_Foot_Target target[DOG_LEG_COUNT],
+                                        float clearance_mm)
+{
+    if ((target == nullptr) || ((leg_mask & DOG_LEG_MASK_ALL) == 0U) ||
+        (!isfinite(clearance_mm)) || (clearance_mm < 0.0f)) {
+        return 0U;
+    }
+
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if ((leg_mask & (uint8_t)(1U << leg)) == 0U) {
+            continue;
+        }
+        const float target_x = target[leg].x_mm;
+        const float target_z = target[leg].z_mm;
+        const float start_x = s_leg_command_x_mm[leg];
+        const float start_z = s_leg_command_z_mm[leg];
+        if ((!isfinite(target_x)) || (!isfinite(target_z)) ||
+            (!isfinite(start_x)) || (!isfinite(start_z))) {
+            return 0U;
+        }
+        for (uint8_t sample = 0U; sample <= DOG_FOOT_MOTION_VALIDATION_STEPS; ++sample) {
+            const float raw = (float)sample / (float)DOG_FOOT_MOTION_VALIDATION_STEPS;
+            const float progress = smoothstep5_01(raw);
+            const float arc = (raw < 0.5f) ? smoothstep5_01(raw * 2.0f) :
+                smoothstep5_01((1.0f - raw) * 2.0f);
+            const float x_mm = start_x + (target_x - start_x) * progress;
+            const float z_mm = start_z + (target_z - start_z) * progress -
+                clearance_mm * arc;
+            if (dog_leg_foot_xz_to_motor_deg(leg, x_mm, z_mm,
+                                             nullptr, nullptr) == 0U) {
+                return 0U;
+            }
+        }
+    }
+    return 1U;
+}
+
+uint8_t dog_foot_motion_start(uint8_t leg_mask,
+                              const Dog_Foot_Target target[DOG_LEG_COUNT],
+                              float clearance_mm,
+                              uint32_t duration_ms,
+                              uint32_t timeout_ms)
+{
+    leg_mask &= DOG_LEG_MASK_ALL;
+    uint32_t generation = 0U;
+    taskENTER_CRITICAL();
+    generation = s_foot_motion_generation;
+    const uint8_t motion_active =
+        (s_foot_motion.state == DOG_FOOT_MOTION_ACTIVE) ? 1U : 0U;
+    taskEXIT_CRITICAL();
+    if ((duration_ms == 0U) || (timeout_ms < duration_ms) ||
+        (motion_active != 0U) || (foot_motion_environment_ready() == 0U) ||
+        (dog_foot_motion_validate(leg_mask, target, clearance_mm) == 0U)) {
+        return 0U;
+    }
+
+    taskENTER_CRITICAL();
+    if ((s_foot_motion_generation != generation) ||
+        (s_foot_motion.state == DOG_FOOT_MOTION_ACTIVE) ||
+        (foot_motion_environment_ready() == 0U)) {
+        taskEXIT_CRITICAL();
+        return 0U;
+    }
+    s_foot_motion.state = DOG_FOOT_MOTION_ACTIVE;
+    s_foot_motion.leg_mask = leg_mask;
+    s_foot_motion.start_ms = HAL_GetTick();
+    joint_stability_velocity_filter_reset(s_foot_motion.start_ms);
+    s_foot_motion.duration_ms = duration_ms;
+    s_foot_motion.timeout_ms = timeout_ms;
+    s_foot_motion.settle_since_ms = 0U;
+    s_foot_motion.support_unstable_since_ms = 0U;
+    s_foot_motion.saturation_since_ms = 0U;
+    s_foot_motion.clearance_mm = clearance_mm;
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        s_foot_motion.start[leg].x_mm = s_leg_command_x_mm[leg];
+        s_foot_motion.start[leg].z_mm = s_leg_command_z_mm[leg];
+        s_foot_motion.target[leg] = target[leg];
+    }
+    s_foot_motion_generation++;
+
+    if (clearance_mm > 0.0f) {
+        mit_set_mixed_swing_leg_mask(leg_mask);
+    } else {
+        mit_set_all_stand_pid_mode();
+    }
+    dog_mit_reset_integrators();
+    taskEXIT_CRITICAL();
+    return 1U;
+}
+
+static uint8_t foot_motion_fault_if_current(uint32_t generation)
+{
+    uint8_t changed = 0U;
+    taskENTER_CRITICAL();
+    if ((s_foot_motion_generation == generation) &&
+        (s_foot_motion.state == DOG_FOOT_MOTION_ACTIVE)) {
+        s_foot_motion.state = DOG_FOOT_MOTION_FAULT;
+        mit_set_all_stand_pid_mode();
+        changed = 1U;
+    }
+    taskEXIT_CRITICAL();
+    return changed;
+}
+
+static uint8_t foot_motion_runtime_guard(uint32_t generation, uint8_t moving_leg_mask,
+                                         uint32_t now_ms)
+{
+    uint8_t support_stable = 1U;
+    if (moving_leg_mask != DOG_LEG_MASK_ALL) {
+        for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+            if ((moving_leg_mask & (uint8_t)(1U << leg)) != 0U) {
+                continue;
+            }
+            if (march_leg_joints_stable(leg, DOG_FOOT_MOTION_SUPPORT_ERR_DEG,
+                                        DOG_FOOT_MOTION_SUPPORT_VEL_DPS) == 0U) {
+                support_stable = 0U;
+            }
+        }
+    }
+
+    uint8_t saturated = 0U;
+    for (uint8_t motor = 0U; motor < DOG_MOTOR_COUNT; ++motor) {
+        if ((!isfinite(s_mit_cmd_current_a[motor])) ||
+            (fabsf(s_mit_cmd_current_a[motor]) >= DOG_FOOT_MOTION_SATURATION_A)) {
+            saturated = 1U;
+        }
+    }
+
+    uint8_t healthy = 1U;
+    taskENTER_CRITICAL();
+    if ((s_foot_motion_generation != generation) ||
+        (s_foot_motion.state != DOG_FOOT_MOTION_ACTIVE)) {
+        taskEXIT_CRITICAL();
+        return 0U;
+    }
+    if (support_stable != 0U) {
+        s_foot_motion.support_unstable_since_ms = 0U;
+    } else if (s_foot_motion.support_unstable_since_ms == 0U) {
+        s_foot_motion.support_unstable_since_ms = (now_ms != 0U) ? now_ms : 1U;
+    } else if ((uint32_t)(now_ms - s_foot_motion.support_unstable_since_ms) >=
+               DOG_FOOT_MOTION_SUPPORT_FAULT_MS) {
+        healthy = 0U;
+    }
+    if (saturated == 0U) {
+        s_foot_motion.saturation_since_ms = 0U;
+    } else if (s_foot_motion.saturation_since_ms == 0U) {
+        s_foot_motion.saturation_since_ms = (now_ms != 0U) ? now_ms : 1U;
+    } else if ((uint32_t)(now_ms - s_foot_motion.saturation_since_ms) >=
+               DOG_FOOT_MOTION_SATURATION_FAULT_MS) {
+        healthy = 0U;
+    }
+    if (healthy == 0U) {
+        s_foot_motion.state = DOG_FOOT_MOTION_FAULT;
+        mit_set_all_stand_pid_mode();
+    }
+    taskEXIT_CRITICAL();
+    return (healthy != 0U) ? 1U : 2U;
+}
+
+void dog_foot_motion_tick(uint32_t now_ms)
+{
+    DogFootMotionContext motion = {};
+    uint32_t generation = 0U;
+    taskENTER_CRITICAL();
+    if (s_foot_motion.state != DOG_FOOT_MOTION_ACTIVE) {
+        taskEXIT_CRITICAL();
+        return;
+    }
+    motion = s_foot_motion;
+    generation = s_foot_motion_generation;
+    taskEXIT_CRITICAL();
+
+    if (foot_motion_environment_ready() == 0U) {
+        (void)foot_motion_fault_if_current(generation);
+        return;
+    }
+    joint_stability_velocity_filter_update(now_ms);
+    const uint8_t guard_result =
+        foot_motion_runtime_guard(generation, motion.leg_mask, now_ms);
+    if (guard_result == 0U) {
+        return;
+    }
+    if (guard_result == 2U) {
+        DebugUart_Printf("Foot motion FAULT: support/current guard mask=0x%X.\r\n",
+                         (unsigned)motion.leg_mask);
+        return;
+    }
+
+    const uint32_t elapsed_ms = (uint32_t)(now_ms - motion.start_ms);
+    if (elapsed_ms > motion.timeout_ms) {
+        if (foot_motion_fault_if_current(generation) != 0U) {
+            DebugUart_Printf("Foot motion FAULT: timeout mask=0x%X elapsed=%lums.\r\n",
+                             (unsigned)motion.leg_mask,
+                             (unsigned long)elapsed_ms);
+        }
+        return;
+    }
+
+    const float raw = (elapsed_ms >= motion.duration_ms) ? 1.0f :
+        ((float)elapsed_ms / (float)motion.duration_ms);
+    const float progress = smoothstep5_01(raw);
+    const float arc = (raw < 0.5f) ? smoothstep5_01(raw * 2.0f) :
+        smoothstep5_01((1.0f - raw) * 2.0f);
+    float command_x[DOG_LEG_COUNT] = {};
+    float command_z[DOG_LEG_COUNT] = {};
+    float hip_deg[DOG_LEG_COUNT] = {};
+    float knee_deg[DOG_LEG_COUNT] = {};
+
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if ((motion.leg_mask & (uint8_t)(1U << leg)) == 0U) {
+            continue;
+        }
+        command_x[leg] = motion.start[leg].x_mm +
+            (motion.target[leg].x_mm - motion.start[leg].x_mm) * progress;
+        const float base_z_mm = motion.start[leg].z_mm +
+            (motion.target[leg].z_mm - motion.start[leg].z_mm) * progress;
+        command_z[leg] = base_z_mm - (motion.clearance_mm * arc);
+        if (dog_leg_foot_xz_to_motor_deg(leg, command_x[leg], command_z[leg],
+                                         &hip_deg[leg], &knee_deg[leg]) == 0U) {
+            if (foot_motion_fault_if_current(generation) != 0U) {
+                DebugUart_Printf("Foot motion FAULT: runtime IK leg=%u x=%ld z=%ldmm.\r\n",
+                                 (unsigned)leg,
+                                 (long)command_x[leg],
+                                 (long)command_z[leg]);
+            }
+            return;
+        }
+    }
+
+    taskENTER_CRITICAL();
+    if ((s_foot_motion_generation != generation) ||
+        (s_foot_motion.state != DOG_FOOT_MOTION_ACTIVE)) {
+        taskEXIT_CRITICAL();
+        return;
+    }
+    if (foot_motion_environment_ready() == 0U) {
+        s_foot_motion.state = DOG_FOOT_MOTION_FAULT;
+        mit_set_all_stand_pid_mode();
+        taskEXIT_CRITICAL();
+        return;
+    }
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if ((motion.leg_mask & (uint8_t)(1U << leg)) == 0U) {
+            continue;
+        }
+        dog_leg_set_motor_user_deg_for_leg(leg, hip_deg[leg], knee_deg[leg]);
+        s_leg_command_x_mm[leg] = command_x[leg];
+        s_leg_command_z_mm[leg] = command_z[leg];
+    }
+    taskEXIT_CRITICAL();
+
+    if (raw < 1.0f) {
+        taskENTER_CRITICAL();
+        if ((s_foot_motion_generation == generation) &&
+            (s_foot_motion.state == DOG_FOOT_MOTION_ACTIVE)) {
+            s_foot_motion.settle_since_ms = 0U;
+        }
+        taskEXIT_CRITICAL();
+        return;
+    }
+
+    uint8_t settled = 1U;
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if ((motion.leg_mask & (uint8_t)(1U << leg)) == 0U) {
+            continue;
+        }
+        const uint8_t hip = leg_joint_index(leg, DOG_JOINT_HIP);
+        const uint8_t knee = leg_joint_index(leg, DOG_JOINT_KNEE);
+        if ((march_leg_joints_settled(leg, DOG_FOOT_MOTION_SETTLE_ERR_DEG) == 0U) ||
+            (hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT) ||
+            (fabsf(user_vel_dps(hip)) > DOG_FOOT_MOTION_SETTLE_VEL_DPS) ||
+            (fabsf(user_vel_dps(knee)) > DOG_FOOT_MOTION_SETTLE_VEL_DPS)) {
+            settled = 0U;
+        }
+    }
+
+    taskENTER_CRITICAL();
+    if ((s_foot_motion_generation != generation) ||
+        (s_foot_motion.state != DOG_FOOT_MOTION_ACTIVE)) {
+        taskEXIT_CRITICAL();
+        return;
+    }
+    if (foot_motion_environment_ready() == 0U) {
+        s_foot_motion.state = DOG_FOOT_MOTION_FAULT;
+        mit_set_all_stand_pid_mode();
+    } else if (settled == 0U) {
+        s_foot_motion.settle_since_ms = 0U;
+    } else if (s_foot_motion.settle_since_ms == 0U) {
+        s_foot_motion.settle_since_ms = now_ms;
+    } else if ((uint32_t)(now_ms - s_foot_motion.settle_since_ms) >=
+               DOG_FOOT_MOTION_SETTLE_MS) {
+        s_foot_motion.state = DOG_FOOT_MOTION_COMPLETE;
+        mit_set_all_stand_pid_mode();
+    }
+    taskEXIT_CRITICAL();
+}
+
+void dog_foot_motion_cancel(void)
+{
+    taskENTER_CRITICAL();
+    memset(&s_foot_motion, 0, sizeof(s_foot_motion));
+    s_foot_motion_generation++;
+    mit_set_all_stand_pid_mode();
+    dog_mit_reset_integrators();
+    taskEXIT_CRITICAL();
+}
+
+uint8_t dog_foot_motion_state(void)
+{
+    taskENTER_CRITICAL();
+    const uint8_t state = s_foot_motion.state;
+    taskEXIT_CRITICAL();
+    return state;
 }
 
 static void march_get_swing_legs(uint8_t *leg_a, uint8_t *leg_b)
@@ -4622,7 +4940,7 @@ static void march_in_place_tick(uint32_t now)
 
     if ((s_march.phase == DOG_MARCH_PHASE_ENTRY_SETTLE) ||
         (s_march.phase == DOG_MARCH_PHASE_TOUCHDOWN)) {
-        march_stability_velocity_filter_update(now);
+        joint_stability_velocity_filter_update(now);
     }
 
     if ((cycloid_gait != 0U) && (s_march.phase == DOG_MARCH_PHASE_SWING_UP)) {
@@ -4672,7 +4990,7 @@ static void march_in_place_tick(uint32_t now)
                 s_march.phase = DOG_MARCH_PHASE_TOUCHDOWN;
                 s_march.phase_t0_ms = now;
                 s_march.touchdown_stable_since_ms = 0U;
-                march_stability_velocity_filter_reset(now);
+                joint_stability_velocity_filter_reset(now);
             }
         } else if (march_swing_legs_settled(DOG_MARCH_SETTLE_ERR_DEG) != 0U) {
             s_march.phase = DOG_MARCH_PHASE_HOLD;
@@ -4845,7 +5163,7 @@ static uint8_t march_in_place_start_mode(uint8_t mode, uint8_t cycles,
     s_march.phase = DOG_MARCH_PHASE_ENTRY_SETTLE;
     s_march.phase_t0_ms = HAL_GetTick();
     s_march.entry_stable_since_ms = 0U;
-    march_stability_velocity_filter_reset(s_march.phase_t0_ms);
+    joint_stability_velocity_filter_reset(s_march.phase_t0_ms);
 
     if (march_mode_uses_cycloid(mode) != 0U) {
         DebugUart_Printf("Drive cycloid: f=%ld yaw=%ld speed=%s hz=%ld.%01ld step=%ldmm turn=%ldmm height=%ldmm swing=%lums dwell=%lums stagger=%lums\r\n",
@@ -6361,7 +6679,6 @@ void DogStand_Request(void)
         DebugUart_Printf("Stand blocked: safety latch active.\r\n");
         return;
     }
-    DogStand_ExitMechanicalLimitIdle();
     mit_debug_stop_tx();
     memset(s_motor_loop_requested, 0, sizeof(s_motor_loop_requested));
     memset(s_motor_final_mode_pending, 0, sizeof(s_motor_final_mode_pending));
@@ -6507,13 +6824,9 @@ void DogStand_Disable(void)
 
     /* Invalidate in-flight control work before removing queued motor commands. */
     s_safety_generation++;
-    s_mechanical_idle_requested = 0U;
-    s_mechanical_idle_ready = 0U;
-    s_mechanical_idle_mask = 0U;
     s_mechanical_pose_requested = 0U;
     s_mechanical_pose_ready = 0U;
     s_mechanical_pose_mask = 0U;
-    s_mechanical_idle_settle_since_ms = 0U;
     s_control_disabled = 1U;
     s_position_tx_enabled = 0U;
     s_position_tx_arm_pending_mask = 0U;
@@ -6676,138 +6989,11 @@ void DogStand_ExitMechanicalLimitPose(void)
     s_mechanical_pose_mask = 0U;
 }
 
-uint8_t DogStand_EnterMechanicalLimitIdle(void)
-{
-    if (motor_tx_guard_take() == 0U) {
-        ArmMotor_Disable();
-        return 0U;
-    }
-    if ((s_safety_latched != 0U) || (s_safety_external_inhibit != 0U) ||
-        (s_control_disabled != 0U)) {
-        motor_tx_guard_give();
-        ArmMotor_Disable();
-        return 0U;
-    }
-
-    s_safety_generation++;
-    s_mechanical_idle_requested = 1U;
-    s_mechanical_idle_ready = 0U;
-    s_mechanical_idle_mask = 0U;
-    s_mechanical_idle_settle_since_ms = 0U;
-    memcpy(s_mechanical_idle_heartbeat_baseline, s_heartbeat_rx_count,
-           sizeof(s_mechanical_idle_heartbeat_baseline));
-    s_position_tx_enabled = 0U;
-    s_position_tx_arm_pending_mask = 0U;
-    s_position_tx_arm_started_ms = 0U;
-    s_mit_debug_active = 0U;
-    s_mit_fault_hold_active = 0U;
-    s_mit_torque_test_active = 0U;
-    s_mit_torque_test_index = DOG_MOTOR_COUNT;
-    s_mit_torque_test_nm = 0.0f;
-    s_jump_active = 0U;
-    s_auto_stand_enabled = 0U;
-    s_diag_support_active = 0U;
-    s_last_command_tick_ms = 0U;
-    s_mit_last_pid_ms = 0U;
-    s_stand_state = DOG_STAND_IDLE;
-    memset(&s_march, 0, sizeof(s_march));
-    memset(s_leg_foot_x_offset, 0, sizeof(s_leg_foot_x_offset));
-    memset(s_leg_hip_offset_deg, 0, sizeof(s_leg_hip_offset_deg));
-    memset(s_motor_configured, 0, sizeof(s_motor_configured));
-    memset(s_motor_loop_requested, 0, sizeof(s_motor_loop_requested));
-    memset(s_motor_final_mode_pending, 0, sizeof(s_motor_final_mode_pending));
-    memset(s_motor_mit_probe_active, 0, sizeof(s_motor_mit_probe_active));
-    memset(s_position_idle_encoder_rx_baseline, 0, sizeof(s_position_idle_encoder_rx_baseline));
-    memset(s_mit_boot_ok, 0, sizeof(s_mit_boot_ok));
-    mit_clear_mixed_pid();
-    teach_hold_stop();
-    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
-        mit_reset_motor_integrator(i);
-    }
-    (void)fdcan_abort_all_tx(&hfdcan1);
-    (void)fdcan_abort_all_tx(&hfdcan2);
-    motor_tx_guard_give();
-
-    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
-        MWSetAxisState(g_dog_motor_config[i].bus,
-                       g_dog_motor_config[i].node_id,
-                       MW_AXIS_STATE_IDLE);
-    }
-    ArmMotor_Disable();
-    return 1U;
-}
-
-uint8_t DogStand_IsMechanicalLimitIdle(void)
-{
-    return s_mechanical_idle_requested;
-}
-
-uint8_t DogStand_IsMechanicalLimitIdleReady(void)
-{
-    return ((s_mechanical_idle_requested != 0U) &&
-            (s_mechanical_idle_ready != 0U)) ? 1U : 0U;
-}
-
-uint8_t DogStand_GetMechanicalLimitIdleMask(void)
-{
-    return s_mechanical_idle_mask;
-}
-
-void DogStand_ExitMechanicalLimitIdle(void)
-{
-    if (motor_tx_guard_take() == 0U) {
-        return;
-    }
-    if (s_mechanical_idle_requested != 0U) {
-        s_safety_generation++;
-    }
-    s_mechanical_idle_requested = 0U;
-    s_mechanical_idle_ready = 0U;
-    s_mechanical_idle_mask = 0U;
-    s_mechanical_idle_settle_since_ms = 0U;
-    motor_tx_guard_give();
-}
-
-static void mechanical_limit_idle_tick(uint32_t now)
-{
-    if (s_mechanical_idle_requested == 0U) {
-        return;
-    }
-
-    uint8_t mask = 0U;
-    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
-        if ((s_heartbeat_rx_count[i] != s_mechanical_idle_heartbeat_baseline[i]) &&
-            (motor_heartbeat_fresh(i, now) != 0U) &&
-            (motor_has_fault(i) == 0U) &&
-            (g_mw_motor_data[i].heartBeat.currentState == MW_AXIS_STATE_IDLE)) {
-            mask |= (uint8_t)(1U << i);
-        }
-    }
-    s_mechanical_idle_mask = mask;
-    if (mask != 0xFFU) {
-        s_mechanical_idle_ready = 0U;
-        s_mechanical_idle_settle_since_ms = 0U;
-        return;
-    }
-    if (s_mechanical_idle_settle_since_ms == 0U) {
-        s_mechanical_idle_settle_since_ms = now;
-        return;
-    }
-    if ((uint32_t)(now - s_mechanical_idle_settle_since_ms) >=
-        DOG_MECHANICAL_IDLE_SETTLE_MS) {
-        s_mechanical_idle_ready = 1U;
-    }
-}
-
 static void DogStand_Estop(void)
 {
     const uint32_t now = HAL_GetTick();
     if (motor_tx_guard_take() != 0U) {
         s_safety_generation++;
-        s_mechanical_idle_requested = 0U;
-        s_mechanical_idle_ready = 0U;
-        s_mechanical_idle_mask = 0U;
-        s_mechanical_idle_settle_since_ms = 0U;
         s_safety_latched = 1U;
         s_control_disabled = 1U;
         s_safety_rearm_requested = 0U;
@@ -6824,10 +7010,6 @@ static void DogStand_Estop(void)
         const uint32_t primask = __get_PRIMASK();
         __disable_irq();
         s_safety_generation++;
-        s_mechanical_idle_requested = 0U;
-        s_mechanical_idle_ready = 0U;
-        s_mechanical_idle_mask = 0U;
-        s_mechanical_idle_settle_since_ms = 0U;
         s_safety_latched = 1U;
         s_control_disabled = 1U;
         s_safety_rearm_requested = 0U;
@@ -7169,15 +7351,9 @@ void motor_task_init(void)
     s_safety_latched = 0U;
     s_safety_external_inhibit = 0U;
     s_control_disabled = 0U;
-    s_mechanical_idle_requested = 0U;
-    s_mechanical_idle_ready = 0U;
-    s_mechanical_idle_mask = 0U;
-    s_mechanical_idle_settle_since_ms = 0U;
     s_mechanical_pose_requested = 0U;
     s_mechanical_pose_ready = 0U;
     s_mechanical_pose_mask = 0U;
-    memset(s_mechanical_idle_heartbeat_baseline, 0,
-           sizeof(s_mechanical_idle_heartbeat_baseline));
     s_safety_rearm_requested = 0U;
     s_safety_generation = 0U;
     s_safety_latched_ms = 0U;
@@ -7187,6 +7363,7 @@ void motor_task_init(void)
     s_estop_pending_mask = 0U;
     s_mit_debug_active = 0U;
     teach_hold_stop();
+    DogObstacle_Init();
 
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
         g_mw_node_ids[i] = g_dog_motor_config[i].node_id;
@@ -7227,21 +7404,19 @@ void motor_task(void)
 
     (void)motor_feedback_health_tick(now);
 
-    mechanical_limit_idle_tick(now);
-
     motor_safety_tick(now);
 
-    if (s_mechanical_idle_requested == 0U) {
-        stand_state_tick(now);
-        dog_mit_lower_to_start_pose_tick(now);
-        if (s_lower_state == DOG_LOWER_IDLE) {
-            march_in_place_tick(now);
-        }
+    stand_state_tick(now);
+    dog_mit_lower_to_start_pose_tick(now);
+    if (s_lower_state == DOG_LOWER_IDLE) {
+        march_in_place_tick(now);
+        DogObstacle_Tick(now);
+        dog_foot_motion_tick(now);
     }
 
     static uint32_t s_closed_loop_retry_last_ms = 0U;
     static uint8_t s_closed_loop_retry_cursor = 0U;
-    if ((s_safety_latched == 0U) && (s_mechanical_idle_requested == 0U) &&
+    if ((s_safety_latched == 0U) &&
         ((uint32_t)(now - s_closed_loop_retry_last_ms) >= DOG_CLOSED_LOOP_RETRY_SLOT_MS)) {
         s_closed_loop_retry_last_ms = now;
         const uint8_t index = s_closed_loop_retry_cursor;
@@ -7259,26 +7434,20 @@ void motor_task(void)
         }
     }
 
-    if (s_mechanical_idle_requested == 0U) {
-        position_finalization_fast_tick();
-        position_tx_arm_tick(now);
-    }
+    position_finalization_fast_tick();
+    position_tx_arm_tick(now);
 
-    if (s_mechanical_idle_requested == 0U) {
-        send_mit_probe_keepalive(now);
-        send_mit_torque_test_keepalive(now);
-    }
+    send_mit_probe_keepalive(now);
+    send_mit_torque_test_keepalive(now);
 
     if (s_position_tx_enabled != 0U) {
         send_enabled_targets(now);
     }
 
-    if (s_mechanical_idle_requested == 0U) {
-        encoder_feedback_query_tick(now);
-    }
+    encoder_feedback_query_tick(now);
 
     static uint32_t s_arm_cmd_last_ms = 0U;
-    if ((s_safety_latched == 0U) && (s_mechanical_idle_requested == 0U) &&
+    if ((s_safety_latched == 0U) &&
         (mit_probe_bus_tx_busy(DOG_CAN_FRONT_BUS) == 0U) &&
         (mit_probe_bus_tx_busy(DOG_CAN_REAR_BUS) == 0U) &&
         ((uint32_t)(now - s_arm_cmd_last_ms) >= ARM_CMD_PERIOD_MS) &&
@@ -7302,8 +7471,7 @@ void motor_task(void)
     ArmMotor_DiagnosticPoll(now, arm_diagnostic_tx_mask);
 
     static uint32_t s_slow_feedback_last_ms = 0U;
-    if ((s_mechanical_idle_requested == 0U) &&
-        ((uint32_t)(now - s_slow_feedback_last_ms) >= DOG_SLOW_FEEDBACK_SLOT_MS)) {
+    if ((uint32_t)(now - s_slow_feedback_last_ms) >= DOG_SLOW_FEEDBACK_SLOT_MS) {
         s_slow_feedback_last_ms = now;
         const uint8_t buses[2U] = {DOG_CAN_FRONT_BUS, DOG_CAN_REAR_BUS};
         for (uint8_t di = 0U; di < 2U; ++di) {

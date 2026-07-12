@@ -22,6 +22,7 @@ extern "C" {
 #define DOG_LEG_RF              1U
 #define DOG_LEG_LB              2U
 #define DOG_LEG_RB              3U
+#define DOG_LEG_MASK_ALL        0x0FU
 
 #define DOG_JOINT_HIP           0U
 #define DOG_JOINT_KNEE          1U
@@ -78,10 +79,6 @@ extern "C" {
 #define DOG_TROT_FORWARD_X_SIGN          1.0f    /* physical forward calibration for trot */
 #define DOG_TURN_X_SIGN                 (-1.0f)  /* independent turn calibration; preserves left/right */
 #define DOG_TROT_YAW_TRIM_X_MM           0.0f
-#define DOG_FORWARD_HIP_STEP_DEG        5.0f
-#define DOG_FORWARD_SWING_HIP_DEG       8.0f
-#define DOG_FORWARD_SWING_KNEE_DEG      (-20.0f)
-#define DOG_MARCH_HOLD_MS               250U
 #define DOG_MARCH_LEG_PAUSE_MS          150U
 #define DOG_MARCH_SETTLE_TIMEOUT_MS     2500U
 #define DOG_MARCH_SETTLE_ERR_DEG        DOG_STAND_KNEE_SETTLE_ERR_DEG
@@ -90,7 +87,6 @@ extern "C" {
 #define DOG_TROT_CYCLE_MS               (1000U / DOG_TROT_HZ)
 #define DOG_TROT_PAIR_MS                (DOG_TROT_CYCLE_MS / 2U)
 #define DOG_TROT_SWING_MS               DOG_TROT_PAIR_MS   /* cycloid swing = half cycle @ 2Hz */
-#define DOG_TROT_SWING_UP_MS            35U                /* walk mode only */
 #define DOG_TROT_HOLD_MS                15U
 #define DOG_TROT_SWING_DOWN_MS          35U
 #define DOG_TROT_SETTLE_ERR_DEG         4.0f
@@ -110,8 +106,8 @@ extern "C" {
 #define DOG_TROT_TOUCHDOWN_CONFIRM_MS    20U
 #define DOG_TROT_TOUCHDOWN_FALLBACK_MS   40U
 #define DOG_TROT_TOUCHDOWN_TIMEOUT_MS   200U
-#define DOG_TROT_TOUCHDOWN_SEARCH_MM      8.0f
-#define DOG_TROT_TOUCHDOWN_SEARCH_MM_S   40.0f
+#define DOG_TROT_TOUCHDOWN_SEARCH_MM      5.0f
+#define DOG_TROT_TOUCHDOWN_SEARCH_MM_S   12.0f
 #define DOG_GAIT_LOW_TOUCHDOWN_ERR_DEG    4.0f
 #define DOG_GAIT_LOW_TOUCHDOWN_VEL_DPS    8.0f
 #define DOG_GAIT_LOW_TOUCHDOWN_STABLE_MS 80U
@@ -119,8 +115,6 @@ extern "C" {
 #define DOG_GAIT_LOW_SUPPORT_CURRENT_A   16.0f
 
 #define DOG_TURN_STRIDE_X_MM             30.0f    /* in-place turn step per leg side */
-#define DOG_TURN_HZ                       DOG_TROT_HZ
-#define DOG_TURN_SWING_MS                 DOG_TROT_SWING_MS
 
 enum Dog_March_Mode {
     DOG_MARCH_MODE_WALK = 0U,
@@ -163,6 +157,18 @@ struct DogGaitSyncState {
     float active_forward_stride_x_mm;
     float active_turn_stride_x_mm;
     float stop_progress;
+};
+
+enum Dog_Foot_Motion_State {
+    DOG_FOOT_MOTION_IDLE = 0U,
+    DOG_FOOT_MOTION_ACTIVE,
+    DOG_FOOT_MOTION_COMPLETE,
+    DOG_FOOT_MOTION_FAULT,
+};
+
+struct Dog_Foot_Target {
+    float x_mm;
+    float z_mm;
 };
 
 enum Dog_Leg_Kin_Mode {
@@ -396,6 +402,15 @@ uint8_t dog_mit_diag_support_lf_rb_start(void);
 void dog_mit_diag_support_stop(void);
 uint8_t dog_mit_diag_support_is_active(void);
 void dog_diag_support_print_status(void);
+uint8_t dog_foot_motion_prepare(void);
+uint8_t dog_foot_motion_start(uint8_t leg_mask,
+                              const Dog_Foot_Target target[DOG_LEG_COUNT],
+                              float clearance_mm,
+                              uint32_t duration_ms,
+                              uint32_t timeout_ms);
+void dog_foot_motion_tick(uint32_t now_ms);
+void dog_foot_motion_cancel(void);
+uint8_t dog_foot_motion_state(void);
 void dog_mit_print_all_motor_current(const char *tag);
 uint8_t dog_leg_foot_xz_is_reachable(float x_mm, float z_mm);
 uint8_t dog_leg_foot_xz_to_motor_deg(uint8_t leg, float x_mm, float z_mm,
@@ -448,11 +463,6 @@ void DogStand_Request(void);
 void DogStand_Disable(void);
 uint8_t DogStand_ClearDisable(void);
 uint8_t DogStand_IsDisabled(void);
-uint8_t DogStand_EnterMechanicalLimitIdle(void);
-uint8_t DogStand_IsMechanicalLimitIdle(void);
-uint8_t DogStand_IsMechanicalLimitIdleReady(void);
-uint8_t DogStand_GetMechanicalLimitIdleMask(void);
-void DogStand_ExitMechanicalLimitIdle(void);
 uint8_t DogStand_EnterMechanicalLimitPose(void);
 uint8_t DogStand_IsMechanicalLimitPose(void);
 uint8_t DogStand_IsMechanicalLimitPoseReady(void);
