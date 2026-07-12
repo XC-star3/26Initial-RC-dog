@@ -403,6 +403,11 @@ void dog_mit_diag_support_stop(void);
 uint8_t dog_mit_diag_support_is_active(void);
 void dog_diag_support_print_status(void);
 uint8_t dog_foot_motion_prepare(void);
+uint8_t dog_foot_motion_path_is_valid(
+    uint8_t leg_mask,
+    const Dog_Foot_Target start[DOG_LEG_COUNT],
+    const Dog_Foot_Target target[DOG_LEG_COUNT],
+    float clearance_mm);
 uint8_t dog_foot_motion_start(uint8_t leg_mask,
                               const Dog_Foot_Target target[DOG_LEG_COUNT],
                               float clearance_mm,

@@ -17,6 +17,36 @@ static_assert(DOG_OBSTACLE_BRIDGE_ACTIVE_GAP_MM <=
 static_assert(DOG_OBSTACLE_BRIDGE_TEST_GAP_LIMIT_MM <=
                   DOG_OBSTACLE_BRIDGE_FINAL_GAP_MM,
               "Bridge B test limit exceeds the formal gap");
+static_assert(DOG_OBSTACLE_STAIR_STEP_HEIGHT_MM > 0.0f,
+              "Stair height must be positive");
+static_assert(DOG_OBSTACLE_STAIR_TREAD_MM >
+                  (2.0f * DOG_OBSTACLE_STAIR_EDGE_MARGIN_MM),
+              "Stair tread is too short for the wheel edge margins");
+static_assert(DOG_OBSTACLE_STAIR_LEVEL_COUNT == 3U,
+              "The current T-stair sequence is designed for three levels");
+static_assert(DOG_OBSTACLE_STAIR_TREAD_MM *
+                  DOG_OBSTACLE_STAIR_LEVEL_COUNT ==
+                  DOG_OBSTACLE_STAIR_RUN_MM,
+              "Three stair treads must fill the 900 mm stair run");
+static_assert((2.0f * DOG_OBSTACLE_STAIR_RUN_MM) +
+                  DOG_OBSTACLE_STAIR_TOP_PLATFORM_MM ==
+                  DOG_OBSTACLE_STAIR_TOTAL_LENGTH_MM,
+              "Stair runs and top platform must match the total length");
+static_assert(DOG_OBSTACLE_STAIR_WIDTH_MM > 0.0f,
+              "Stair flight width must be positive");
+static_assert(DOG_OBSTACLE_STAIR_FRONT_FORWARD_X_MM -
+                  (-DOG_OBSTACLE_STAIR_COMPACT_X_MM) ==
+                  DOG_OBSTACLE_STAIR_TREAD_MM,
+              "Front stair stride must equal the tread depth");
+static_assert(DOG_OBSTACLE_STAIR_COMPACT_X_MM -
+                  DOG_OBSTACLE_STAIR_REAR_SHIFT_X_MM ==
+                  DOG_OBSTACLE_STAIR_TREAD_MM,
+              "Rear stair stride must equal the tread depth");
+static_assert(DOG_OBSTACLE_WHEELBASE_MM -
+                  (2.0f * DOG_OBSTACLE_STAIR_COMPACT_X_MM) ==
+                  DOG_OBSTACLE_STAIR_TREAD_MM -
+                  (2.0f * DOG_OBSTACLE_STAIR_EDGE_MARGIN_MM),
+              "Compact stair stance must preserve both edge margins");
 
 static constexpr uint8_t kFrontLegMask =
     (uint8_t)((1U << DOG_LEG_LF) | (1U << DOG_LEG_RF));
@@ -49,6 +79,123 @@ static int8_t s_motion_direction = 0;
 static uint8_t s_recovery_leg_mask = DOG_LEG_MASK_ALL;
 static float s_recovery_clearance_mm = 0.0f;
 static uint32_t s_recovery_duration_ms = 0U;
+
+static constexpr uint8_t kStairWaypointCount =
+    (uint8_t)(DOG_STAIR_PHASE_TOP_READY + 1U);
+static constexpr uint8_t kStairMaxSegments = 16U;
+
+struct StairSegment {
+    uint8_t source_phase;
+    uint8_t target_phase;
+    uint8_t leg_mask;
+    uint32_t duration_ms;
+    float clearance_mm;
+    uint32_t dwell_ms;
+};
+
+struct StairContext {
+    Dog_Foot_Target waypoint[kStairWaypointCount][DOG_LEG_COUNT];
+    StairSegment sequence[kStairMaxSegments];
+    uint8_t geometry_ready;
+    uint8_t current_phase;
+    uint8_t motion_source_phase;
+    uint8_t motion_target_phase;
+    uint8_t sequence_count;
+    uint8_t sequence_index;
+    uint8_t sequence_recovering;
+    uint8_t motion_active;
+    uint8_t failed_segment_active;
+    uint8_t paused;
+    uint8_t recovery_goal_phase;
+    uint32_t dwell_started_ms;
+    uint32_t dwell_duration_ms;
+};
+
+static StairContext s_stair = {};
+
+static float stair_front_normal_z(void)
+{
+    return DOG_STAND_FOOT_Z_MM;
+}
+
+static float stair_rear_normal_z(void)
+{
+    return DOG_STAND_FOOT_Z_MM + DOG_REAR_FOOT_EXTRA_Z_MM;
+}
+
+static void stair_set_waypoint(uint8_t phase, float front_x, float front_z,
+                               float rear_x, float rear_z)
+{
+    if (phase >= kStairWaypointCount) {
+        return;
+    }
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        const uint8_t rear = ((leg == DOG_LEG_LB) ||
+                              (leg == DOG_LEG_RB)) ? 1U : 0U;
+        s_stair.waypoint[phase][leg].x_mm = (rear != 0U) ? rear_x : front_x;
+        s_stair.waypoint[phase][leg].z_mm = (rear != 0U) ? rear_z : front_z;
+    }
+}
+
+static void stair_build_geometry(void)
+{
+    const float front_z = stair_front_normal_z();
+    const float rear_z = stair_rear_normal_z();
+    const float front_upper_z = front_z - DOG_OBSTACLE_STAIR_STEP_HEIGHT_MM;
+    const float rear_upper_z = rear_z - DOG_OBSTACLE_STAIR_STEP_HEIGHT_MM;
+    const float front_lift_z = front_upper_z - DOG_OBSTACLE_STAIR_CLEARANCE_MM;
+    const float rear_lift_z = rear_upper_z - DOG_OBSTACLE_STAIR_CLEARANCE_MM;
+    const float compact = DOG_OBSTACLE_STAIR_COMPACT_X_MM;
+    const float front_forward = DOG_OBSTACLE_STAIR_FRONT_FORWARD_X_MM;
+    const float rear_shift = DOG_OBSTACLE_STAIR_REAR_SHIFT_X_MM;
+
+    stair_set_waypoint(DOG_STAIR_PHASE_IDLE, 0.0f, front_z, 0.0f, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_PREP_BODY_SHIFT,
+                       -compact, front_z, -compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_PREP_REAR_COMPACT,
+                       -compact, front_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_LEVEL_READY,
+                       -compact, front_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_FRONT_LIFT,
+                       -compact, front_lift_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_FRONT_FORWARD,
+                       front_forward, front_lift_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_FRONT_LAND,
+                       front_forward, front_upper_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_BODY_SHIFT,
+                       -compact, front_upper_z, rear_shift, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_REAR_LIFT,
+                       -compact, front_upper_z, rear_shift, rear_lift_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_REAR_FORWARD,
+                       -compact, front_upper_z, compact, rear_lift_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_REAR_LAND,
+                       -compact, front_upper_z, compact, rear_upper_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_BODY_RAISE,
+                       -compact, front_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
+                       front_forward, front_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_TOP_BODY_SHIFT,
+                       -compact, front_z, rear_shift, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
+                       -compact, front_z, compact, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
+                       -(2.0f * compact), front_z, 0.0f, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_TOP_FRONT_NORMAL,
+                       0.0f, front_z, 0.0f, rear_z);
+    stair_set_waypoint(DOG_STAIR_PHASE_TOP_READY,
+                       0.0f, front_z, 0.0f, rear_z);
+    s_stair.geometry_ready = 1U;
+}
+
+static void stair_context_reset(void)
+{
+    memset(&s_stair, 0, sizeof(s_stair));
+    stair_build_geometry();
+    s_stair.current_phase = DOG_STAIR_PHASE_IDLE;
+    s_stair.motion_source_phase = DOG_STAIR_PHASE_IDLE;
+    s_stair.motion_target_phase = DOG_STAIR_PHASE_IDLE;
+    s_stair.recovery_goal_phase = DOG_STAIR_PHASE_IDLE;
+}
 
 static void obstacle_publish_status(void)
 {
@@ -119,10 +266,28 @@ static void obstacle_fault(uint8_t fault)
         return;
     }
     dog_foot_motion_cancel();
+    if (s_status.selected == DOG_OBSTACLE_STAIRS) {
+        if ((s_stair.motion_active != 0U) ||
+            ((s_stair.sequence_count != 0U) &&
+             (s_stair.sequence_index < s_stair.sequence_count))) {
+            s_stair.failed_segment_active = 1U;
+        }
+        s_stair.motion_active = 0U;
+        s_stair.paused = 0U;
+        s_stair.dwell_started_ms = 0U;
+        s_stair.dwell_duration_ms = 0U;
+        s_status.phase = s_stair.current_phase;
+        s_status.checkpoint = s_stair.current_phase;
+    }
     s_status.fault = fault;
     s_status.motion_state = DOG_FOOT_MOTION_FAULT;
-    s_status.can_exit = ((s_status.prepared == 0U) &&
-                         (s_motion_kind == BRIDGE_MOTION_NONE)) ? 1U : 0U;
+    if (s_status.selected == DOG_OBSTACLE_STAIRS) {
+        s_status.can_exit = ((s_stair.current_phase == DOG_STAIR_PHASE_IDLE) &&
+                             (s_stair.sequence_count == 0U)) ? 1U : 0U;
+    } else {
+        s_status.can_exit = ((s_status.prepared == 0U) &&
+                             (s_motion_kind == BRIDGE_MOTION_NONE)) ? 1U : 0U;
+    }
     obstacle_set_state(DOG_OBSTACLE_FAULT);
 }
 
@@ -148,7 +313,33 @@ static void obstacle_control_abort(uint8_t fault)
     s_recovery_leg_mask = DOG_LEG_MASK_ALL;
     s_recovery_clearance_mm = 0.0f;
     s_recovery_duration_ms = 0U;
+    stair_context_reset();
+    s_status.phase = DOG_STAIR_PHASE_IDLE;
+    s_status.completed_levels = 0U;
     obstacle_set_state(DOG_OBSTACLE_FAULT);
+}
+
+static void obstacle_reset_selection(uint8_t selection)
+{
+    dog_foot_motion_cancel();
+    s_status.selected = selection;
+    s_status.fault = DOG_OBSTACLE_FAULT_NONE;
+    s_status.prepared = 0U;
+    s_status.checkpoint = kCheckpointUnprepared;
+    s_status.target_checkpoint = kCheckpointUnprepared;
+    s_status.motion_state = DOG_FOOT_MOTION_IDLE;
+    s_status.can_exit = 1U;
+    s_status.completed_gaps = 0U;
+    s_status.phase = DOG_STAIR_PHASE_IDLE;
+    s_status.completed_levels = 0U;
+    s_motion_kind = BRIDGE_MOTION_NONE;
+    s_motion_source_checkpoint = kCheckpointUnprepared;
+    s_motion_direction = 0;
+    s_recovery_leg_mask = DOG_LEG_MASK_ALL;
+    s_recovery_clearance_mm = 0.0f;
+    s_recovery_duration_ms = 0U;
+    stair_context_reset();
+    obstacle_set_state(DOG_OBSTACLE_DISABLED);
 }
 
 static void bridge_build_geometry(void)
@@ -465,6 +656,411 @@ static void bridge_exit_tick(void)
     }
 }
 
+static uint8_t stair_path_valid(uint8_t source, uint8_t target,
+                                uint8_t leg_mask, float clearance_mm)
+{
+    if ((source >= kStairWaypointCount) || (target >= kStairWaypointCount)) {
+        return 0U;
+    }
+    return dog_foot_motion_path_is_valid(
+        leg_mask, s_stair.waypoint[source], s_stair.waypoint[target],
+        clearance_mm);
+}
+
+static uint8_t stair_geometry_valid(void)
+{
+    if (s_stair.geometry_ready == 0U) {
+        stair_build_geometry();
+    }
+    struct StairPathCheck {
+        uint8_t source;
+        uint8_t target;
+        uint8_t mask;
+        float clearance;
+    };
+    static const StairPathCheck checks[] = {
+        {DOG_STAIR_PHASE_IDLE, DOG_STAIR_PHASE_PREP_BODY_SHIFT,
+         DOG_LEG_MASK_ALL, 0.0f},
+        {DOG_STAIR_PHASE_PREP_BODY_SHIFT, DOG_STAIR_PHASE_PREP_REAR_COMPACT,
+         kRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_LEVEL_READY, DOG_STAIR_PHASE_FRONT_LIFT,
+         kFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_FRONT_LIFT, DOG_STAIR_PHASE_FRONT_FORWARD,
+         kFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_FRONT_FORWARD, DOG_STAIR_PHASE_FRONT_LAND,
+         kFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_FRONT_LAND, DOG_STAIR_PHASE_BODY_SHIFT,
+         DOG_LEG_MASK_ALL, 0.0f},
+        {DOG_STAIR_PHASE_BODY_SHIFT, DOG_STAIR_PHASE_REAR_LIFT,
+         kRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_REAR_LIFT, DOG_STAIR_PHASE_REAR_FORWARD,
+         kRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_REAR_FORWARD, DOG_STAIR_PHASE_REAR_LAND,
+         kRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_REAR_LAND, DOG_STAIR_PHASE_BODY_RAISE,
+         DOG_LEG_MASK_ALL, 0.0f},
+        {DOG_STAIR_PHASE_LEVEL_READY, DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
+         kFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_FRONT_ADVANCE, DOG_STAIR_PHASE_TOP_BODY_SHIFT,
+         DOG_LEG_MASK_ALL, 0.0f},
+        {DOG_STAIR_PHASE_TOP_BODY_SHIFT, DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
+         kRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_REAR_ADVANCE, DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
+         DOG_LEG_MASK_ALL, 0.0f},
+        {DOG_STAIR_PHASE_TOP_BODY_NORMALIZE, DOG_STAIR_PHASE_TOP_FRONT_NORMAL,
+         kFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+    };
+    for (uint8_t i = 0U; i < (uint8_t)(sizeof(checks) / sizeof(checks[0])); ++i) {
+        if (stair_path_valid(checks[i].source, checks[i].target,
+                             checks[i].mask, checks[i].clearance) == 0U) {
+            DebugUart_Printf("STAIRS precheck FAIL path=%u->%u.\r\n",
+                             (unsigned)checks[i].source,
+                             (unsigned)checks[i].target);
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
+static void stair_sequence_clear(uint8_t recovering, uint8_t goal_phase)
+{
+    memset(s_stair.sequence, 0, sizeof(s_stair.sequence));
+    s_stair.sequence_count = 0U;
+    s_stair.sequence_index = 0U;
+    s_stair.sequence_recovering = recovering;
+    s_stair.motion_active = 0U;
+    s_stair.failed_segment_active = 0U;
+    s_stair.paused = 0U;
+    s_stair.recovery_goal_phase = goal_phase;
+    s_stair.dwell_started_ms = 0U;
+    s_stair.dwell_duration_ms = 0U;
+}
+
+static uint8_t stair_sequence_add(uint8_t source, uint8_t target,
+                                  uint8_t leg_mask, uint32_t duration_ms,
+                                  float clearance_mm, uint32_t dwell_ms)
+{
+    if ((s_stair.sequence_count >= kStairMaxSegments) ||
+        (source >= kStairWaypointCount) || (target >= kStairWaypointCount)) {
+        return 0U;
+    }
+    StairSegment *segment = &s_stair.sequence[s_stair.sequence_count++];
+    segment->source_phase = source;
+    segment->target_phase = target;
+    segment->leg_mask = leg_mask;
+    segment->duration_ms = duration_ms;
+    segment->clearance_mm = clearance_mm;
+    segment->dwell_ms = dwell_ms;
+    return 1U;
+}
+
+static uint8_t stair_add_level_sequence(uint8_t source_phase)
+{
+    return
+        stair_sequence_add(source_phase, DOG_STAIR_PHASE_FRONT_LIFT,
+                           kFrontLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_FRONT_LIFT,
+                           DOG_STAIR_PHASE_FRONT_FORWARD,
+                           kFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_FRONT_FORWARD,
+                           DOG_STAIR_PHASE_FRONT_LAND,
+                           kFrontLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
+                           0.0f, DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_FRONT_LAND,
+                           DOG_STAIR_PHASE_BODY_SHIFT,
+                           DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_BODY_SHIFT_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_BODY_SHIFT,
+                           DOG_STAIR_PHASE_REAR_LIFT,
+                           kRearLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_REAR_LIFT,
+                           DOG_STAIR_PHASE_REAR_FORWARD,
+                           kRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_REAR_FORWARD,
+                           DOG_STAIR_PHASE_REAR_LAND,
+                           kRearLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
+                           0.0f, DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_REAR_LAND,
+                           DOG_STAIR_PHASE_BODY_RAISE,
+                           DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_BODY_RAISE_MS,
+                           0.0f, DOG_OBSTACLE_STAIR_DWELL_MS);
+}
+
+static uint8_t stair_add_top_sequence(void)
+{
+    return
+        stair_sequence_add(DOG_STAIR_PHASE_BODY_RAISE,
+                           DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
+                           kFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
+                           DOG_STAIR_PHASE_TOP_BODY_SHIFT,
+                           DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_BODY_SHIFT_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_BODY_SHIFT,
+                           DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
+                           kRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                           DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
+                           DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
+                           DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_PREPARE_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
+                           DOG_STAIR_PHASE_TOP_FRONT_NORMAL,
+                           kFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                           DOG_OBSTACLE_STAIR_DWELL_MS);
+}
+
+static uint8_t stair_build_forward_sequence(void)
+{
+    const uint8_t next_level = (uint8_t)(s_status.completed_levels + 1U);
+    if ((next_level == 0U) ||
+        (next_level > DOG_OBSTACLE_STAIR_LEVEL_COUNT)) {
+        return 0U;
+    }
+    stair_sequence_clear(0U, s_stair.current_phase);
+    uint8_t level_source = DOG_STAIR_PHASE_LEVEL_READY;
+    if ((s_status.completed_levels == 0U) &&
+        (s_stair.current_phase == DOG_STAIR_PHASE_IDLE)) {
+        if ((stair_sequence_add(DOG_STAIR_PHASE_IDLE,
+                                DOG_STAIR_PHASE_PREP_BODY_SHIFT,
+                                DOG_LEG_MASK_ALL,
+                                DOG_OBSTACLE_STAIR_PREPARE_MS,
+                                0.0f, 0U) == 0U) ||
+            (stair_sequence_add(DOG_STAIR_PHASE_PREP_BODY_SHIFT,
+                                DOG_STAIR_PHASE_PREP_REAR_COMPACT,
+                                kRearLegMask,
+                                DOG_OBSTACLE_STAIR_PREPARE_MS,
+                                DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                                DOG_OBSTACLE_STAIR_DWELL_MS) == 0U)) {
+            return 0U;
+        }
+        level_source = DOG_STAIR_PHASE_PREP_REAR_COMPACT;
+    }
+    if (stair_add_level_sequence(level_source) == 0U) {
+        return 0U;
+    }
+    if ((next_level == DOG_OBSTACLE_STAIR_LEVEL_COUNT) &&
+        (stair_add_top_sequence() == 0U)) {
+        return 0U;
+    }
+    return 1U;
+}
+
+static uint8_t stair_start_current_segment(int8_t direction)
+{
+    if ((s_stair.sequence_index >= s_stair.sequence_count) ||
+        (s_stair.motion_active != 0U)) {
+        return 0U;
+    }
+    const StairSegment *segment = &s_stair.sequence[s_stair.sequence_index];
+    if (dog_foot_motion_start(
+            segment->leg_mask, s_stair.waypoint[segment->target_phase],
+            segment->clearance_mm, segment->duration_ms,
+            segment->duration_ms + DOG_OBSTACLE_STAIR_TIMEOUT_MARGIN_MS) == 0U) {
+        obstacle_fault(DOG_OBSTACLE_FAULT_MOTION_START);
+        return 0U;
+    }
+    s_stair.motion_active = 1U;
+    s_stair.failed_segment_active = 0U;
+    s_stair.motion_source_phase = segment->source_phase;
+    s_stair.motion_target_phase = segment->target_phase;
+    s_status.prepared = 1U;
+    s_status.phase = segment->target_phase;
+    s_status.target_checkpoint = segment->target_phase;
+    s_status.motion_state = DOG_FOOT_MOTION_ACTIVE;
+    s_status.can_exit = 0U;
+    obstacle_set_state((direction < 0) ? DOG_OBSTACLE_ROLLBACK :
+                                         DOG_OBSTACLE_MOVING);
+    return 1U;
+}
+
+static void stair_sequence_finish(void)
+{
+    s_stair.sequence_count = 0U;
+    s_stair.sequence_index = 0U;
+    s_stair.motion_active = 0U;
+    s_stair.failed_segment_active = 0U;
+    s_stair.paused = 0U;
+    s_stair.dwell_started_ms = 0U;
+    s_stair.dwell_duration_ms = 0U;
+    s_status.fault = DOG_OBSTACLE_FAULT_NONE;
+    s_status.motion_state = DOG_FOOT_MOTION_IDLE;
+
+    if (s_stair.sequence_recovering != 0U) {
+        s_stair.current_phase = s_stair.recovery_goal_phase;
+        s_status.phase = s_stair.current_phase;
+        s_status.checkpoint = s_stair.current_phase;
+        s_status.target_checkpoint = s_stair.current_phase;
+        s_status.prepared = (s_stair.current_phase == DOG_STAIR_PHASE_IDLE) ? 0U : 1U;
+        s_status.can_exit = (s_status.prepared == 0U) ? 1U : 0U;
+        s_stair.sequence_recovering = 0U;
+        obstacle_set_state(DOG_OBSTACLE_READY);
+        return;
+    }
+
+    if (s_status.completed_levels < DOG_OBSTACLE_STAIR_LEVEL_COUNT) {
+        s_status.completed_levels++;
+    }
+    if (s_status.completed_levels >= DOG_OBSTACLE_STAIR_LEVEL_COUNT) {
+        s_stair.current_phase = DOG_STAIR_PHASE_TOP_READY;
+        s_status.phase = DOG_STAIR_PHASE_TOP_READY;
+        s_status.checkpoint = DOG_STAIR_PHASE_TOP_READY;
+        s_status.target_checkpoint = DOG_STAIR_PHASE_TOP_READY;
+        s_status.prepared = 0U;
+        s_status.can_exit = 1U;
+    } else {
+        s_stair.current_phase = DOG_STAIR_PHASE_LEVEL_READY;
+        s_status.phase = DOG_STAIR_PHASE_LEVEL_READY;
+        s_status.checkpoint = DOG_STAIR_PHASE_LEVEL_READY;
+        s_status.target_checkpoint = DOG_STAIR_PHASE_LEVEL_READY;
+        s_status.prepared = 1U;
+        s_status.can_exit = 0U;
+    }
+    obstacle_set_state(DOG_OBSTACLE_READY);
+}
+
+static void stair_continue_sequence(uint32_t now_ms, uint8_t mode_requested)
+{
+    if ((s_stair.sequence_count == 0U) ||
+        (s_stair.motion_active != 0U)) {
+        return;
+    }
+    if (s_stair.dwell_duration_ms != 0U) {
+        if (s_stair.dwell_started_ms == 0U) {
+            s_stair.dwell_started_ms = (now_ms != 0U) ? now_ms : 1U;
+            return;
+        }
+        if ((uint32_t)(now_ms - s_stair.dwell_started_ms) <
+            s_stair.dwell_duration_ms) {
+            return;
+        }
+        s_stair.dwell_started_ms = 0U;
+        s_stair.dwell_duration_ms = 0U;
+    }
+    if (s_stair.sequence_index >= s_stair.sequence_count) {
+        stair_sequence_finish();
+        return;
+    }
+    if (mode_requested == 0U) {
+        s_stair.paused = 1U;
+        s_status.phase = s_stair.current_phase;
+        s_status.checkpoint = s_stair.current_phase;
+        s_status.target_checkpoint = s_stair.current_phase;
+        s_status.motion_state = DOG_FOOT_MOTION_IDLE;
+        s_status.can_exit = 0U;
+        obstacle_set_state(DOG_OBSTACLE_READY);
+        return;
+    }
+    s_stair.paused = 0U;
+    (void)stair_start_current_segment(
+        (s_stair.sequence_recovering != 0U) ? -1 : 1);
+}
+
+static void stair_motion_complete(uint32_t now_ms, uint8_t mode_requested)
+{
+    if ((s_stair.motion_active == 0U) ||
+        (s_stair.sequence_index >= s_stair.sequence_count)) {
+        obstacle_fault(DOG_OBSTACLE_FAULT_MOTION_RUNTIME);
+        return;
+    }
+    const StairSegment *segment = &s_stair.sequence[s_stair.sequence_index];
+    dog_foot_motion_cancel();
+    s_stair.motion_active = 0U;
+    s_stair.current_phase = segment->target_phase;
+    s_status.phase = s_stair.current_phase;
+    s_status.checkpoint = s_stair.current_phase;
+    s_status.target_checkpoint = s_stair.current_phase;
+    s_status.motion_state = DOG_FOOT_MOTION_IDLE;
+    s_stair.sequence_index++;
+    s_stair.dwell_started_ms = 0U;
+    s_stair.dwell_duration_ms = segment->dwell_ms;
+    stair_continue_sequence(now_ms, mode_requested);
+}
+
+static uint8_t stair_build_recovery_sequence(void)
+{
+    if ((s_stair.sequence_count == 0U) ||
+        (dog_foot_motion_prepare() == 0U)) {
+        return 0U;
+    }
+    StairSegment original[kStairMaxSegments] = {};
+    const uint8_t original_count = s_stair.sequence_count;
+    const uint8_t original_index = s_stair.sequence_index;
+    const uint8_t was_recovering = s_stair.sequence_recovering;
+    const uint8_t failed_active = s_stair.failed_segment_active;
+    memcpy(original, s_stair.sequence, sizeof(original));
+    const uint8_t goal = (was_recovering != 0U) ?
+        s_stair.recovery_goal_phase : original[0].source_phase;
+    stair_sequence_clear(1U, goal);
+
+    if ((failed_active != 0U) && (original_index < original_count)) {
+        const StairSegment *failed = &original[original_index];
+        if (stair_sequence_add(s_stair.current_phase, failed->source_phase,
+                               failed->leg_mask, failed->duration_ms,
+                               failed->clearance_mm,
+                               DOG_OBSTACLE_STAIR_DWELL_MS) == 0U) {
+            return 0U;
+        }
+    }
+    if (was_recovering != 0U) {
+        for (uint8_t i = original_index; i < original_count; ++i) {
+            const StairSegment *segment = &original[i];
+            if (stair_sequence_add(segment->source_phase,
+                                   segment->target_phase,
+                                   segment->leg_mask, segment->duration_ms,
+                                   segment->clearance_mm, segment->dwell_ms) == 0U) {
+                return 0U;
+            }
+        }
+    } else {
+        for (uint8_t i = original_index; i > 0U; --i) {
+            const StairSegment *segment = &original[i - 1U];
+            if (stair_sequence_add(segment->target_phase,
+                                   segment->source_phase,
+                                   segment->leg_mask, segment->duration_ms,
+                                   segment->clearance_mm,
+                                   DOG_OBSTACLE_STAIR_DWELL_MS) == 0U) {
+                return 0U;
+            }
+        }
+    }
+    s_stair.recovery_goal_phase = goal;
+    s_status.fault = DOG_OBSTACLE_FAULT_NONE;
+    s_status.motion_state = DOG_FOOT_MOTION_IDLE;
+    s_status.can_exit = 0U;
+    if (s_stair.sequence_count == 0U) {
+        stair_sequence_finish();
+        return 1U;
+    }
+    return stair_start_current_segment(-1);
+}
+
+static void stair_exit_tick(void)
+{
+    if ((s_stair.motion_active != 0U) ||
+        (s_stair.sequence_count != 0U)) {
+        s_stair.paused = 1U;
+        s_status.can_exit = 0U;
+        return;
+    }
+    if ((s_stair.current_phase == DOG_STAIR_PHASE_IDLE) ||
+        (s_stair.current_phase == DOG_STAIR_PHASE_TOP_READY)) {
+        s_status.prepared = 0U;
+        s_status.can_exit = 1U;
+        obstacle_set_state(DOG_OBSTACLE_DISABLED);
+        return;
+    }
+    s_status.can_exit = 0U;
+    obstacle_set_state(DOG_OBSTACLE_READY);
+}
+
 void DogObstacle_Init(void)
 {
     taskENTER_CRITICAL();
@@ -482,6 +1078,10 @@ void DogObstacle_Init(void)
     s_status.can_exit = 1U;
     s_status.active_gap_mm = DOG_OBSTACLE_BRIDGE_ACTIVE_GAP_MM;
     s_status.final_gap_mm = DOG_OBSTACLE_BRIDGE_FINAL_GAP_MM;
+    s_status.phase = DOG_STAIR_PHASE_IDLE;
+    s_status.total_levels = DOG_OBSTACLE_STAIR_LEVEL_COUNT;
+    s_status.step_height_mm = DOG_OBSTACLE_STAIR_STEP_HEIGHT_MM;
+    s_status.tread_depth_mm = DOG_OBSTACLE_STAIR_TREAD_MM;
     s_geometry_ready = 0U;
     s_motion_kind = BRIDGE_MOTION_NONE;
     s_motion_source_checkpoint = kCheckpointUnprepared;
@@ -489,6 +1089,7 @@ void DogObstacle_Init(void)
     s_recovery_leg_mask = DOG_LEG_MASK_ALL;
     s_recovery_clearance_mm = 0.0f;
     s_recovery_duration_ms = 0U;
+    stair_context_reset();
     obstacle_publish_status();
 }
 
@@ -543,7 +1144,6 @@ void DogObstacle_RequestSafetyAbort(void)
 
 void DogObstacle_Tick(uint32_t now_ms)
 {
-    (void)now_ms;
     uint8_t requested_mode = 0U;
     uint8_t requested_selection = DOG_OBSTACLE_BRIDGE_B;
     int8_t requested_step = 0;
@@ -573,11 +1173,13 @@ void DogObstacle_Tick(uint32_t now_ms)
         obstacle_control_abort(DOG_OBSTACLE_FAULT_SAFETY);
         return;
     }
+    const uint8_t stair_mode_requested =
+        ((requested_mode != 0U) &&
+         (requested_selection == DOG_OBSTACLE_STAIRS)) ? 1U : 0U;
 
-    const uint8_t motion_was_active =
+    if ((s_status.selected == DOG_OBSTACLE_BRIDGE_B) &&
         ((s_status.state == DOG_OBSTACLE_MOVING) ||
-         (s_status.state == DOG_OBSTACLE_ROLLBACK)) ? 1U : 0U;
-    if (motion_was_active != 0U) {
+         (s_status.state == DOG_OBSTACLE_ROLLBACK))) {
         s_status.motion_state = dog_foot_motion_state();
         if (s_status.motion_state == DOG_FOOT_MOTION_COMPLETE) {
             bridge_motion_complete();
@@ -592,19 +1194,42 @@ void DogObstacle_Tick(uint32_t now_ms)
         requested_step = 0;
     }
 
-    if ((s_status.prepared == 0U) &&
-        (s_status.state != DOG_OBSTACLE_MOVING) &&
-        (s_status.state != DOG_OBSTACLE_ROLLBACK)) {
-        if (s_status.selected != requested_selection) {
-            s_status.selected = requested_selection;
-            s_status.fault = DOG_OBSTACLE_FAULT_NONE;
-            obstacle_set_state(DOG_OBSTACLE_DISABLED);
+    if ((s_status.selected == DOG_OBSTACLE_STAIRS) &&
+        (s_stair.sequence_count != 0U) &&
+        (s_status.state != DOG_OBSTACLE_FAULT)) {
+        requested_step = 0;
+        if (s_stair.motion_active != 0U) {
+            s_status.motion_state = dog_foot_motion_state();
+            if (s_status.motion_state == DOG_FOOT_MOTION_COMPLETE) {
+                stair_motion_complete(now_ms, stair_mode_requested);
+            } else if (s_status.motion_state == DOG_FOOT_MOTION_FAULT) {
+                obstacle_fault(DOG_OBSTACLE_FAULT_MOTION_RUNTIME);
+            } else if (s_status.motion_state == DOG_FOOT_MOTION_ACTIVE) {
+                return;
+            } else {
+                obstacle_fault(DOG_OBSTACLE_FAULT_MOTION_RUNTIME);
+            }
+        } else {
+            stair_continue_sequence(now_ms, stair_mode_requested);
         }
     }
 
-    if (requested_mode == 0U) {
+    if ((s_status.can_exit != 0U) &&
+        (s_status.prepared == 0U) &&
+        (s_status.state != DOG_OBSTACLE_MOVING) &&
+        (s_status.state != DOG_OBSTACLE_ROLLBACK)) {
+        if (s_status.selected != requested_selection) {
+            obstacle_reset_selection(requested_selection);
+        }
+    }
+
+    if ((requested_mode == 0U) ||
+        ((s_status.selected == DOG_OBSTACLE_STAIRS) &&
+         (stair_mode_requested == 0U))) {
         if (s_status.selected == DOG_OBSTACLE_BRIDGE_B) {
             bridge_exit_tick();
+        } else if (s_status.selected == DOG_OBSTACLE_STAIRS) {
+            stair_exit_tick();
         } else {
             s_status.can_exit = 1U;
             obstacle_set_state(DOG_OBSTACLE_DISABLED);
@@ -615,7 +1240,7 @@ void DogObstacle_Tick(uint32_t now_ms)
     s_status.can_exit = ((s_status.prepared == 0U) &&
                          (s_status.state != DOG_OBSTACLE_MOVING) &&
                          (s_status.state != DOG_OBSTACLE_ROLLBACK)) ? 1U : 0U;
-    if (s_status.selected != DOG_OBSTACLE_BRIDGE_B) {
+    if (s_status.selected == DOG_OBSTACLE_GRAVEL) {
         s_status.fault = DOG_OBSTACLE_FAULT_NONE;
         s_status.can_exit = 1U;
         obstacle_set_state(DOG_OBSTACLE_UNAVAILABLE);
@@ -630,7 +1255,10 @@ void DogObstacle_Tick(uint32_t now_ms)
             s_status.fault = DOG_OBSTACLE_FAULT_PRECHECK;
             return;
         }
-        if (bridge_geometry_valid() == 0U) {
+        const uint8_t geometry_valid =
+            (s_status.selected == DOG_OBSTACLE_STAIRS) ?
+                stair_geometry_valid() : bridge_geometry_valid();
+        if (geometry_valid == 0U) {
             obstacle_fault(DOG_OBSTACLE_FAULT_PRECHECK);
             return;
         }
@@ -641,20 +1269,34 @@ void DogObstacle_Tick(uint32_t now_ms)
 
     if (s_status.state == DOG_OBSTACLE_FAULT) {
         if (requested_step < 0) {
-            if ((s_motion_kind == BRIDGE_MOTION_NONE) &&
-                (s_status.prepared == 0U)) {
-                s_status.fault = DOG_OBSTACLE_FAULT_NONE;
-                obstacle_set_state(DOG_OBSTACLE_PRECHECK);
+            if (obstacle_reserve_motion_start(request_epoch) == 0U) {
                 return;
             }
-            if (bridge_recover_interrupted_motion() == 0U) {
-                return;
-            }
-            if ((s_status.state != DOG_OBSTACLE_MOVING) &&
-                (s_status.state != DOG_OBSTACLE_ROLLBACK)) {
-                s_status.fault = DOG_OBSTACLE_FAULT_NONE;
-                obstacle_set_state(DOG_OBSTACLE_READY);
-                bridge_backward_step();
+            if (s_status.selected == DOG_OBSTACLE_STAIRS) {
+                if ((s_stair.sequence_count == 0U) &&
+                    (s_stair.current_phase == DOG_STAIR_PHASE_IDLE)) {
+                    s_status.fault = DOG_OBSTACLE_FAULT_NONE;
+                    s_status.motion_state = DOG_FOOT_MOTION_IDLE;
+                    obstacle_set_state(DOG_OBSTACLE_PRECHECK);
+                } else {
+                    (void)stair_build_recovery_sequence();
+                }
+            } else {
+                if ((s_motion_kind == BRIDGE_MOTION_NONE) &&
+                    (s_status.prepared == 0U)) {
+                    s_status.fault = DOG_OBSTACLE_FAULT_NONE;
+                    obstacle_set_state(DOG_OBSTACLE_PRECHECK);
+                    return;
+                }
+                if (bridge_recover_interrupted_motion() == 0U) {
+                    return;
+                }
+                if ((s_status.state != DOG_OBSTACLE_MOVING) &&
+                    (s_status.state != DOG_OBSTACLE_ROLLBACK)) {
+                    s_status.fault = DOG_OBSTACLE_FAULT_NONE;
+                    obstacle_set_state(DOG_OBSTACLE_READY);
+                    bridge_backward_step();
+                }
             }
         }
         return;
@@ -663,12 +1305,32 @@ void DogObstacle_Tick(uint32_t now_ms)
     if (s_status.state != DOG_OBSTACLE_READY) {
         return;
     }
+    if ((s_status.selected == DOG_OBSTACLE_STAIRS) &&
+        (s_stair.sequence_count != 0U)) {
+        stair_continue_sequence(now_ms, stair_mode_requested);
+        return;
+    }
     if (requested_step > 0) {
         if (obstacle_reserve_motion_start(request_epoch) == 0U) {
             return;
         }
-        bridge_forward_step();
+        if (s_status.selected == DOG_OBSTACLE_STAIRS) {
+            if (s_status.completed_levels >= DOG_OBSTACLE_STAIR_LEVEL_COUNT) {
+                return;
+            }
+            if ((stair_build_forward_sequence() == 0U) ||
+                (stair_start_current_segment(1) == 0U)) {
+                if (s_status.state != DOG_OBSTACLE_FAULT) {
+                    obstacle_fault(DOG_OBSTACLE_FAULT_MOTION_START);
+                }
+            }
+        } else {
+            bridge_forward_step();
+        }
     } else if (requested_step < 0) {
+        if (s_status.selected == DOG_OBSTACLE_STAIRS) {
+            return;
+        }
         if (s_status.prepared == 0U) {
             return;
         }
@@ -719,5 +1381,31 @@ const char *DogObstacle_StateName(uint8_t state)
     case DOG_OBSTACLE_UNAVAILABLE: return "UNAVAILABLE";
     case DOG_OBSTACLE_FAULT:       return "FAULT";
     default:                       return "UNKNOWN";
+    }
+}
+
+const char *DogObstacle_StairPhaseName(uint8_t phase)
+{
+    switch (phase) {
+    case DOG_STAIR_PHASE_IDLE:               return "IDLE";
+    case DOG_STAIR_PHASE_PREP_BODY_SHIFT:    return "PREP_BODY_SHIFT";
+    case DOG_STAIR_PHASE_PREP_REAR_COMPACT:  return "PREP_REAR_COMPACT";
+    case DOG_STAIR_PHASE_LEVEL_READY:        return "LEVEL_READY";
+    case DOG_STAIR_PHASE_FRONT_LIFT:         return "FRONT_LIFT";
+    case DOG_STAIR_PHASE_FRONT_FORWARD:      return "FRONT_FORWARD";
+    case DOG_STAIR_PHASE_FRONT_LAND:         return "FRONT_LAND";
+    case DOG_STAIR_PHASE_BODY_SHIFT:         return "BODY_SHIFT";
+    case DOG_STAIR_PHASE_REAR_LIFT:          return "REAR_LIFT";
+    case DOG_STAIR_PHASE_REAR_FORWARD:       return "REAR_FORWARD";
+    case DOG_STAIR_PHASE_REAR_LAND:          return "REAR_LAND";
+    case DOG_STAIR_PHASE_BODY_RAISE:         return "BODY_RAISE";
+    case DOG_STAIR_PHASE_TOP_FRONT_ADVANCE:  return "TOP_FRONT_ADVANCE";
+    case DOG_STAIR_PHASE_TOP_BODY_SHIFT:     return "TOP_BODY_SHIFT";
+    case DOG_STAIR_PHASE_TOP_REAR_ADVANCE:   return "TOP_REAR_ADVANCE";
+    case DOG_STAIR_PHASE_TOP_BODY_NORMALIZE: return "TOP_BODY_NORMALIZE";
+    case DOG_STAIR_PHASE_TOP_FRONT_NORMAL:   return "TOP_FRONT_NORMAL";
+    case DOG_STAIR_PHASE_TOP_READY:          return "TOP_READY";
+    case DOG_STAIR_PHASE_RECOVERY:           return "RECOVERY";
+    default:                                 return "UNKNOWN";
     }
 }

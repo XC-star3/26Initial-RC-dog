@@ -3869,11 +3869,14 @@ uint8_t dog_foot_motion_prepare(void)
     return 1U;
 }
 
-static uint8_t dog_foot_motion_validate(uint8_t leg_mask,
-                                        const Dog_Foot_Target target[DOG_LEG_COUNT],
-                                        float clearance_mm)
+uint8_t dog_foot_motion_path_is_valid(
+    uint8_t leg_mask,
+    const Dog_Foot_Target start[DOG_LEG_COUNT],
+    const Dog_Foot_Target target[DOG_LEG_COUNT],
+    float clearance_mm)
 {
-    if ((target == nullptr) || ((leg_mask & DOG_LEG_MASK_ALL) == 0U) ||
+    leg_mask &= DOG_LEG_MASK_ALL;
+    if ((start == nullptr) || (target == nullptr) || (leg_mask == 0U) ||
         (!isfinite(clearance_mm)) || (clearance_mm < 0.0f)) {
         return 0U;
     }
@@ -3884,8 +3887,8 @@ static uint8_t dog_foot_motion_validate(uint8_t leg_mask,
         }
         const float target_x = target[leg].x_mm;
         const float target_z = target[leg].z_mm;
-        const float start_x = s_leg_command_x_mm[leg];
-        const float start_z = s_leg_command_z_mm[leg];
+        const float start_x = start[leg].x_mm;
+        const float start_z = start[leg].z_mm;
         if ((!isfinite(target_x)) || (!isfinite(target_z)) ||
             (!isfinite(start_x)) || (!isfinite(start_z))) {
             return 0U;
@@ -3915,14 +3918,20 @@ uint8_t dog_foot_motion_start(uint8_t leg_mask,
 {
     leg_mask &= DOG_LEG_MASK_ALL;
     uint32_t generation = 0U;
+    Dog_Foot_Target start[DOG_LEG_COUNT] = {};
     taskENTER_CRITICAL();
     generation = s_foot_motion_generation;
     const uint8_t motion_active =
         (s_foot_motion.state == DOG_FOOT_MOTION_ACTIVE) ? 1U : 0U;
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        start[leg].x_mm = s_leg_command_x_mm[leg];
+        start[leg].z_mm = s_leg_command_z_mm[leg];
+    }
     taskEXIT_CRITICAL();
     if ((duration_ms == 0U) || (timeout_ms < duration_ms) ||
         (motion_active != 0U) || (foot_motion_environment_ready() == 0U) ||
-        (dog_foot_motion_validate(leg_mask, target, clearance_mm) == 0U)) {
+        (dog_foot_motion_path_is_valid(leg_mask, start, target,
+                                       clearance_mm) == 0U)) {
         return 0U;
     }
 
@@ -3944,8 +3953,7 @@ uint8_t dog_foot_motion_start(uint8_t leg_mask,
     s_foot_motion.saturation_since_ms = 0U;
     s_foot_motion.clearance_mm = clearance_mm;
     for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
-        s_foot_motion.start[leg].x_mm = s_leg_command_x_mm[leg];
-        s_foot_motion.start[leg].z_mm = s_leg_command_z_mm[leg];
+        s_foot_motion.start[leg] = start[leg];
         s_foot_motion.target[leg] = target[leg];
     }
     s_foot_motion_generation++;

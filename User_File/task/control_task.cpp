@@ -308,6 +308,22 @@ static void print_obstacle_status(void)
 {
     DogObstacleStatus status = {};
     DogObstacle_GetStatus(&status);
+    if (status.selected == DOG_OBSTACLE_STAIRS) {
+        DebugUart_Printf("OBSTACLE: request=%u selected=%s state=%s fault=%u prepared=%u phase=%s level=%u/%u motion=%u can_exit=%u stair=%ldx%ldmm\r\n",
+                         (unsigned)status.mode_requested,
+                         DogObstacle_TypeName(status.selected),
+                         DogObstacle_StateName(status.state),
+                         (unsigned)status.fault,
+                         (unsigned)status.prepared,
+                         DogObstacle_StairPhaseName(status.phase),
+                         (unsigned)status.completed_levels,
+                         (unsigned)status.total_levels,
+                         (unsigned)status.motion_state,
+                         (unsigned)status.can_exit,
+                         (long)status.step_height_mm,
+                         (long)status.tread_depth_mm);
+        return;
+    }
     DebugUart_Printf("OBSTACLE: request=%u selected=%s state=%s fault=%u prepared=%u cp=%u target=%u gaps=%u motion=%u can_exit=%u gap=%ld/%ldmm\r\n",
                      (unsigned)status.mode_requested,
                      DogObstacle_TypeName(status.selected),
