@@ -111,6 +111,7 @@ uint8_t CDC_Transmit_HS(uint8_t* Buf, uint16_t Len);
 /* USER CODE BEGIN EXPORTED_FUNCTIONS */
 uint8_t CDC_HostIsOpen_HS(void);
 int     CDC_GetByte_HS(void);
+uint32_t CDC_GetRxDropCount_HS(void);
 
 /* USER CODE END EXPORTED_FUNCTIONS */
 
@@ -131,4 +132,3 @@ int     CDC_GetByte_HS(void);
 #endif
 
 #endif /* __USBD_CDC_IF_H__ */
-

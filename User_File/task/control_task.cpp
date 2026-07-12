@@ -5,6 +5,8 @@
 #include "motor_task.h"
 #include "sbus.h"
 #include "tim.h"
+#include "usb_frame_protocol.h"
+#include "usbd_cdc_if.h"
 #include "vofa_pid.h"
 #include "wheel_motor_task.h"
 
@@ -16,6 +18,12 @@
 
 #define DEBUG_LF_STATUS_MS 1000U
 #define STEP_DEG           30.0f
+
+#ifndef USB_CDC_PRODUCTION_INTERFACE
+#define USB_CDC_PRODUCTION_INTERFACE 1
+#endif
+
+#define USB_RC_TIMEOUT_MS      150U
 
 #define SBUS_REMOTE_TIMEOUT_MS 250U
 #define SBUS_FAILSAFE_CONFIRM_MS 100U
@@ -69,6 +77,7 @@ enum SbusRobotMode {
     SBUS_MODE_MOTOR_CHECK,
     SBUS_MODE_LOW_WHEEL,
     SBUS_MODE_LOW_SAFE,
+    SBUS_MODE_USB_IDLE,
     SBUS_MODE_STAND_HOLD,
     SBUS_MODE_STAND_WHEEL,
     SBUS_MODE_STAND_ARM,
@@ -106,6 +115,12 @@ enum SbusLinkState {
     SBUS_LINK_LOST,
 };
 
+enum ControlInputSource {
+    CONTROL_SOURCE_SBUS = 0U,
+    CONTROL_SOURCE_USB,
+    CONTROL_SOURCE_NONE,
+};
+
 struct SbusDriveInput {
     float forward;
     float yaw;
@@ -114,7 +129,9 @@ struct SbusDriveInput {
 
 static ControlMode s_mode = MODE_RX_ONLY;
 static uint8_t s_can_rx_log_enabled = 0U;
+#if !USB_CDC_PRODUCTION_INTERFACE
 static uint32_t s_last_lf_status_ms = 0U;
+#endif
 static uint8_t s_sbus_seen_fresh = 0U;
 static uint8_t s_sbus_switch_valid = 0U;
 static uint8_t s_sbus_main_prev = SBUS_SWITCH_LOW;
@@ -153,6 +170,15 @@ static uint32_t s_sbus_motor_check_last_ms = 0U;
 static uint32_t s_sbus_fault_clear_last_ms = 0U;
 static uint8_t s_sbus_hybrid_wheel_degraded = 0U;
 static uint8_t s_sbus_lowering_pending = 0U;
+static ControlInputSource s_control_source = CONTROL_SOURCE_SBUS;
+static UsbVirtualRcSample s_usb_applied_rc = {};
+static uint8_t s_usb_session_active = 0U;
+static uint8_t s_usb_release_hold = 0U;
+static uint32_t s_usb_session_id = 0U;
+static uint32_t s_usb_last_counter = 0U;
+static uint32_t s_usb_last_generation = 0U;
+static uint32_t s_usb_last_accepted_ms = 0U;
+static uint32_t s_usb_blocked_session_id = 0U;
 
 static const char *sbus_switch_name(uint8_t sw);
 static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc);
@@ -178,6 +204,8 @@ static const char *sbus_block_reason_name(SbusModeBlockReason reason);
 static void sbus_mode_transition(SbusRobotMode requested);
 static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
                            uint8_t changed, uint32_t now);
+static const char *control_source_name(ControlInputSource source);
+static void usb_control_revoke(uint8_t hold);
 
 static void print_wheel_status(void)
 {
@@ -487,6 +515,28 @@ static void print_sbus_status(void)
                      (long)(gait.contact_search_mm[2U] * 1000.0f),
                      (long)(gait.contact_search_mm[3U] * 1000.0f),
                      (unsigned)s_sbus_hybrid_wheel_degraded);
+    UsbFrameProtocolDiag usb_diag = {};
+    UsbVirtualRcSample usb_rc = {};
+    UsbFrameProtocol_GetDiag(&usb_diag);
+    const uint8_t have_usb_rc = UsbFrameProtocol_GetVirtualRc(&usb_rc);
+    const uint32_t usb_age = (have_usb_rc != 0U) ?
+        (uint32_t)(now - usb_rc.received_ms) : 0xFFFFFFFFU;
+    DebugUart_Printf("  USB: source=%s session=%u id=0x%08lX counter=%lu age=%lums rx=%lu ctrl=%lu imu=%lu hdr=%lu crc=%lu reject=%lu seqgap=%lu parse_to=%lu ring_drop=%lu hold=%u\r\n",
+                     control_source_name(s_control_source),
+                     (unsigned)s_usb_session_active,
+                     (unsigned long)s_usb_session_id,
+                     (unsigned long)s_usb_last_counter,
+                     (unsigned long)usb_age,
+                     (unsigned long)usb_diag.rx_bytes,
+                     (unsigned long)usb_diag.valid_control_frames,
+                     (unsigned long)usb_diag.valid_imu_frames,
+                     (unsigned long)usb_diag.header_error_count,
+                     (unsigned long)usb_diag.crc_error_count,
+                     (unsigned long)usb_diag.payload_reject_count,
+                     (unsigned long)usb_diag.sequence_gap_count,
+                     (unsigned long)usb_diag.parser_timeout_count,
+                     (unsigned long)CDC_GetRxDropCount_HS(),
+                     (unsigned)s_usb_release_hold);
     print_wheel_status();
     print_arm_status();
 }
@@ -634,7 +684,8 @@ static uint8_t sbus_mode_is_low(SbusRobotMode mode)
 {
     return ((mode == SBUS_MODE_MOTOR_CHECK) ||
             (mode == SBUS_MODE_LOW_WHEEL) ||
-            (mode == SBUS_MODE_LOW_SAFE)) ? 1U : 0U;
+            (mode == SBUS_MODE_LOW_SAFE) ||
+            (mode == SBUS_MODE_USB_IDLE)) ? 1U : 0U;
 }
 
 static uint8_t sbus_mode_is_mid(SbusRobotMode mode)
@@ -650,6 +701,7 @@ static const char *sbus_robot_mode_name(SbusRobotMode mode)
     case SBUS_MODE_MOTOR_CHECK:   return "MOTOR_CHECK";
     case SBUS_MODE_LOW_WHEEL:     return "LOW_WHEEL";
     case SBUS_MODE_LOW_SAFE:      return "LOW_SAFE";
+    case SBUS_MODE_USB_IDLE:      return "USB_IDLE";
     case SBUS_MODE_STAND_HOLD:    return "STAND_HOLD";
     case SBUS_MODE_STAND_WHEEL:   return "STAND_WHEEL";
     case SBUS_MODE_STAND_ARM:     return "STAND_ARM";
@@ -1357,10 +1409,12 @@ static void sbus_mode_transition(SbusRobotMode requested)
         if (gait_to_gait == 0U) {
             sbus_wheel_hold();
         }
-        if (requested != SBUS_MODE_LOW_WHEEL) {
+        if ((requested != SBUS_MODE_LOW_WHEEL) &&
+            (requested != SBUS_MODE_USB_IDLE)) {
             sbus_mechanical_cancel();
         }
-        if (requested == SBUS_MODE_LOW_SAFE) {
+        if ((requested == SBUS_MODE_LOW_SAFE) ||
+            (requested == SBUS_MODE_USB_IDLE)) {
             sbus_quad_stop_motion_immediate(0U);
             if (s_sbus_lowering_pending == 0U) {
                 dog_debug_rx_only();
@@ -1490,6 +1544,13 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
             s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
             s_sbus_block_reason = SBUS_BLOCK_WHEEL_FAULT;
         }
+        break;
+
+    case SBUS_MODE_USB_IDLE:
+        WheelDrive_SetProfile(WHEEL_PROFILE_NORMAL);
+        sbus_wheel_hold();
+        sbus_mechanical_prepare(rc, now);
+        sbus_mode_set_active(requested);
         break;
 
     case SBUS_MODE_STAND_HOLD:
@@ -1761,6 +1822,198 @@ static void sbus_remote_failsafe(uint32_t now)
     DogRemote_Update(&sample);
 }
 
+static const char *control_source_name(ControlInputSource source)
+{
+    switch (source) {
+    case CONTROL_SOURCE_SBUS: return "SBUS";
+    case CONTROL_SOURCE_USB:  return "USB";
+    default:                  return "NONE";
+    }
+}
+
+static void usb_control_revoke(uint8_t hold)
+{
+    const uint8_t had_usb_control =
+        ((s_usb_session_active != 0U) ||
+         (s_control_source == CONTROL_SOURCE_USB)) ? 1U : 0U;
+    if (s_usb_session_active != 0U) {
+        s_usb_blocked_session_id = s_usb_session_id;
+    }
+    memset(&s_usb_applied_rc, 0, sizeof(s_usb_applied_rc));
+    s_usb_session_active = 0U;
+    s_usb_session_id = 0U;
+    s_usb_last_counter = 0U;
+    s_usb_last_generation = 0U;
+    s_usb_last_accepted_ms = 0U;
+    if (hold == 0U) {
+        s_usb_release_hold = 0U;
+    } else if (had_usb_control != 0U) {
+        s_usb_release_hold = 1U;
+    }
+    s_control_source = (s_usb_release_hold != 0U) ?
+        CONTROL_SOURCE_NONE : CONTROL_SOURCE_SBUS;
+}
+
+static uint8_t usb_counter_is_forward(uint32_t value, uint32_t previous)
+{
+    return ((int32_t)(value - previous) > 0) ? 1U : 0U;
+}
+
+static uint8_t usb_rc_is_safe_zero(const UsbVirtualRcSample *rc)
+{
+    if (rc == nullptr) {
+        return 0U;
+    }
+    return ((rc->main_switch == 0U) && (rc->sub_switch == 0U) &&
+            (rc->command_flags == 0U) &&
+            (rc->yaw_permille == 0) && (rc->forward_permille == 0) &&
+            (rc->speed_permille == -1000) &&
+            (rc->arm_j0_permille == 0) && (rc->arm_j1_permille == 0)) ? 1U : 0U;
+}
+
+static uint8_t usb_physical_authorized(const SbusState *rc,
+                                       uint8_t main_sw, uint8_t sub_sw)
+{
+    if ((rc == nullptr) || (main_sw != SBUS_SWITCH_LOW) ||
+        (sub_sw != SBUS_SWITCH_LOW)) {
+        return 0U;
+    }
+    const uint8_t channels[] = {0U, 1U, SBUS_ARM_J0_CH, SBUS_ARM_J1_CH};
+    for (uint8_t i = 0U; i < (uint8_t)(sizeof(channels) / sizeof(channels[0])); ++i) {
+        const int16_t value = rc->norm[channels[i]];
+        if ((value < -SBUS_MOVE_EXIT_DEADBAND) ||
+            (value > SBUS_MOVE_EXIT_DEADBAND)) {
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
+static uint8_t usb_control_refresh(const SbusState *physical_rc,
+                                   uint8_t physical_main,
+                                   uint8_t physical_sub,
+                                   uint32_t now)
+{
+    if (usb_physical_authorized(physical_rc, physical_main, physical_sub) == 0U) {
+        if ((s_usb_session_active != 0U) || (s_usb_release_hold != 0U)) {
+            usb_control_revoke(0U);
+        }
+        return 0U;
+    }
+
+    UsbVirtualRcSample latest = {};
+    if (UsbFrameProtocol_GetVirtualRc(&latest) == 0U) {
+        return 0U;
+    }
+
+    if (s_usb_session_active == 0U) {
+        if (((uint32_t)(now - latest.received_ms) <= USB_RC_TIMEOUT_MS) &&
+            (latest.session_id != s_usb_blocked_session_id) &&
+            (usb_rc_is_safe_zero(&latest) != 0U)) {
+            s_usb_session_active = 1U;
+            s_usb_release_hold = 0U;
+            s_usb_session_id = latest.session_id;
+            s_usb_last_counter = latest.command_counter;
+            s_usb_last_generation = latest.generation;
+            s_usb_last_accepted_ms = latest.received_ms;
+            s_usb_applied_rc = latest;
+            s_control_source = CONTROL_SOURCE_USB;
+        } else {
+            return 0U;
+        }
+    } else if ((latest.session_id == s_usb_session_id) &&
+               (latest.generation != s_usb_last_generation)) {
+        s_usb_last_generation = latest.generation;
+        if (usb_counter_is_forward(latest.command_counter, s_usb_last_counter) != 0U) {
+            s_usb_last_counter = latest.command_counter;
+            s_usb_last_accepted_ms = latest.received_ms;
+            s_usb_applied_rc = latest;
+        }
+    }
+
+    if ((uint32_t)(now - s_usb_last_accepted_ms) > USB_RC_TIMEOUT_MS) {
+        usb_control_revoke(1U);
+        return 0U;
+    }
+    s_control_source = CONTROL_SOURCE_USB;
+    return 1U;
+}
+
+static int16_t usb_permille_to_norm(int16_t value)
+{
+    const int32_t rounded = (value >= 0) ?
+        ((int32_t)value + 5) / 10 : ((int32_t)value - 5) / 10;
+    return (int16_t)rounded;
+}
+
+static SbusRobotMode usb_decode_robot_mode(uint8_t main_sw, uint8_t sub_sw)
+{
+    const uint8_t mode = (uint8_t)(main_sw * 3U + sub_sw);
+    switch (mode) {
+    case 1U: return SBUS_MODE_LOW_WHEEL;
+    case 2U: return SBUS_MODE_LOW_SAFE;
+    case 3U: return SBUS_MODE_STAND_HOLD;
+    case 4U: return SBUS_MODE_STAND_WHEEL;
+    case 5U: return SBUS_MODE_STAND_ARM;
+    case 6U: return SBUS_MODE_GAIT_ONLY;
+    case 7U: return SBUS_MODE_GAIT_WHEEL;
+    case 8U: return SBUS_MODE_RESERVED_STAND;
+    default: return SBUS_MODE_USB_IDLE;
+    }
+}
+
+static void usb_build_control_view(const SbusState *physical_rc,
+                                   SbusState *control_rc,
+                                   uint8_t *main_sw,
+                                   uint8_t *sub_sw,
+                                   SbusRobotMode *requested_mode,
+                                   uint8_t *virtual_mode)
+{
+    if ((physical_rc == nullptr) || (control_rc == nullptr) ||
+        (main_sw == nullptr) || (sub_sw == nullptr) ||
+        (requested_mode == nullptr) || (virtual_mode == nullptr)) {
+        return;
+    }
+
+    *control_rc = *physical_rc;
+    control_rc->norm[0U] = 0;
+    control_rc->norm[1U] = 0;
+    control_rc->norm[SBUS_SPEED_CH] = -100;
+    control_rc->norm[SBUS_ARM_J0_CH] = 0;
+    control_rc->norm[SBUS_ARM_J1_CH] = 0;
+
+    const uint8_t motion_enable =
+        ((s_usb_applied_rc.command_flags & USB_RC_FLAG_MOTION_ENABLE) != 0U) ? 1U : 0U;
+    const uint8_t deadman =
+        ((s_usb_applied_rc.command_flags & USB_RC_FLAG_DEADMAN_HELD) != 0U) ? 1U : 0U;
+    const uint8_t smooth_stop =
+        ((s_usb_applied_rc.command_flags & USB_RC_FLAG_SMOOTH_STOP) != 0U) ? 1U : 0U;
+
+    if (motion_enable == 0U) {
+        *main_sw = SBUS_SWITCH_LOW;
+        *sub_sw = SBUS_SWITCH_LOW;
+        *virtual_mode = 0U;
+        *requested_mode = SBUS_MODE_USB_IDLE;
+        return;
+    }
+
+    *main_sw = s_usb_applied_rc.main_switch;
+    *sub_sw = s_usb_applied_rc.sub_switch;
+    *virtual_mode = (uint8_t)(*main_sw * 3U + *sub_sw);
+    *requested_mode = usb_decode_robot_mode(*main_sw, *sub_sw);
+    control_rc->norm[SBUS_SPEED_CH] =
+        usb_permille_to_norm(s_usb_applied_rc.speed_permille);
+
+    if ((deadman != 0U) && (smooth_stop == 0U)) {
+        control_rc->norm[0U] = usb_permille_to_norm(s_usb_applied_rc.yaw_permille);
+        control_rc->norm[1U] = usb_permille_to_norm(s_usb_applied_rc.forward_permille);
+        control_rc->norm[SBUS_ARM_J0_CH] =
+            usb_permille_to_norm(s_usb_applied_rc.arm_j0_permille);
+        control_rc->norm[SBUS_ARM_J1_CH] =
+            usb_permille_to_norm(s_usb_applied_rc.arm_j1_permille);
+    }
+}
+
 void control_task_safety_poll(void)
 {
     SbusState rc = {};
@@ -1796,19 +2049,21 @@ void control_task_safety_poll(void)
 
 static void sbus_control_update(void)
 {
-    SbusState rc = {};
+    SbusState physical_rc = {};
     Dog_Remote_Sample sample = {};
     const uint32_t now = HAL_GetTick();
 
     Sbus_Process();
-    (void)Sbus_GetState(&rc);
+    (void)Sbus_GetState(&physical_rc);
 
-    const SbusLinkState link_state = sbus_link_state_update(&rc, now);
+    const SbusLinkState link_state = sbus_link_state_update(&physical_rc, now);
     if (link_state == SBUS_LINK_LOST) {
+        usb_control_revoke(1U);
         sbus_remote_failsafe(now);
         return;
     }
     if (link_state == SBUS_LINK_TRANSIENT) {
+        usb_control_revoke(1U);
         sbus_remote_transient_inhibit(now);
         return;
     }
@@ -1824,26 +2079,22 @@ static void sbus_control_update(void)
         s_sbus_failsafe_stop_sent = 0U;
     }
 
-    const uint8_t main_sw = Sbus_Switch3(SBUS_MAIN_MODE_CH);
-    const uint8_t sub_sw = Sbus_Switch3(SBUS_SUB_MODE_CH);
-    const uint8_t safety_state = sbus_safety_update(&rc);
-    const uint8_t changed = ((s_sbus_switch_valid == 0U) ||
-                             (main_sw != s_sbus_main_prev) ||
-                             (sub_sw != s_sbus_sub_prev)) ? 1U : 0U;
-    const SbusRobotMode requested_mode = sbus_decode_robot_mode(main_sw, sub_sw);
+    const uint8_t physical_main = Sbus_Switch3(SBUS_MAIN_MODE_CH);
+    const uint8_t physical_sub = Sbus_Switch3(SBUS_SUB_MODE_CH);
+    const uint8_t safety_state = sbus_safety_update(&physical_rc);
 
     if (s_sbus_seen_fresh == 0U) {
         DebugUart_Printf("SBUS online main=%s sub=%s.\r\n",
-                         sbus_switch_name(main_sw),
-                         sbus_switch_name(sub_sw));
+                         sbus_switch_name(physical_main),
+                         sbus_switch_name(physical_sub));
     }
     s_sbus_seen_fresh = 1U;
-    sbus_update_speed_profile(&rc, (s_sbus_switch_valid == 0U) ? 1U : 0U);
 
-    sample.mode = (uint8_t)(main_sw * 3U + sub_sw);
+    sample.mode = (uint8_t)(physical_main * 3U + physical_sub);
     sample.tick_ms = now;
 
     if (safety_state != SBUS_SAFETY_RELEASED) {
+        usb_control_revoke(1U);
         if ((safety_state == SBUS_SAFETY_TRIGGER) && (DogSafety_IsLatched() == 0U)) {
             sample.estop_request = 1U;
             DogRemote_Update(&sample);
@@ -1853,13 +2104,14 @@ static void sbus_control_update(void)
         }
         s_sbus_safety_active = 1U;
         s_sbus_safety_recovery_since_ms = 0U;
-        sbus_update_switch_state(main_sw, sub_sw);
+        sbus_update_switch_state(physical_main, physical_sub);
         return;
     }
     DogSafety_SetSdEstop(0U);
     s_sbus_safety_active = 0U;
 
     if ((DogSafety_IsLatched() != 0U) && (s_sbus_safety_needs_clear == 0U)) {
+        usb_control_revoke(1U);
         sbus_arm_leave();
         sbus_quad_reset_state();
         s_sbus_safety_needs_clear = 1U;
@@ -1870,6 +2122,7 @@ static void sbus_control_update(void)
     }
 
     if ((DogStand_IsDisabled() != 0U) && (s_sbus_remote_lockout == 0U)) {
+        usb_control_revoke(1U);
         sbus_arm_leave();
         sbus_quad_reset_state();
         s_sbus_remote_lockout = 1U;
@@ -1878,13 +2131,14 @@ static void sbus_control_update(void)
     }
 
     if (s_sbus_remote_lockout != 0U) {
-        const uint8_t low_low = ((main_sw == SBUS_SWITCH_LOW) &&
-                                 (sub_sw == SBUS_SWITCH_LOW)) ? 1U : 0U;
+        usb_control_revoke(1U);
+        const uint8_t low_low = ((physical_main == SBUS_SWITCH_LOW) &&
+                                 (physical_sub == SBUS_SWITCH_LOW)) ? 1U : 0U;
         const uint8_t sticks_neutral =
-            ((rc.norm[0U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
-             (rc.norm[0U] <= SBUS_MOVE_EXIT_DEADBAND) &&
-             (rc.norm[1U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
-             (rc.norm[1U] <= SBUS_MOVE_EXIT_DEADBAND)) ? 1U : 0U;
+            ((physical_rc.norm[0U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
+             (physical_rc.norm[0U] <= SBUS_MOVE_EXIT_DEADBAND) &&
+             (physical_rc.norm[1U] >= -SBUS_MOVE_EXIT_DEADBAND) &&
+             (physical_rc.norm[1U] <= SBUS_MOVE_EXIT_DEADBAND)) ? 1U : 0U;
         const uint8_t recovery_ready = (s_sbus_safety_needs_clear != 0U) ?
             low_low : sticks_neutral;
         if (recovery_ready != 0U) {
@@ -1894,19 +2148,19 @@ static void sbus_control_update(void)
                 }
                 if ((uint32_t)(now - s_sbus_safety_recovery_since_ms) < SBUS_SAFETY_RECOVERY_MS) {
                     DogRemote_Update(&sample);
-                    sbus_update_switch_state(main_sw, sub_sw);
+                    sbus_update_switch_state(physical_main, physical_sub);
                     return;
                 }
                 if (WheelDrive_TryClearLock() == 0U) {
                     DogRemote_Update(&sample);
-                    sbus_update_switch_state(main_sw, sub_sw);
+                    sbus_update_switch_state(physical_main, physical_sub);
                     return;
                 }
                 (void)DogSafety_RequestRearm();
             }
             if (DogSafety_IsLatched() != 0U) {
                 DogRemote_Update(&sample);
-                sbus_update_switch_state(main_sw, sub_sw);
+                sbus_update_switch_state(physical_main, physical_sub);
                 return;
             }
             if (s_sbus_safety_needs_clear != 0U) {
@@ -1926,15 +2180,46 @@ static void sbus_control_update(void)
                 s_sbus_remote_lockout_logged = 1U;
             }
             DogRemote_Update(&sample);
-            sbus_update_switch_state(main_sw, sub_sw);
+            sbus_update_switch_state(physical_main, physical_sub);
             return;
         }
     }
 
-    sbus_mode_tick(requested_mode, &rc, changed, now);
+    const ControlInputSource previous_source = s_control_source;
+    const uint8_t usb_active = usb_control_refresh(
+        &physical_rc, physical_main, physical_sub, now);
+    if ((usb_active == 0U) && (s_usb_release_hold != 0U) &&
+        (usb_physical_authorized(&physical_rc, physical_main, physical_sub) != 0U)) {
+        s_control_source = CONTROL_SOURCE_NONE;
+        sbus_remote_transient_inhibit(now);
+        sbus_update_switch_state(physical_main, physical_sub);
+        return;
+    }
+
+    SbusState control_rc = physical_rc;
+    uint8_t control_main = physical_main;
+    uint8_t control_sub = physical_sub;
+    uint8_t control_mode = (uint8_t)(physical_main * 3U + physical_sub);
+    SbusRobotMode requested_mode = sbus_decode_robot_mode(physical_main, physical_sub);
+    if (usb_active != 0U) {
+        usb_build_control_view(&physical_rc, &control_rc,
+                               &control_main, &control_sub,
+                               &requested_mode, &control_mode);
+        s_control_source = CONTROL_SOURCE_USB;
+    } else {
+        s_control_source = CONTROL_SOURCE_SBUS;
+    }
+
+    const uint8_t changed = ((s_sbus_switch_valid == 0U) ||
+                             (control_main != s_sbus_main_prev) ||
+                             (control_sub != s_sbus_sub_prev) ||
+                             (previous_source != s_control_source)) ? 1U : 0U;
+    sbus_update_speed_profile(&control_rc, changed);
+    sample.mode = control_mode;
+    sbus_mode_tick(requested_mode, &control_rc, changed, now);
 
     DogRemote_Update(&sample);
-    sbus_update_switch_state(main_sw, sub_sw);
+    sbus_update_switch_state(control_main, control_sub);
 }
 
 static void handle_command(char c)
@@ -2324,8 +2609,36 @@ static void update_target(void)
     (void)s_mode;
 }
 
+static void usb_cdc_process_input(void)
+{
+    const uint32_t now = HAL_GetTick();
+    UsbFrameProtocol_Tick(now);
+
+    int ch;
+    while ((ch = DebugUart_GetByte()) >= 0) {
+        if (UsbFrameProtocol_FeedByte((uint8_t)ch, now) != 0U) {
+            continue;
+        }
+#if USB_CDC_PRODUCTION_INTERFACE
+        if ((ch == 'p') || (ch == 'Y') || (ch == 'y')) {
+            handle_command((char)ch);
+        }
+#else
+        if (VofaPid_IsEnabled() != 0U) {
+            if (VofaPid_FeedRxByte((uint8_t)ch) != 0U) {
+                continue;
+            }
+        }
+        handle_command((char)ch);
+#endif
+    }
+}
+
 static void lf_periodic_status(void)
 {
+#if USB_CDC_PRODUCTION_INTERFACE
+    return;
+#else
     if (VofaPid_IsEnabled() != 0U) {
         return;
     }
@@ -2347,6 +2660,7 @@ static void lf_periodic_status(void)
     }
 
     dog_lf_print_periodic_status();
+#endif
 }
 
 static void control_init_wait(uint32_t timeout_ms, uint8_t stop_when_host_open)
@@ -2366,29 +2680,36 @@ void control_task_init(void)
 {
     VofaPid_Init();
     Sbus_Init();
+    UsbFrameProtocol_Init();
+    s_control_source = CONTROL_SOURCE_SBUS;
+    s_usb_session_active = 0U;
+    s_usb_release_hold = 0U;
+    s_usb_session_id = 0U;
+    s_usb_last_counter = 0U;
+    s_usb_last_generation = 0U;
+    s_usb_last_accepted_ms = 0U;
+    s_usb_blocked_session_id = 0U;
     s_sbus_start_ms = HAL_GetTick();
+
+#if USB_CDC_PRODUCTION_INTERFACE
+    DebugUart_SetLogVerbose(0U);
+    DebugUart_SetCanRxVerbose(0U);
+    s_can_rx_log_enabled = 0U;
+#endif
 
     control_init_wait(1500U, 1U);
     control_init_wait(500U, 0U);
 
+#if !USB_CDC_PRODUCTION_INTERFACE
     print_help();
+#endif
     enter_rx_only();
 }
 
 void control_task(void)
 {
+    usb_cdc_process_input();
     update_target();
-
-    int ch;
-    while ((ch = DebugUart_GetByte()) >= 0) {
-        if (VofaPid_IsEnabled() != 0U) {
-            if (VofaPid_FeedRxByte((uint8_t)ch) != 0U) {
-                continue;
-            }
-        }
-        handle_command((char)ch);
-    }
-
     lf_periodic_status();
 }
 

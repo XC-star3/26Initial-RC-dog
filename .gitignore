@@ -1,6 +1,8 @@
 build/
 cmake-build-debug/
 mx.scratch/
+__pycache__/
+*.py[cod]
 
 # STM32CubeIDE / editor metadata
 .settings/

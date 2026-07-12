@@ -99,10 +99,11 @@ static volatile uint8_t s_cdc_hs_host_open = 0U;
 
 // CDC RX 环形缓冲：CDC_Receive_HS 在 USB ISR 里把收到的字节推进来；
 // 主循环用 CDC_GetByte_HS() 非阻塞取一个字节。满了丢新字节（不阻塞 ISR）。
-#define CDC_RX_RING_SIZE 128U
+#define CDC_RX_RING_SIZE 256U
 static volatile uint8_t  s_cdc_rx_ring[CDC_RX_RING_SIZE];
 static volatile uint32_t s_cdc_rx_head = 0U;
 static volatile uint32_t s_cdc_rx_tail = 0U;
+static volatile uint32_t s_cdc_rx_drop_count = 0U;
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -164,6 +165,9 @@ static int8_t CDC_Init_HS(void)
   /* USER CODE BEGIN 8 */
   /* Set Application Buffers */
   s_cdc_hs_host_open = 0U;
+  s_cdc_rx_head = 0U;
+  s_cdc_rx_tail = 0U;
+  s_cdc_rx_drop_count = 0U;
   USBD_CDC_SetTxBuffer(&hUsbDeviceHS, UserTxBufferHS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceHS, UserRxBufferHS);
   return (USBD_OK);
@@ -284,6 +288,7 @@ static int8_t CDC_Receive_HS(uint8_t* Buf, uint32_t *Len)
   uint32_t tail = s_cdc_rx_tail;
   for (uint32_t i = 0U; i < n; ++i) {
     if ((head - tail) >= CDC_RX_RING_SIZE) {
+      s_cdc_rx_drop_count += (n - i);
       break; // 满：丢弃剩余新字节
     }
     s_cdc_rx_ring[head % CDC_RX_RING_SIZE] = Buf[i];
@@ -361,6 +366,15 @@ int CDC_GetByte_HS(void)
 uint8_t CDC_HostIsOpen_HS(void)
 {
   return s_cdc_hs_host_open;
+}
+
+uint32_t CDC_GetRxDropCount_HS(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  uint32_t drops = s_cdc_rx_drop_count;
+  __set_PRIMASK(primask);
+  return drops;
 }
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */

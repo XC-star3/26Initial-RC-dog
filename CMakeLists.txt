@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/User_File/BSP/CAN/bsp_fdcan.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/RGB/board_rgb.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/debug_uart.cpp
+    ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/usb_frame_protocol.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/vofa_pid.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/system_startup_hooks.c
     ${CMAKE_SOURCE_DIR}/User_File/motor/MWSDK/MWMotor.c
