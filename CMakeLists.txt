@@ -95,3 +95,15 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 if(CMAKE_CXX_COMPILER_LOADED)
     target_link_libraries(${CMAKE_PROJECT_NAME} stdc++ supc++)
 endif()
+
+# STM32Cube Build Analyzer derives the map name from the workspace folder,
+# while the linker names it after the CMake target. Keep both names available.
+get_filename_component(STM32_WORKSPACE_NAME "${CMAKE_SOURCE_DIR}" NAME)
+if(NOT STM32_WORKSPACE_NAME STREQUAL CMAKE_PROJECT_NAME)
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_PROJECT_NAME}.map"
+            "${CMAKE_CURRENT_BINARY_DIR}/${STM32_WORKSPACE_NAME}.map"
+        VERBATIM
+    )
+endif()
