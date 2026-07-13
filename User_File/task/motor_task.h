@@ -113,6 +113,11 @@ extern "C" {
 #define DOG_GAIT_LOW_TOUCHDOWN_STABLE_MS 80U
 #define DOG_GAIT_LOW_TOUCHDOWN_TIMEOUT_MS 500U
 #define DOG_GAIT_LOW_SUPPORT_CURRENT_A   16.0f
+#define DOG_GAIT_SUPPORT_TRANSITION_MS   150U
+#define DOG_GAIT_SOFT_SETTLE_STOP_COUNT    3U
+#define DOG_GAIT_RECOVERY_HALF_STEPS       2U
+#define DOG_GAIT_DEGRADED_SCALE_L1         0.65f
+#define DOG_GAIT_DEGRADED_SCALE_L2         0.40f
 
 #define DOG_TURN_STRIDE_X_MM             30.0f    /* in-place turn step per leg side */
 
@@ -131,6 +136,7 @@ enum Dog_Gait_Phase {
     DOG_GAIT_PHASE_TOUCHDOWN,
     DOG_GAIT_PHASE_STOP_NEUTRAL,
     DOG_GAIT_PHASE_PAUSE,
+    DOG_GAIT_PHASE_SUPPORT_TRANSITION,
 };
 
 struct DogGaitSyncState {
@@ -157,6 +163,8 @@ struct DogGaitSyncState {
     float active_forward_stride_x_mm;
     float active_turn_stride_x_mm;
     float stop_progress;
+    uint8_t requested_speed_profile;
+    uint8_t stability_degrade_level;
 };
 
 enum Dog_Foot_Motion_State {

@@ -20,7 +20,7 @@ extern FDCAN_HandleTypeDef hfdcan2;
 extern FDCAN_HandleTypeDef hfdcan3;
 
 #define ARM_J0_DM_CAN_ID               0x01U
-#define ARM_J0_DM_FEEDBACK_ID          0x10U
+#define ARM_J0_DM_FEEDBACK_ID          0x00U
 #define ARM_J1_EL05_CAN_ID             0x7FU
 #define ARM_J1_EL05_INIT_MODEL_IGNORED 0U
 #define ARM_CMD_PERIOD_MS              5U
@@ -217,6 +217,7 @@ enum Dog_March_Phase {
     DOG_MARCH_PHASE_TOUCHDOWN,
     DOG_MARCH_PHASE_STOP_NEUTRAL,
     DOG_MARCH_PHASE_PAUSE,
+    DOG_MARCH_PHASE_SUPPORT_TRANSITION,
 };
 
 static struct {
@@ -231,6 +232,9 @@ static struct {
     float lift_knee_deg;
     uint8_t trot_stride_applied;
     uint8_t stop_requested;
+    uint8_t stability_degrade_level;
+    uint8_t stable_recovery_half_steps;
+    uint8_t support_transition_pending;
     uint32_t entry_stable_since_ms;
     float contact_iq_baseline_a[DOG_LEG_COUNT];
     float contact_iq_filtered_a[DOG_LEG_COUNT];
@@ -2274,8 +2278,8 @@ static void march_compute_drive_stride_deltas(float forward, float yaw,
 }
 
 static float march_compatible_wheel_rpm(float forward, float yaw,
-                                        float forward_stride_x_mm,
-                                        float turn_stride_x_mm,
+                                         float forward_stride_x_mm,
+                                         float turn_stride_x_mm,
                                         uint32_t swing_ms)
 {
     if (swing_ms == 0U) {
@@ -2288,12 +2292,24 @@ static float march_compatible_wheel_rpm(float forward, float yaw,
     return travel_mm_s * 60.0f / (DOG_PI * DOG_WHEEL_DIAMETER_MM);
 }
 
+static float march_command_degrade_scale(void)
+{
+    if (s_march.stability_degrade_level >= 2U) {
+        return DOG_GAIT_DEGRADED_SCALE_L2;
+    }
+    if (s_march.stability_degrade_level == 1U) {
+        return DOG_GAIT_DEGRADED_SCALE_L1;
+    }
+    return 1.0f;
+}
+
 static void march_snapshot_drive_command(void)
 {
-    s_march.applied_forward = march_slew_command(s_march.applied_forward,
-                                                  s_march.requested_forward);
-    s_march.applied_yaw = march_slew_command(s_march.applied_yaw,
-                                              s_march.requested_yaw);
+    const float degrade_scale = march_command_degrade_scale();
+    s_march.applied_forward = march_slew_command(
+        s_march.applied_forward, s_march.requested_forward * degrade_scale);
+    s_march.applied_yaw = march_slew_command(
+        s_march.applied_yaw, s_march.requested_yaw * degrade_scale);
     s_march.active_forward = s_march.applied_forward;
     s_march.active_yaw = s_march.applied_yaw;
     s_march.active_speed_profile = dog_mit_get_gait_speed_profile();
@@ -4799,6 +4815,45 @@ static void march_touchdown_search_update(uint32_t now)
 
 static void march_begin_stop_neutral(uint32_t now);
 
+static void march_note_stable_touchdown(void)
+{
+    if (s_march.stability_degrade_level == 0U) {
+        s_march.stable_recovery_half_steps = 0U;
+        return;
+    }
+
+    s_march.stable_recovery_half_steps++;
+    if (s_march.stable_recovery_half_steps < DOG_GAIT_RECOVERY_HALF_STEPS) {
+        return;
+    }
+
+    s_march.stable_recovery_half_steps = 0U;
+    s_march.stability_degrade_level--;
+    DebugUart_Printf("Gait stability recovered: degrade=%u scale=%ld/1000.\r\n",
+                     (unsigned)s_march.stability_degrade_level,
+                     (long)(march_command_degrade_scale() * 1000.0f));
+}
+
+static uint8_t march_accept_soft_settle_timeout(uint32_t now, const char *label)
+{
+    s_march.stable_recovery_half_steps = 0U;
+    if (s_march.stability_degrade_level < 0xFFU) {
+        s_march.stability_degrade_level++;
+    }
+    if (s_march.stability_degrade_level >= DOG_GAIT_SOFT_SETTLE_STOP_COUNT) {
+        DebugUart_Printf("%s repeated %u times; stopping neutral.\r\n",
+                         label, (unsigned)s_march.stability_degrade_level);
+        march_begin_stop_neutral(now);
+        return 0U;
+    }
+
+    s_march.support_transition_pending = 1U;
+    DebugUart_Printf("%s; continue degraded=%u scale=%ld/1000 with support transition.\r\n",
+                     label, (unsigned)s_march.stability_degrade_level,
+                     (long)(march_command_degrade_scale() * 1000.0f));
+    return 1U;
+}
+
 static void march_begin_swing_up(uint32_t now)
 {
     uint8_t leg_a = 0U;
@@ -4904,6 +4959,8 @@ static void march_stop_neutral_tick(uint32_t now)
         ((float)elapsed_ms / (float)DOG_GAIT_STOP_NEUTRAL_MS);
     const float progress = smoothstep5_01(raw_progress);
     s_march.stop_progress = progress;
+    s_march.active_forward = s_march.applied_forward * (1.0f - progress);
+    s_march.active_yaw = s_march.applied_yaw * (1.0f - progress);
 
     for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
         const float x_mm = s_march.stop_start_x_mm[leg] * (1.0f - progress);
@@ -4946,6 +5003,27 @@ static void march_advance_step(uint32_t now)
                 DebugUart_Printf("March done.\r\n");
                 return;
             }
+        }
+    }
+
+    if (march_mode_uses_cycloid(s_march.mode) != 0U) {
+        const uint8_t requested_profile = dog_mit_get_gait_speed_profile();
+        if ((s_march.support_transition_pending != 0U) ||
+            (requested_profile != s_march.active_speed_profile)) {
+            const uint8_t previous_profile = s_march.active_speed_profile;
+            const char *previous_name = (previous_profile <= DOG_GAIT_SPEED_HIGH) ?
+                s_gait_speed_profiles[previous_profile].name : "?";
+            const char *requested_name = (requested_profile <= DOG_GAIT_SPEED_HIGH) ?
+                s_gait_speed_profiles[requested_profile].name : "?";
+            s_march.support_transition_pending = 0U;
+            mit_set_all_stand_pid_mode();
+            s_march.phase = DOG_MARCH_PHASE_SUPPORT_TRANSITION;
+            s_march.phase_t0_ms = now;
+            DebugUart_Printf("Gait support transition %lums speed=%s->%s degrade=%u.\r\n",
+                             (unsigned long)DOG_GAIT_SUPPORT_TRANSITION_MS,
+                             previous_name, requested_name,
+                             (unsigned)s_march.stability_degrade_level);
+            return;
         }
     }
 
@@ -5064,20 +5142,38 @@ static void march_in_place_tick(uint32_t now)
                   DOG_GAIT_LOW_TOUCHDOWN_STABLE_MS)) ? 1U : 0U;
             if ((elapsed_ms >= dwell_ms) && (stable_window_ready != 0U) &&
                 ((current_contact != 0U) || (fallback_ready != 0U))) {
+                march_note_stable_touchdown();
                 march_advance_step(now);
             } else if (elapsed_ms >= DOG_GAIT_LOW_TOUCHDOWN_TIMEOUT_MS) {
-                DebugUart_Printf("LOW support settle timeout; stopping at neutral.\r\n");
-                march_begin_stop_neutral(now);
+                if ((support_margin != 0U) &&
+                    ((current_contact != 0U) || (fallback_ready != 0U)) &&
+                    (march_accept_soft_settle_timeout(
+                        now, "LOW support settle timeout") != 0U)) {
+                    march_advance_step(now);
+                } else if (s_march.phase != DOG_MARCH_PHASE_STOP_NEUTRAL) {
+                    DebugUart_Printf("LOW support unsafe: margin=%u contact=%u; stopping neutral.\r\n",
+                                     (unsigned)support_margin,
+                                     (unsigned)current_contact);
+                    march_begin_stop_neutral(now);
+                }
             }
         } else {
             const uint8_t stable = march_swing_legs_stable();
             if ((elapsed_ms >= dwell_ms) && (stable != 0U) &&
                 ((current_contact != 0U) || (fallback_ready != 0U))) {
+                march_note_stable_touchdown();
                 march_advance_step(now);
             } else if (elapsed_ms >= DOG_TROT_TOUCHDOWN_TIMEOUT_MS) {
-                DebugUart_Printf("Trot touchdown timeout pair=%u; stopping neutral.\r\n",
-                                 (unsigned)s_march.leg);
-                march_begin_stop_neutral(now);
+                if ((current_contact != 0U) &&
+                    (march_accept_soft_settle_timeout(
+                        now, "Trot touchdown settle timeout") != 0U)) {
+                    march_advance_step(now);
+                } else if (s_march.phase != DOG_MARCH_PHASE_STOP_NEUTRAL) {
+                    DebugUart_Printf("Trot touchdown unsafe pair=%u contact=%u; stopping neutral.\r\n",
+                                     (unsigned)s_march.leg,
+                                     (unsigned)current_contact);
+                    march_begin_stop_neutral(now);
+                }
             }
         }
         break;
@@ -5114,6 +5210,15 @@ static void march_in_place_tick(uint32_t now)
         if ((uint32_t)(now - s_march.phase_t0_ms) >=
             ((cycloid_gait != 0U) ? DOG_MARCH_LEG_PAUSE_MS : march_walk_leg_pause_ms())) {
             march_advance_step(now);
+        }
+        break;
+
+    case DOG_MARCH_PHASE_SUPPORT_TRANSITION:
+        if (s_march.stop_requested != 0U) {
+            march_begin_stop_neutral(now);
+        } else if ((uint32_t)(now - s_march.phase_t0_ms) >=
+                   DOG_GAIT_SUPPORT_TRANSITION_MS) {
+            march_begin_swing_up(now);
         }
         break;
 
@@ -5251,10 +5356,10 @@ void dog_mit_drive_get_command(float *requested_forward, float *requested_yaw,
         *requested_yaw = s_march.requested_yaw;
     }
     if (applied_forward != nullptr) {
-        *applied_forward = s_march.applied_forward;
+        *applied_forward = s_march.active_forward;
     }
     if (applied_yaw != nullptr) {
-        *applied_yaw = s_march.applied_yaw;
+        *applied_yaw = s_march.active_yaw;
     }
 }
 
@@ -5303,6 +5408,8 @@ void dog_mit_get_gait_sync_state(DogGaitSyncState *state)
     state->active_forward_stride_x_mm = s_march.active_forward_stride_x_mm;
     state->active_turn_stride_x_mm = s_march.active_turn_stride_x_mm;
     state->stop_progress = s_march.stop_progress;
+    state->requested_speed_profile = dog_mit_get_gait_speed_profile();
+    state->stability_degrade_level = s_march.stability_degrade_level;
     taskEXIT_CRITICAL();
 }
 
@@ -7419,7 +7526,7 @@ void motor_task_init(void)
     if (system_can[2] == false) {
         DebugUart_Printf("FDCAN3 init failed: wheel drive locked; leg/arm diagnostics remain available.\r\n");
     }
-    DebugUart_Printf("quadruped SDK debug: CAN1 front+J0_DM=0x01/0x10 CAN2 rear+J1_EL05=0x7F disabled\r\n");
+    DebugUart_Printf("quadruped SDK debug: CAN1 front+J0_DM=0x01 feedback=0x00/0x10 CAN2 rear+J1_EL05=0x7F disabled\r\n");
 }
 
 void motor_task(void)

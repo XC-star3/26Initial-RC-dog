@@ -1,5 +1,6 @@
 #include "arm_motor_task.h"
 
+#include "main.h"
 #include "motor_DM.h"
 #include "motor_LZ.h"
 
@@ -15,6 +16,9 @@ static constexpr uint32_t kFeedbackTimeoutMs = 100U;
 static constexpr uint32_t kPresentTimeoutMs = 1000U;
 static constexpr uint32_t kDiagnosticPeriodMs = 300U;
 static constexpr uint8_t kEl05DeviceIdResponseTarget = 0xFEU;
+static constexpr uint16_t kDm4310CompatibleFeedbackId = 0x10U;
+static constexpr fp32 kJ1MitPositionKp = 1.0f;
+static constexpr fp32 kJ1MitPositionKd = 1.0f;
 
 struct J0PidState {
     ArmMotorPidConfig config;
@@ -314,6 +318,7 @@ void ArmMotor_Init(FDCAN_HandleTypeDef *j0_dm_can,
                    uint8_t j1_lz_model)
 {
     (void)j1_lz_model;
+    ArmMotor_SetPumpEnabled(0U);
 
     s_j0_can = j0_dm_can;
     s_j1_can = j1_lz_can;
@@ -324,6 +329,8 @@ void ArmMotor_Init(FDCAN_HandleTypeDef *j0_dm_can,
     s_j0_dm4310.Init(j0_dm_can, j0_dm_can_id, MOTOR_DM_J4310, Motor_DM_Pos_control);
     s_j1_lz.Init(j1_lz_can, j1_lz_can_id, MOTOR_LZ_EL05, Motor_LZ_Pos_control);
     s_j1_lz.set_master_id(s_j1_ctrl.master_id);
+    s_j1_lz.Set_Kp(kJ1MitPositionKp);
+    s_j1_lz.Set_Kd(kJ1MitPositionKd);
     s_j0_ctrl.enabled = 0U;
     s_j0_ctrl.first_set_angle = 1U;
     s_j1_ctrl.enabled = 0U;
@@ -375,11 +382,19 @@ void ArmMotor_Enable(void)
 
 void ArmMotor_Disable(void)
 {
+    ArmMotor_SetPumpEnabled(0U);
     if (s_initialized == 0U) {
         return;
     }
     j0_disable();
     j1_disable();
+}
+
+void ArmMotor_SetPumpEnabled(uint8_t enable)
+{
+    HAL_GPIO_WritePin(ARM_PUMP_EN_GPIO_Port,
+                      ARM_PUMP_EN_Pin,
+                      (enable != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 void ArmMotor_Zero(uint8_t joint)
@@ -388,9 +403,29 @@ void ArmMotor_Zero(uint8_t joint)
         return;
     }
     if (joint == ARM_J0_DM4310) {
+        s_j0_ctrl.target_angle_deg = 0.0f;
+        s_j0_ctrl.speed_ff_rpm = 0.0f;
+        s_j0_ctrl.torque_ff_nm = 0.0f;
+        s_j0_ctrl.last_torque_cmd_nm = 0.0f;
+        s_j0_ctrl.first_set_angle = 1U;
+        s_feedback[ARM_J0_DM4310].online = 0U;
+        s_feedback[ARM_J0_DM4310].feedback_age_ms = ARM_MOTOR_FEEDBACK_AGE_INVALID;
+        s_status_feedback_seen[ARM_J0_DM4310] = 0U;
+        s_enable_request_ms[ARM_J0_DM4310] = HAL_GetTick();
+        j0_clear_pid();
         s_j0_dm4310.zero();
     } else if (joint == ARM_J1_LZ) {
+        s_j1_ctrl.target_angle_deg = 0.0f;
+        s_j1_ctrl.target_vel_rad_s = 0.0f;
+        s_j1_ctrl.target_torque_nm = 0.0f;
+        s_j1_ctrl.first_set_angle = 1U;
+        s_feedback[ARM_J1_LZ].online = 0U;
+        s_feedback[ARM_J1_LZ].feedback_age_ms = ARM_MOTOR_FEEDBACK_AGE_INVALID;
+        s_status_feedback_seen[ARM_J1_LZ] = 0U;
+        s_enable_request_ms[ARM_J1_LZ] = HAL_GetTick();
         s_j1_lz.zero();
+        s_j1_lz.active_recv(1U);
+        j1_apply_target_to_motor();
     }
 }
 
@@ -637,7 +672,10 @@ uint8_t ArmMotor_OnCanRx(FDCAN_HandleTypeDef *hfdcan, const FDCAN_RxHeaderTypeDe
 
     if ((hfdcan == s_j0_can) && (header->IdType == FDCAN_STANDARD_ID)) {
         const uint8_t feedback_node = (uint8_t)(data[0] & 0x0FU);
-        if ((header->Identifier == s_j0_dm_feedback_id) &&
+        const uint8_t feedback_id_matches =
+            ((header->Identifier == s_j0_dm_feedback_id) ||
+             (header->Identifier == kDm4310CompatibleFeedbackId)) ? 1U : 0U;
+        if ((feedback_id_matches != 0U) &&
             (fdcan_dlc_to_bytes(header->DataLength) == 8U) &&
             (feedback_node == (uint8_t)(s_j0_dm_id & 0x0FU))) {
             s_j0_dm4310.can_recv(data);

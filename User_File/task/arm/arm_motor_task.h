@@ -49,6 +49,7 @@ void ArmMotor_Init(FDCAN_HandleTypeDef *j0_dm_can,
                    uint8_t j1_lz_model);
 void ArmMotor_Enable(void);
 void ArmMotor_Disable(void);
+void ArmMotor_SetPumpEnabled(uint8_t enable);
 void ArmMotor_Zero(uint8_t joint);
 void ArmMotor_SetTargetRad(uint8_t joint, fp32 pos_rad, fp32 vel_rad_s, fp32 torque_nm);
 void ArmMotor_SetTargetDeg(uint8_t joint, fp32 angle_deg, fp32 vel_rad_s, fp32 torque_nm);
