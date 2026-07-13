@@ -49,7 +49,7 @@ extern "C" {
 #define DOG_STAND_RISE_MS               1500U
 #define DOG_STAND_LOWER_SETTLE_MS        200U
 #define DOG_STAND_LOWER_SETTLE_VEL_DPS     8.0f
-#define DOG_LOW_WHEEL_HIP_LIFT_DEG         15.0f
+#define DOG_LOW_WHEEL_HIP_LIFT_DEG       (-15.0f)
 #define DOG_LOW_WHEEL_HIP_LIFT_MS         800U
 #define DOG_JUMP_FOOT_X_MM              DOG_STAND_FOOT_X_MM
 #define DOG_JUMP_APEX_Z_MM              400.0f
