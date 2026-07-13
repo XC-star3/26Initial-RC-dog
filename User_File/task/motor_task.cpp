@@ -10,6 +10,7 @@
 
 #include "FreeRTOS.h"
 #include "semphr.h"
+#include "task.h"
 
 #include <string.h>
 #include <math.h>
@@ -1587,6 +1588,7 @@ static uint8_t motor_blocking_service(uint32_t *now_out)
     control_task_safety_poll();
     fdcan_poll_rx(&hfdcan1);
     fdcan_poll_rx(&hfdcan2);
+    fdcan_poll_rx(&hfdcan3);
 
     const uint32_t now = HAL_GetTick();
     const uint8_t feedback_ok = motor_feedback_health_tick(now);
@@ -4721,6 +4723,23 @@ static uint8_t march_swing_legs_contact_detected(void)
     return ((s_march.contact_mask & s_march.swing_mask) == s_march.swing_mask) ? 1U : 0U;
 }
 
+static uint8_t march_swing_legs_stable(void)
+{
+    uint8_t leg_a = 0U;
+    uint8_t leg_b = DOG_LEG_COUNT;
+    march_get_swing_legs(&leg_a, &leg_b);
+    if (march_leg_joints_stable(leg_a, DOG_TROT_SETTLE_ERR_DEG,
+                                DOG_TROT_TOUCHDOWN_VEL_DPS) == 0U) {
+        return 0U;
+    }
+    if ((leg_b < DOG_LEG_COUNT) &&
+        (march_leg_joints_stable(leg_b, DOG_TROT_SETTLE_ERR_DEG,
+                                 DOG_TROT_TOUCHDOWN_VEL_DPS) == 0U)) {
+        return 0U;
+    }
+    return 1U;
+}
+
 static void march_touchdown_search_update(uint32_t now)
 {
     const uint32_t elapsed_ms = (uint32_t)(now - s_march.phase_t0_ms);
@@ -5025,6 +5044,8 @@ static void march_in_place_tick(uint32_t now)
             break;
         }
         const uint8_t current_contact = march_swing_legs_contact_detected();
+        const uint8_t fallback_ready =
+            (elapsed_ms >= (dwell_ms + DOG_TROT_TOUCHDOWN_FALLBACK_MS)) ? 1U : 0U;
         if (s_march.active_speed_profile == DOG_GAIT_SPEED_LOW) {
             const uint8_t stable = march_all_legs_stable(DOG_GAIT_LOW_TOUCHDOWN_ERR_DEG,
                                                           DOG_GAIT_LOW_TOUCHDOWN_VEL_DPS);
@@ -5042,15 +5063,21 @@ static void march_in_place_tick(uint32_t now)
                  ((uint32_t)(now - s_march.touchdown_stable_since_ms) >=
                   DOG_GAIT_LOW_TOUCHDOWN_STABLE_MS)) ? 1U : 0U;
             if ((elapsed_ms >= dwell_ms) && (stable_window_ready != 0U) &&
-                (current_contact != 0U)) {
+                ((current_contact != 0U) || (fallback_ready != 0U))) {
                 march_advance_step(now);
             } else if (elapsed_ms >= DOG_GAIT_LOW_TOUCHDOWN_TIMEOUT_MS) {
                 DebugUart_Printf("LOW support settle timeout; stopping at neutral.\r\n");
                 march_begin_stop_neutral(now);
             }
         } else {
-            if ((elapsed_ms >= dwell_ms) && (current_contact != 0U)) {
+            const uint8_t stable = march_swing_legs_stable();
+            if ((elapsed_ms >= dwell_ms) && (stable != 0U) &&
+                ((current_contact != 0U) || (fallback_ready != 0U))) {
                 march_advance_step(now);
+            } else if (elapsed_ms >= DOG_TROT_TOUCHDOWN_TIMEOUT_MS) {
+                DebugUart_Printf("Trot touchdown timeout pair=%u; stopping neutral.\r\n",
+                                 (unsigned)s_march.leg);
+                march_begin_stop_neutral(now);
             }
         }
         break;
@@ -6908,10 +6935,12 @@ uint8_t DogStand_EnterMechanicalLimitPose(void)
         return 0U;
     }
 
+    /* Selecting all motors stops the previous debug mode and clears the
+     * mechanical-pose state. Do it before publishing the new request. */
+    dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
     s_mechanical_pose_requested = 1U;
     s_mechanical_pose_ready = 0U;
     s_mechanical_pose_mask = 0U;
-    dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
     if (dog_debug_mit_boot_sequence() != DOG_MOTOR_COUNT) {
         s_mechanical_pose_requested = 0U;
         dog_mit_protect_hold();
@@ -6958,18 +6987,15 @@ uint8_t DogStand_EnterMechanicalLimitPose(void)
         if (raw_progress >= 1.0f) {
             break;
         }
-        HAL_Delay(1U);
+        /* Control_Task has higher priority than CAN_Task and Wheel_Task.
+         * Block for one RTOS tick so both feedback and wheel control remain
+         * alive throughout the 800 ms mechanical-pose transition. */
+        vTaskDelay(pdMS_TO_TICKS(1U));
     }
 
-    if (mit_stand_wait_target_legs_settled(DOG_STAND_MOVE_MS) == 0U) {
-        s_mechanical_pose_requested = 0U;
-        dog_mit_protect_hold();
-        DebugUart_Printf("Mechanical wheel pose FAIL: joint settle timeout.\r\n");
-        return 0U;
-    }
     s_mechanical_pose_mask = 0xFFU;
     s_mechanical_pose_ready = 1U;
-    DebugUart_Printf("Mechanical wheel pose ready: hip=%+ldmdeg knee=hold.\r\n",
+    DebugUart_Printf("Mechanical wheel pose ready: hip=%+ldmdeg knee=stand-PID hold.\r\n",
                      (long)(DOG_LOW_WHEEL_HIP_LIFT_DEG * 1000.0f));
     return 1U;
 }
