@@ -222,8 +222,11 @@ static void print_wheel_status(void)
 {
     WheelDriveDiag diag = {};
     WheelDrive_GetDiag(&diag);
-    DebugUart_Printf("WHEEL: can=%u mode=%u op=%u lock=%u brake=%u hybrid=%u online=%u stopped=%u seen=0x%X profile=%u peak=0x%X therm=0x%X hot=0x%X req=%ld/%ldrpm txfail=%lu busoff=%lu timeout=%lu cmdtimeout=%lu reject=%lu\r\n",
+    DebugUart_Printf("WHEEL: can=%u ready=%u config=%u baud=%lu mode=%u op=%u lock=%u brake=%u hybrid=%u online=%u stopped=%u seen=0x%X profile=%u peak=0x%X therm=0x%X hot=0x%X req=%ld/%ldrpm txfail=%lu busoff=%lu timeout=%lu cmdtimeout=%lu reject=%lu\r\n",
+                     (unsigned)diag.can_bus,
                      (unsigned)diag.can_ready,
+                     (unsigned)diag.can_config_valid,
+                     (unsigned long)diag.nominal_baud,
                      (unsigned)diag.mode_enabled,
                      (unsigned)diag.operating_mode,
                      (unsigned)diag.locked,

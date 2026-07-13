@@ -35,7 +35,9 @@ typedef struct WheelMotorFeedback {
 } WheelMotorFeedback;
 
 typedef struct WheelDriveDiag {
+    uint8_t can_bus;
     uint8_t can_ready;
+    uint8_t can_config_valid;
     uint8_t mode_enabled;
     uint8_t locked;
     uint8_t all_online;
@@ -63,6 +65,7 @@ typedef struct WheelDriveDiag {
     uint32_t feedback_timeout_count;
     uint32_t command_timeout_count;
     uint32_t rx_reject_count;
+    uint32_t nominal_baud;
     WheelMotorFeedback motor[WHEEL_MOTOR_COUNT];
 } WheelDriveDiag;
 

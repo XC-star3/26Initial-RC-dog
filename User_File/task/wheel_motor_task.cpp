@@ -12,6 +12,11 @@
 #define WHEEL_CAN_CONTROL_ID             0x200U
 #define WHEEL_CAN_FEEDBACK_FIRST_ID      0x201U
 #define WHEEL_CAN_FEEDBACK_LAST_ID       0x204U
+#define WHEEL_CAN_NOMINAL_BAUD            1000000UL
+#define WHEEL_CAN_NOMINAL_PRESCALER       4U
+#define WHEEL_CAN_NOMINAL_SYNC_JUMP       8U
+#define WHEEL_CAN_NOMINAL_TIME_SEG1       31U
+#define WHEEL_CAN_NOMINAL_TIME_SEG2       8U
 #define WHEEL_ENCODER_COUNTS             8192
 #define WHEEL_ENCODER_HALF_COUNTS        (WHEEL_ENCODER_COUNTS / 2)
 #define WHEEL_GEAR_RATIO                 (268.0f / 17.0f)
@@ -73,6 +78,7 @@ static volatile uint8_t s_mode_enabled = 0U;
 static volatile WheelDriveOperatingMode s_operating_mode = WHEEL_OPERATING_OFF;
 static volatile uint8_t s_locked = 0U;
 static volatile uint8_t s_can_ready = 0U;
+static volatile uint8_t s_can_config_valid = 0U;
 static volatile uint8_t s_reset_pending = 0U;
 static volatile uint8_t s_zero_pending = 0U;
 static volatile uint32_t s_state_generation = 0U;
@@ -101,6 +107,31 @@ static uint8_t feedback_lock(void)
         return 0U;
     }
     return (xSemaphoreTake(s_feedback_mutex, portMAX_DELAY) == pdTRUE) ? 1U : 0U;
+}
+
+static uint8_t wheel_can_bus_number(const FDCAN_HandleTypeDef *hfdcan)
+{
+    if (hfdcan == nullptr) {
+        return 0U;
+    }
+    if (hfdcan->Instance == FDCAN1) {
+        return 1U;
+    }
+    if (hfdcan->Instance == FDCAN2) {
+        return 2U;
+    }
+    return (hfdcan->Instance == FDCAN3) ? 3U : 0U;
+}
+
+static uint8_t wheel_can_config_valid(const FDCAN_HandleTypeDef *hfdcan)
+{
+    return ((wheel_can_bus_number(hfdcan) == 3U) &&
+            (hfdcan->Init.FrameFormat == FDCAN_FRAME_CLASSIC) &&
+            (hfdcan->Init.Mode == FDCAN_MODE_NORMAL) &&
+            (hfdcan->Init.NominalPrescaler == WHEEL_CAN_NOMINAL_PRESCALER) &&
+            (hfdcan->Init.NominalSyncJumpWidth == WHEEL_CAN_NOMINAL_SYNC_JUMP) &&
+            (hfdcan->Init.NominalTimeSeg1 == WHEEL_CAN_NOMINAL_TIME_SEG1) &&
+            (hfdcan->Init.NominalTimeSeg2 == WHEEL_CAN_NOMINAL_TIME_SEG2)) ? 1U : 0U;
 }
 
 static void feedback_unlock(void)
@@ -304,8 +335,9 @@ void WheelDrive_Init(FDCAN_HandleTypeDef *hfdcan)
     s_command_timeout_count = 0U;
     s_rx_reject_count = 0U;
     s_last_command_ms = s_init_ms;
-    s_can_ready = ((hfdcan != nullptr) && (hfdcan->Instance == FDCAN3) &&
-                   system_can[2] && (s_feedback_mutex != nullptr)) ? 1U : 0U;
+    s_can_config_valid = wheel_can_config_valid(hfdcan);
+    s_can_ready = ((s_can_config_valid != 0U) && system_can[2] &&
+                   (s_feedback_mutex != nullptr)) ? 1U : 0U;
     s_locked = (s_can_ready != 0U) ? 0U : 1U;
     s_zero_pending = (s_can_ready != 0U) ? 1U : 0U;
 }
@@ -617,7 +649,7 @@ static void service_bus(uint32_t now_ms)
         }
     } else {
         if (s_bus_off_active != 0U) {
-            s_can_ready = 1U;
+            s_can_ready = s_can_config_valid;
             s_zero_pending = 1U;
             s_next_tx_attempt_ms = now_ms;
         }
@@ -825,7 +857,9 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
         return;
     }
     memset(diag, 0, sizeof(*diag));
+    diag->can_bus = wheel_can_bus_number(s_can);
     diag->can_ready = s_can_ready;
+    diag->can_config_valid = s_can_config_valid;
     diag->mode_enabled = s_mode_enabled;
     diag->locked = s_locked;
     diag->all_online = WheelDrive_AllOnline();
@@ -844,6 +878,7 @@ void WheelDrive_GetDiag(WheelDriveDiag *diag)
     diag->feedback_timeout_count = s_feedback_timeout_count;
     diag->command_timeout_count = s_command_timeout_count;
     diag->rx_reject_count = s_rx_reject_count;
+    diag->nominal_baud = WHEEL_CAN_NOMINAL_BAUD;
     if (feedback_lock() != 0U) {
         diag->feedback_seen_mask = s_feedback_seen_mask;
         memcpy(diag->motor, s_feedback, sizeof(s_feedback));
