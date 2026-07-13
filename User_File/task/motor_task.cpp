@@ -84,7 +84,7 @@ extern FDCAN_HandleTypeDef hfdcan3;
 #define DOG_TRAJ_INERTIA          0.0f
 
 #define DOG_STAND_KP_A_PER_DEG          1.7f
-#define DOG_STAND_KI_A_PER_DEG_S        0.00f
+#define DOG_STAND_KI_A_PER_DEG_S        0.15f
 #define DOG_STAND_KD_A_PER_DPS          0.017f
 #define DOG_STAND_OUTPUT_LIMIT_A        18.0f
 #define DOG_MIT_ANG_PID_INTEGRAL_LIMIT_A 3.0f
@@ -218,6 +218,12 @@ enum Dog_March_Phase {
     DOG_MARCH_PHASE_STOP_NEUTRAL,
     DOG_MARCH_PHASE_PAUSE,
     DOG_MARCH_PHASE_SUPPORT_TRANSITION,
+};
+
+enum Dog_Stand_Settle_Result {
+    DOG_STAND_SETTLE_INTERRUPTED = 0U,
+    DOG_STAND_SETTLE_REACHED,
+    DOG_STAND_SETTLE_TIMEOUT,
 };
 
 static struct {
@@ -3370,14 +3376,29 @@ static uint8_t mit_stand_wait_target_legs_settled(uint32_t timeout_ms)
         }
 
         if (all_settled != 0U) {
-            return 1U;
+            return DOG_STAND_SETTLE_REACHED;
         }
-        HAL_Delay(5U);
+        vTaskDelay(pdMS_TO_TICKS(5U));
     }
 
-    DebugUart_Printf("Stand settle timeout err>%ldmdeg\r\n",
+    DebugUart_Printf("Stand settle pending err>%ldmdeg; continuing closed-loop target.\r\n",
                      (long)(DOG_STAND_JOINT_SETTLE_ERR_DEG * 1000.0f));
-    return 0U;
+    return DOG_STAND_SETTLE_TIMEOUT;
+}
+
+uint8_t dog_mit_stand_pose_is_settled(void)
+{
+    if ((dog_mit_debug_is_active() == 0U) ||
+        (dog_mit_fault_hold_is_active() != 0U) ||
+        (s_debug_target != DOG_DEBUG_TARGET_ALL)) {
+        return 0U;
+    }
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if (march_leg_joints_settled(leg, DOG_STAND_JOINT_SETTLE_ERR_DEG) == 0U) {
+            return 0U;
+        }
+    }
+    return 1U;
 }
 
 static uint8_t mit_stand_rise_interpolate(void)
@@ -3435,7 +3456,7 @@ static uint8_t mit_stand_rise_interpolate(void)
         if (progress >= 1.0f) {
             break;
         }
-        HAL_Delay(1U);
+        vTaskDelay(pdMS_TO_TICKS(1U));
     }
 
     return mit_stand_wait_target_legs_settled(DOG_STAND_MOVE_MS);
@@ -3637,7 +3658,8 @@ static uint8_t mit_jump_test_move(void)
     }
 
     s_jump_active = 0U;
-    return mit_stand_wait_target_legs_settled(DOG_JUMP_SETTLE_MS);
+    return (mit_stand_wait_target_legs_settled(DOG_JUMP_SETTLE_MS) ==
+            DOG_STAND_SETTLE_REACHED) ? 1U : 0U;
 }
 
 static uint8_t march_all_motors_booted(void)
@@ -4018,8 +4040,11 @@ static uint8_t foot_motion_runtime_guard(uint32_t generation, uint8_t moving_leg
 
     uint8_t saturated = 0U;
     for (uint8_t motor = 0U; motor < DOG_MOTOR_COUNT; ++motor) {
-        if ((!isfinite(s_mit_cmd_current_a[motor])) ||
-            (fabsf(s_mit_cmd_current_a[motor]) >= DOG_FOOT_MOTION_SATURATION_A)) {
+        const float cmd_current_a = s_mit_cmd_current_a[motor];
+        const float iq_current_a = g_mw_motor_data[motor].iq.iqMeasured;
+        if ((!isfinite(cmd_current_a)) || (!isfinite(iq_current_a)) ||
+            (fabsf(cmd_current_a) >= DOG_FOOT_MOTION_SATURATION_A) ||
+            (fabsf(iq_current_a) >= DOG_FOOT_MOTION_SATURATION_A)) {
             saturated = 1U;
         }
     }

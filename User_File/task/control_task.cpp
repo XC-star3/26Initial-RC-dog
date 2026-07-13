@@ -32,6 +32,7 @@
 #define SBUS_SPEED_CH          2U
 #define SBUS_MAIN_MODE_CH      4U
 #define SBUS_SUB_MODE_CH       7U
+#define SBUS_OBSTACLE_STEP_CH  9U
 #define SBUS_ARM_J0_CH         5U
 #define SBUS_ARM_J1_CH         6U
 #define SBUS_ARM_UPDATE_MS     20U
@@ -51,8 +52,10 @@
 #define SBUS_SPEED_LOW_NORM    (-60)
 #define SBUS_SPEED_HIGH_NORM   60
 #define SBUS_SAFETY_CH         8U
+#define SBUS_OBSTACLE_ROLLBACK_NORM (-95)
 #define SBUS_SAFETY_HIGH_NORM  50
 #define SBUS_SAFETY_RELEASE_NORM 20
+#define SBUS_OBSTACLE_STEP_STABLE_FRAMES 3U
 #define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
 #define SBUS_FAULT_CLEAR_RETRY_MS 1000U
@@ -190,8 +193,14 @@ static uint32_t s_sbus_motor_check_last_ms = 0U;
 static uint32_t s_sbus_fault_clear_last_ms = 0U;
 static uint8_t s_sbus_hybrid_wheel_degraded = 0U;
 static uint8_t s_sbus_lowering_pending = 0U;
-static int8_t s_sbus_obstacle_stick_latch = 0;
-static uint8_t s_sbus_obstacle_stick_armed = 0U;
+static uint8_t s_sbus_obstacle_step_switch_seen = 0U;
+static uint8_t s_sbus_obstacle_step_switch_state = 0U;
+static uint8_t s_sbus_obstacle_step_candidate_state = 0U;
+static uint8_t s_sbus_obstacle_step_candidate_frames = 0U;
+static uint32_t s_sbus_obstacle_step_last_frame = 0U;
+static uint8_t s_sbus_obstacle_fault_seen = 0U;
+static uint8_t s_sbus_obstacle_rollback_armed = 0U;
+static uint8_t s_sbus_obstacle_rollback_sent = 0U;
 static uint32_t s_sbus_obstacle_wheel_stopped_since_ms = 0U;
 static uint8_t s_sbus_obstacle_started = 0U;
 static uint8_t s_sbus_obstacle_wheel_violation = 0U;
@@ -1219,31 +1228,80 @@ static uint8_t sbus_obstacle_selection_from_ch3(const SbusState *rc)
     return DOG_OBSTACLE_STAIRS;
 }
 
-static void sbus_obstacle_step_input(const SbusState *rc)
+static void sbus_obstacle_input_reset(void)
 {
-    if (rc == nullptr) {
+    s_sbus_obstacle_step_switch_seen = 0U;
+    s_sbus_obstacle_step_switch_state = 0U;
+    s_sbus_obstacle_step_candidate_state = 0U;
+    s_sbus_obstacle_step_candidate_frames = 0U;
+    s_sbus_obstacle_step_last_frame = 0U;
+    s_sbus_obstacle_fault_seen = 0U;
+    s_sbus_obstacle_rollback_armed = 0U;
+    s_sbus_obstacle_rollback_sent = 0U;
+}
+
+static void sbus_obstacle_step_input(const SbusState *rc,
+                                     const DogObstacleStatus *obstacle)
+{
+    if ((rc == nullptr) || (obstacle == nullptr)) {
         return;
     }
-    const int16_t forward = rc->norm[1U];
-    if (s_sbus_obstacle_stick_armed == 0U) {
-        if ((forward >= -SBUS_MOVE_EXIT_DEADBAND) &&
-            (forward <= SBUS_MOVE_EXIT_DEADBAND)) {
-            s_sbus_obstacle_stick_armed = 1U;
-            s_sbus_obstacle_stick_latch = 0;
+
+    if (rc->frame_count != s_sbus_obstacle_step_last_frame) {
+        s_sbus_obstacle_step_last_frame = rc->frame_count;
+        const uint8_t step_switch_state =
+            (rc->norm[SBUS_OBSTACLE_STEP_CH] >= 0) ? 1U : 0U;
+        if (s_sbus_obstacle_step_switch_seen == 0U) {
+            s_sbus_obstacle_step_switch_seen = 1U;
+            s_sbus_obstacle_step_switch_state = step_switch_state;
+            s_sbus_obstacle_step_candidate_state = step_switch_state;
+            s_sbus_obstacle_step_candidate_frames = 0U;
+        } else if (step_switch_state == s_sbus_obstacle_step_switch_state) {
+            s_sbus_obstacle_step_candidate_state = step_switch_state;
+            s_sbus_obstacle_step_candidate_frames = 0U;
+        } else {
+            if (step_switch_state != s_sbus_obstacle_step_candidate_state) {
+                s_sbus_obstacle_step_candidate_state = step_switch_state;
+                s_sbus_obstacle_step_candidate_frames = 1U;
+            } else if (s_sbus_obstacle_step_candidate_frames <
+                       SBUS_OBSTACLE_STEP_STABLE_FRAMES) {
+                s_sbus_obstacle_step_candidate_frames++;
+            }
+            if (s_sbus_obstacle_step_candidate_frames >=
+                SBUS_OBSTACLE_STEP_STABLE_FRAMES) {
+                s_sbus_obstacle_step_switch_state = step_switch_state;
+                s_sbus_obstacle_step_candidate_frames = 0U;
+                if (obstacle->state == DOG_OBSTACLE_READY) {
+                    DogObstacle_RequestStep(1);
+                }
+            }
         }
+    }
+
+    const int16_t forward = rc->norm[1U];
+    if (obstacle->state != DOG_OBSTACLE_FAULT) {
+        s_sbus_obstacle_fault_seen = 0U;
+        s_sbus_obstacle_rollback_armed = 0U;
+        s_sbus_obstacle_rollback_sent = 0U;
         return;
     }
-    if ((forward >= SBUS_MOVE_ENTER_DEADBAND) &&
-        (s_sbus_obstacle_stick_latch == 0)) {
-        s_sbus_obstacle_stick_latch = 1;
-        DogObstacle_RequestStep(1);
-    } else if ((forward <= -SBUS_MOVE_ENTER_DEADBAND) &&
-               (s_sbus_obstacle_stick_latch == 0)) {
-        s_sbus_obstacle_stick_latch = -1;
+    if (s_sbus_obstacle_fault_seen == 0U) {
+        s_sbus_obstacle_fault_seen = 1U;
+        s_sbus_obstacle_rollback_armed = 0U;
+        s_sbus_obstacle_rollback_sent = 0U;
+        return;
+    }
+
+    if ((forward >= -SBUS_MOVE_EXIT_DEADBAND) &&
+        (forward <= SBUS_MOVE_EXIT_DEADBAND) &&
+        (s_sbus_obstacle_rollback_sent == 0U)) {
+        s_sbus_obstacle_rollback_armed = 1U;
+    } else if ((forward <= SBUS_OBSTACLE_ROLLBACK_NORM) &&
+               (s_sbus_obstacle_rollback_armed != 0U) &&
+               (s_sbus_obstacle_rollback_sent == 0U)) {
+        s_sbus_obstacle_rollback_armed = 0U;
+        s_sbus_obstacle_rollback_sent = 1U;
         DogObstacle_RequestStep(-1);
-    } else if ((forward >= -SBUS_MOVE_EXIT_DEADBAND) &&
-               (forward <= SBUS_MOVE_EXIT_DEADBAND)) {
-        s_sbus_obstacle_stick_latch = 0;
     }
 }
 
@@ -1308,6 +1366,13 @@ static uint8_t sbus_quad_ensure_stand(uint32_t now)
         (dog_mit_debug_is_active() != 0U) &&
         (dog_mit_fault_hold_is_active() == 0U) &&
         (dog_debug_target() == DOG_DEBUG_TARGET_ALL)) {
+        if (dog_mit_stand_pose_is_settled() == 0U) {
+            return 0U;
+        }
+        if (s_sbus_quad_standing == 1U) {
+            s_sbus_quad_standing = 2U;
+            DebugUart_Printf("SBUS stand settled; requested mode may continue.\r\n");
+        }
         return 1U;
     }
 
@@ -1344,10 +1409,17 @@ static uint8_t sbus_quad_ensure_stand(uint32_t now)
     s_sbus_quad_standing = 1U;
     s_sbus_quad_cmd = SBUS_QUAD_STOP;
     s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
-    DebugUart_Printf("SBUS stand OK %u/%u.\r\n",
+    if (dog_mit_stand_pose_is_settled() != 0U) {
+        s_sbus_quad_standing = 2U;
+        DebugUart_Printf("SBUS stand OK %u/%u.\r\n",
+                         (unsigned)ok,
+                         (unsigned)dog_debug_target_count());
+        return 1U;
+    }
+    DebugUart_Printf("SBUS stand control active %u/%u; waiting for loaded pose to settle.\r\n",
                      (unsigned)ok,
                      (unsigned)dog_debug_target_count());
-    return 1U;
+    return 0U;
 }
 
 static float sbus_axis_to_drive(int16_t value)
@@ -1526,8 +1598,7 @@ static void sbus_mode_transition(SbusRobotMode requested)
     s_sbus_entry_state = SBUS_ENTRY_ENTERING;
     s_sbus_block_reason = SBUS_BLOCK_NONE;
     s_sbus_motor_check_last_ms = 0U;
-    s_sbus_obstacle_stick_latch = 0;
-    s_sbus_obstacle_stick_armed = 0U;
+    sbus_obstacle_input_reset();
     s_sbus_obstacle_wheel_stopped_since_ms = 0U;
     s_sbus_obstacle_started = 0U;
     s_sbus_obstacle_wheel_violation = 0U;
@@ -1785,10 +1856,10 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
         DogObstacle_Select(sbus_obstacle_selection_from_ch3(rc));
         DogObstacle_SetModeRequested(1U);
         s_sbus_obstacle_started = 1U;
-        sbus_obstacle_step_input(rc);
 
         DogObstacleStatus obstacle = {};
         DogObstacle_GetStatus(&obstacle);
+        sbus_obstacle_step_input(rc, &obstacle);
         if ((obstacle.state == DOG_OBSTACLE_FAULT) ||
             (obstacle.state == DOG_OBSTACLE_UNAVAILABLE)) {
             if ((obstacle.state == DOG_OBSTACLE_FAULT) &&
@@ -2608,7 +2679,9 @@ static void handle_command(char c)
             }
         } else {
             s_mode = MODE_MIT_DEBUG;
-            DebugUart_Printf("Stand OK %u/%u: foot IK front (%ld,%ld)->(%ld,%ld) rear (%ld,%ld)->(%ld,%ld)mm target=%s\r\n",
+            DebugUart_Printf((dog_mit_stand_pose_is_settled() != 0U) ?
+                             "Stand OK %u/%u: foot IK front (%ld,%ld)->(%ld,%ld) rear (%ld,%ld)->(%ld,%ld)mm target=%s\r\n" :
+                             "Stand control active %u/%u (loaded pose still settling): foot IK front (%ld,%ld)->(%ld,%ld) rear (%ld,%ld)->(%ld,%ld)mm target=%s\r\n",
                              (unsigned)ok,
                              (unsigned)dog_debug_target_count(),
                              (long)DOG_STAND_FOOT_X_MM,
