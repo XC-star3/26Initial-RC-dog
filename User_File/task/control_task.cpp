@@ -1366,13 +1366,6 @@ static uint8_t sbus_quad_ensure_stand(uint32_t now)
         (dog_mit_debug_is_active() != 0U) &&
         (dog_mit_fault_hold_is_active() == 0U) &&
         (dog_debug_target() == DOG_DEBUG_TARGET_ALL)) {
-        if (dog_mit_stand_pose_is_settled() == 0U) {
-            return 0U;
-        }
-        if (s_sbus_quad_standing == 1U) {
-            s_sbus_quad_standing = 2U;
-            DebugUart_Printf("SBUS stand settled; requested mode may continue.\r\n");
-        }
         return 1U;
     }
 
@@ -1409,17 +1402,10 @@ static uint8_t sbus_quad_ensure_stand(uint32_t now)
     s_sbus_quad_standing = 1U;
     s_sbus_quad_cmd = SBUS_QUAD_STOP;
     s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
-    if (dog_mit_stand_pose_is_settled() != 0U) {
-        s_sbus_quad_standing = 2U;
-        DebugUart_Printf("SBUS stand OK %u/%u.\r\n",
-                         (unsigned)ok,
-                         (unsigned)dog_debug_target_count());
-        return 1U;
-    }
-    DebugUart_Printf("SBUS stand control active %u/%u; waiting for loaded pose to settle.\r\n",
+    DebugUart_Printf("SBUS stand OK %u/%u.\r\n",
                      (unsigned)ok,
                      (unsigned)dog_debug_target_count());
-    return 0U;
+    return 1U;
 }
 
 static float sbus_axis_to_drive(int16_t value)
@@ -2679,9 +2665,7 @@ static void handle_command(char c)
             }
         } else {
             s_mode = MODE_MIT_DEBUG;
-            DebugUart_Printf((dog_mit_stand_pose_is_settled() != 0U) ?
-                             "Stand OK %u/%u: foot IK front (%ld,%ld)->(%ld,%ld) rear (%ld,%ld)->(%ld,%ld)mm target=%s\r\n" :
-                             "Stand control active %u/%u (loaded pose still settling): foot IK front (%ld,%ld)->(%ld,%ld) rear (%ld,%ld)->(%ld,%ld)mm target=%s\r\n",
+            DebugUart_Printf("Stand OK %u/%u: foot IK front (%ld,%ld)->(%ld,%ld) rear (%ld,%ld)->(%ld,%ld)mm target=%s\r\n",
                              (unsigned)ok,
                              (unsigned)dog_debug_target_count(),
                              (long)DOG_STAND_FOOT_X_MM,
