@@ -375,7 +375,7 @@ static void print_help(void)
     DebugUart_Printf("  2 : target selected leg hip+knee\r\n");
     DebugUart_Printf("  3 : target front pair LF+RF\r\n");
     DebugUart_Printf("  4 : target rear pair LB+RB\r\n");
-    DebugUart_Printf("  8 : target all 8 motors\r\n");
+    DebugUart_Printf("  8 : target all enabled leg motors (disabled mask excluded)\r\n");
     DebugUart_Printf("  r : RX-only, no control TX\r\n");
     DebugUart_Printf("  e : clear errors on active target\r\n");
     DebugUart_Printf("  m : set trapezoidal position mode (Control=3 Input=5)\r\n");
@@ -2575,7 +2575,7 @@ static void handle_command(char c)
             if ((s_sbus_remote_lockout != 0U) || (s_sbus_seen_fresh != 0U)) {
                 DebugUart_Printf("Safety re-arm requires fresh SBUS with main LOW.\r\n");
             } else if (DogSafety_RequestRearm() != 0U) {
-                DebugUart_Printf("Leg safety re-arm requested; wait for all 8 leg motors idle/fault-free. Wheel lock clears independently.\r\n");
+                DebugUart_Printf("Leg safety re-arm requested; wait for all enabled leg motors idle/fault-free. Wheel lock clears independently.\r\n");
             } else {
                 DebugUart_Printf("Safety re-arm blocked by active CH9 inhibit.\r\n");
             }
@@ -2737,7 +2737,7 @@ static void handle_command(char c)
             break;
         }
         if (dog_debug_target() != DOG_DEBUG_TARGET_ALL) {
-            DebugUart_Printf("Send '8' to target all 8 motors before march.\r\n");
+            DebugUart_Printf("Send '8' to target all enabled leg motors before march.\r\n");
             break;
         }
         if (dog_mit_march_in_place_is_active() != 0U) {
@@ -2748,7 +2748,7 @@ static void handle_command(char c)
 
         uint8_t ok = dog_mit_march_in_place_start(0U);
         if (ok == 0U) {
-            DebugUart_Printf("March FAIL: need all 8 online/booted, no fault-hold.\r\n");
+            DebugUart_Printf("March FAIL: need all enabled motors online/booted, no fault-hold.\r\n");
         } else {
             s_mode = MODE_MIT_DEBUG;
         }
@@ -2777,7 +2777,7 @@ static void handle_command(char c)
             break;
         }
         if (dog_debug_target() != DOG_DEBUG_TARGET_ALL) {
-            DebugUart_Printf("Send '8' to target all 8 motors before turn.\r\n");
+            DebugUart_Printf("Send '8' to target all enabled leg motors before turn.\r\n");
             break;
         }
         if (dog_mit_march_in_place_is_active() != 0U) {
@@ -2800,7 +2800,7 @@ static void handle_command(char c)
             break;
         }
         if (dog_debug_target() != DOG_DEBUG_TARGET_ALL) {
-            DebugUart_Printf("Send '8' to target all 8 motors before turn.\r\n");
+            DebugUart_Printf("Send '8' to target all enabled leg motors before turn.\r\n");
             break;
         }
         if (dog_mit_march_in_place_is_active() != 0U) {
@@ -2823,7 +2823,7 @@ static void handle_command(char c)
             break;
         }
         if (dog_debug_target() != DOG_DEBUG_TARGET_ALL) {
-            DebugUart_Printf("Send '8' to target all 8 motors before trot.\r\n");
+            DebugUart_Printf("Send '8' to target all enabled leg motors before trot.\r\n");
             break;
         }
         if (dog_mit_march_in_place_is_active() != 0U) {
@@ -2846,7 +2846,7 @@ static void handle_command(char c)
             break;
         }
         if (dog_debug_target() != DOG_DEBUG_TARGET_ALL) {
-            DebugUart_Printf("Send '8' to target all 8 motors before diag support.\r\n");
+            DebugUart_Printf("Send '8' to target all enabled leg motors before diag support.\r\n");
             break;
         }
         if (dog_mit_diag_support_is_active() != 0U) {
@@ -2857,7 +2857,7 @@ static void handle_command(char c)
 
         uint8_t ok = dog_mit_diag_support_lf_rb_start();
         if (ok == 0U) {
-            DebugUart_Printf("Diag FAIL: need all 8 online/booted, no fault-hold.\r\n");
+            DebugUart_Printf("Diag FAIL: need all enabled motors online/booted, no fault-hold.\r\n");
         } else {
             s_mode = MODE_MIT_DEBUG;
         }

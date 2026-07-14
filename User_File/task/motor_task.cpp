@@ -563,6 +563,28 @@ static uint8_t motor_safety_token_guard_take(uint32_t generation)
     return 1U;
 }
 
+static uint8_t motor_is_disabled(uint8_t index)
+{
+    return ((index < DOG_MOTOR_COUNT) &&
+            ((DOG_DISABLED_MOTOR_MASK & (1U << index)) != 0U)) ? 1U : 0U;
+}
+
+static uint8_t enabled_motor_mask(void)
+{
+    return (uint8_t)(0xFFU & (uint8_t)~DOG_DISABLED_MOTOR_MASK);
+}
+
+static uint8_t enabled_motor_count(void)
+{
+    uint8_t count = 0U;
+    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) == 0U) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static uint8_t motor_index(uint8_t bus, uint8_t node_id)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
@@ -583,50 +605,65 @@ static uint8_t leg_joint_index(uint8_t leg, uint8_t joint)
     return DOG_MOTOR_COUNT;
 }
 
+static uint8_t debug_target_includes_motor(uint8_t index)
+{
+    if ((index >= DOG_MOTOR_COUNT) || (motor_is_disabled(index) != 0U)) {
+        return 0U;
+    }
+    const Dog_Motor_Config *cfg = &g_dog_motor_config[index];
+    if (s_debug_target == DOG_DEBUG_TARGET_ALL) {
+        return 1U;
+    }
+    if (s_debug_target == DOG_DEBUG_TARGET_FRONT_PAIR) {
+        return ((cfg->leg == DOG_LEG_LF) || (cfg->leg == DOG_LEG_RF)) ? 1U : 0U;
+    }
+    if (s_debug_target == DOG_DEBUG_TARGET_REAR_PAIR) {
+        return ((cfg->leg == DOG_LEG_LB) || (cfg->leg == DOG_LEG_RB)) ? 1U : 0U;
+    }
+    if (cfg->leg != s_target_leg) {
+        return 0U;
+    }
+    if (s_debug_target == DOG_DEBUG_TARGET_LEG) {
+        return 1U;
+    }
+    if (s_debug_target == DOG_DEBUG_TARGET_SINGLE) {
+        return (cfg->joint == DOG_JOINT_HIP) ? 1U : 0U;
+    }
+    if (s_debug_target == DOG_DEBUG_TARGET_SINGLE_KNEE) {
+        return (cfg->joint == DOG_JOINT_KNEE) ? 1U : 0U;
+    }
+    return 0U;
+}
+
 static uint8_t selected_count(void)
 {
-    if (s_debug_target == DOG_DEBUG_TARGET_SINGLE) return 1U;
-    if (s_debug_target == DOG_DEBUG_TARGET_SINGLE_KNEE) return 1U;
-    if (s_debug_target == DOG_DEBUG_TARGET_LEG) return DOG_MOTORS_PER_LEG;
-    if (s_debug_target == DOG_DEBUG_TARGET_FRONT_PAIR) return DOG_MOTORS_PER_LEG * 2U;
-    if (s_debug_target == DOG_DEBUG_TARGET_REAR_PAIR) return DOG_MOTORS_PER_LEG * 2U;
-    return DOG_MOTOR_COUNT;
+    uint8_t count = 0U;
+    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (debug_target_includes_motor(i) != 0U) {
+            count++;
+        }
+    }
+    return count;
 }
 
 static uint8_t selected_index(uint8_t n)
 {
-    if (s_debug_target == DOG_DEBUG_TARGET_SINGLE) {
-        return leg_joint_index(s_target_leg, DOG_JOINT_HIP);
-    }
-    if (s_debug_target == DOG_DEBUG_TARGET_SINGLE_KNEE) {
-        return leg_joint_index(s_target_leg, DOG_JOINT_KNEE);
-    }
-    if (s_debug_target == DOG_DEBUG_TARGET_LEG) {
-        return leg_joint_index(s_target_leg, n);
-    }
-    if (s_debug_target == DOG_DEBUG_TARGET_FRONT_PAIR) {
-        if (n < DOG_MOTORS_PER_LEG) {
-            return leg_joint_index(DOG_LEG_LF, n);
+    uint8_t selected = 0U;
+    for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (debug_target_includes_motor(i) == 0U) {
+            continue;
         }
-        return leg_joint_index(DOG_LEG_RF, (uint8_t)(n - DOG_MOTORS_PER_LEG));
-    }
-    if (s_debug_target == DOG_DEBUG_TARGET_REAR_PAIR) {
-        if (n < DOG_MOTORS_PER_LEG) {
-            return leg_joint_index(DOG_LEG_LB, n);
+        if (selected == n) {
+            return i;
         }
-        return leg_joint_index(DOG_LEG_RB, (uint8_t)(n - DOG_MOTORS_PER_LEG));
+        selected++;
     }
-    return (n < DOG_MOTOR_COUNT) ? n : DOG_MOTOR_COUNT;
+    return DOG_MOTOR_COUNT;
 }
 
 static uint8_t motor_is_selected(uint8_t index)
 {
-    for (uint8_t i = 0U; i < selected_count(); ++i) {
-        if (selected_index(i) == index) {
-            return 1U;
-        }
-    }
-    return 0U;
+    return debug_target_includes_motor(index);
 }
 
 static uint8_t selected_motor_mask(void)
@@ -684,6 +721,7 @@ static float raw_deg(uint8_t index)
 static float user_deg(uint8_t index)
 {
     if (index >= DOG_MOTOR_COUNT) return 0.0f;
+    if (motor_is_disabled(index) != 0U) return s_target_deg[index];
     float user_turn = g_mw_motor_data[index].encoderEstimates.encoderPosEstimate - s_zero_offset_turn[index];
     return mech_deg_from_encoder_turn(index, user_turn);
 }
@@ -691,6 +729,7 @@ static float user_deg(uint8_t index)
 static float user_vel_dps(uint8_t index)
 {
     if (index >= DOG_MOTOR_COUNT) return 0.0f;
+    if (motor_is_disabled(index) != 0U) return 0.0f;
     Dog_Motor_Config *cfg = &g_dog_motor_config[index];
     return (g_mw_motor_data[index].encoderEstimates.encoderVelEstimate * DOG_TURN_TO_DEG * cfg->direction) /
            encoder_gear_ratio(index);
@@ -993,6 +1032,9 @@ static void mw_sender(uint8_t busId, uint8_t canId, uint8_t *data, uint8_t dataS
     if (h == nullptr) return;
 
     const uint8_t index = motor_index(busId, (uint8_t)(canId >> 5));
+    if (motor_is_disabled(index) != 0U) {
+        return;
+    }
     uint8_t id_type = DOG_CAN_ID_EXTENDED;
     if ((index < DOG_MOTOR_COUNT) && (s_motor_can_id_type[index] != DOG_CAN_ID_UNKNOWN)) {
         id_type = s_motor_can_id_type[index];
@@ -1013,7 +1055,7 @@ static void mw_sender(uint8_t busId, uint8_t canId, uint8_t *data, uint8_t dataS
 
 static void mw_query_encoder_frames(uint8_t index, uint8_t include_count)
 {
-    if (index >= DOG_MOTOR_COUNT) {
+    if ((index >= DOG_MOTOR_COUNT) || (motor_is_disabled(index) != 0U)) {
         return;
     }
 
@@ -2749,6 +2791,7 @@ static void prepare_stand_targets(void)
 static uint8_t all_leg_motors_heartbeat_online(uint32_t now)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) continue;
         if ((s_motor_online[i] == 0U) || (s_last_heartbeat_tick_ms[i] == 0U) ||
             ((uint32_t)(now - s_last_heartbeat_tick_ms[i]) > DOG_HEARTBEAT_TIMEOUT_MS) ||
             (motor_has_fault(i) != 0U)) {
@@ -2761,6 +2804,7 @@ static uint8_t all_leg_motors_heartbeat_online(uint32_t now)
 static uint8_t all_leg_motors_control_ready(void)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) continue;
         if ((motor_ready(i) == 0U) || (s_encoder_est_fresh[i] == 0U) ||
             (s_motor_mit_probe_active[i] != 0U) || (s_motor_configured[i] == 0U)) {
             return 0U;
@@ -2772,6 +2816,7 @@ static uint8_t all_leg_motors_control_ready(void)
 static uint8_t online_fault_present(void)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) continue;
         if ((s_motor_online[i] != 0U) && (motor_has_fault(i) != 0U)) {
             return 1U;
         }
@@ -2796,6 +2841,7 @@ static void send_enabled_targets(uint32_t now)
     const uint8_t count = (s_auto_stand_enabled != 0U) ? DOG_MOTOR_COUNT : selected_count();
     for (uint8_t i = 0U; i < count; ++i) {
         const uint8_t index = (s_auto_stand_enabled != 0U) ? i : selected_index(i);
+        if (motor_is_disabled(index) != 0U) continue;
         if ((index >= DOG_MOTOR_COUNT) || (motor_ready(index) == 0U) ||
             (motor_encoder_fresh(index, now) == 0U) ||
             (s_motor_configured[index] == 0U) ||
@@ -2808,11 +2854,12 @@ static void send_enabled_targets(uint32_t now)
     }
 
     for (uint8_t i = 0U; i < count; ++i) {
+        const uint8_t index = (s_auto_stand_enabled != 0U) ? i : selected_index(i);
+        if (motor_is_disabled(index) != 0U) continue;
         if (motor_safety_token_valid(safety_generation) == 0U) {
-            queue_motor_estop((s_auto_stand_enabled != 0U) ? i : selected_index(i));
+            queue_motor_estop(index);
             return;
         }
-        const uint8_t index = (s_auto_stand_enabled != 0U) ? i : selected_index(i);
         Dog_Motor_Config *cfg = &g_dog_motor_config[index];
         MWPosControl(cfg->bus, cfg->node_id, s_target_turn[index], 0, 0);
         if (motor_safety_token_valid(safety_generation) == 0U) {
@@ -2960,6 +3007,9 @@ static void dispatch_mw_rx(uint8_t bus, FDCAN_RxHeaderTypeDef &header, uint8_t *
     uint8_t node_id = (uint8_t)(can_id >> 5);
     const uint8_t cmd = (uint8_t)(can_id & 0x1FU);
     const uint8_t index = motor_index(bus, node_id);
+    if (motor_is_disabled(index) != 0U) {
+        return;
+    }
     if ((index >= DOG_MOTOR_COUNT) || (mw_cmd_is_valid_response(cmd) == 0U)) {
         s_rx_reject_node[di]++;
         return;
@@ -3643,6 +3693,7 @@ static uint8_t mit_jump_test_move(void)
 static uint8_t march_all_motors_booted(void)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) continue;
         if (s_mit_boot_ok[i] == 0U) {
             return 0U;
         }
@@ -3658,7 +3709,8 @@ static uint8_t march_leg_joints_settled(uint8_t leg, float err_threshold_deg)
     if ((hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT)) {
         return 0U;
     }
-    if ((s_encoder_est_fresh[hip] == 0U) || (s_encoder_est_fresh[knee] == 0U)) {
+    if (((motor_is_disabled(hip) == 0U) && (s_encoder_est_fresh[hip] == 0U)) ||
+        ((motor_is_disabled(knee) == 0U) && (s_encoder_est_fresh[knee] == 0U))) {
         return 0U;
     }
     if (fabsf(s_target_deg[hip] - user_deg(hip)) > err_threshold_deg) {
@@ -3807,6 +3859,9 @@ static uint8_t foot_motion_leg_ready(uint8_t leg)
     const uint8_t motors[2U] = {hip, knee};
     for (uint8_t i = 0U; i < 2U; ++i) {
         const uint8_t motor = motors[i];
+        if (motor_is_disabled(motor) != 0U) {
+            continue;
+        }
         if ((s_motor_online[motor] == 0U) || (s_encoder_est_fresh[motor] == 0U) ||
             (s_mit_boot_ok[motor] == 0U) || (motor_closed_loop(motor) == 0U) ||
             (motor_has_fault(motor) != 0U) || (!isfinite(user_deg(motor))) ||
@@ -4018,6 +4073,7 @@ static uint8_t foot_motion_runtime_guard(uint32_t generation, uint8_t moving_leg
 
     uint8_t saturated = 0U;
     for (uint8_t motor = 0U; motor < DOG_MOTOR_COUNT; ++motor) {
+        if (motor_is_disabled(motor) != 0U) continue;
         const float cmd_current_a = s_mit_cmd_current_a[motor];
         const float iq_current_a = g_mw_motor_data[motor].iq.iqMeasured;
         if ((!isfinite(cmd_current_a)) || (!isfinite(iq_current_a)) ||
@@ -5271,11 +5327,11 @@ static uint8_t march_in_place_start_mode(uint8_t mode, uint8_t cycles,
         return 0U;
     }
     if (s_debug_target != DOG_DEBUG_TARGET_ALL) {
-        DebugUart_Printf("March FAIL: send '8' to target all 8 motors.\r\n");
+        DebugUart_Printf("March FAIL: send '8' to target all enabled leg motors.\r\n");
         return 0U;
     }
     if (march_all_motors_booted() == 0U) {
-        DebugUart_Printf("March FAIL: need all 8 online/booted.\r\n");
+        DebugUart_Printf("March FAIL: need all enabled leg motors online/booted.\r\n");
         return 0U;
     }
     if ((march_mode_uses_cycloid(mode) != 0U) &&
@@ -5683,7 +5739,7 @@ uint8_t dog_mit_jump_test_sequence(void)
         return 0U;
     }
     if (s_debug_target != DOG_DEBUG_TARGET_ALL) {
-        DebugUart_Printf("Jump FAIL: send '8' to target all 8 motors.\r\n");
+        DebugUart_Printf("Jump FAIL: send '8' to target all enabled leg motors.\r\n");
         return 0U;
     }
 
@@ -6843,6 +6899,9 @@ static uint8_t send_motor_estop_locked(uint8_t index)
     if (index >= DOG_MOTOR_COUNT) {
         return 0U;
     }
+    if (motor_is_disabled(index) != 0U) {
+        return 1U;
+    }
 
     Dog_Motor_Config *cfg = &g_dog_motor_config[index];
     FDCAN_HandleTypeDef *h = bus_handle(cfg->bus);
@@ -6881,7 +6940,8 @@ static void service_estop_pending_locked(void)
 
 static void queue_motor_estop(uint8_t index)
 {
-    if ((index >= DOG_MOTOR_COUNT) || (motor_tx_guard_take() == 0U)) {
+    if ((index >= DOG_MOTOR_COUNT) || (motor_is_disabled(index) != 0U) ||
+        (motor_tx_guard_take() == 0U)) {
         return;
     }
     if (s_safety_latched == 0U) {
@@ -6898,7 +6958,7 @@ static void send_all_estop(void)
     if (motor_tx_guard_take() == 0U) {
         return;
     }
-    s_estop_pending_mask = 0xFFU;
+    s_estop_pending_mask = enabled_motor_mask();
     service_estop_pending_locked();
     motor_tx_guard_give();
 }
@@ -6920,6 +6980,7 @@ static uint8_t safety_clear_token_valid(uint32_t generation)
 static uint8_t send_all_clear_errors(uint32_t generation)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) continue;
         if (safety_clear_token_valid(generation) == 0U) {
             return 0U;
         }
@@ -6934,6 +6995,7 @@ static uint8_t send_all_clear_errors(uint32_t generation)
 static uint8_t all_leg_motors_stopped_online(void)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) continue;
         if ((s_motor_online[i] == 0U) || (motor_closed_loop(i) != 0U) ||
             ((int32_t)(s_last_heartbeat_tick_ms[i] - s_safety_latched_ms) <= 0)) {
             return 0U;
@@ -6945,6 +7007,7 @@ static uint8_t all_leg_motors_stopped_online(void)
 static uint8_t all_leg_motors_clear_confirmed(void)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) continue;
         if ((s_motor_online[i] == 0U) || (motor_closed_loop(i) != 0U) ||
             (motor_has_fault(i) != 0U) ||
             ((int32_t)(s_last_heartbeat_tick_ms[i] - s_safety_clear_started_ms) <= 0)) {
@@ -7051,7 +7114,7 @@ uint8_t DogStand_EnterMechanicalLimitPose(void)
     s_mechanical_pose_requested = 1U;
     s_mechanical_pose_ready = 0U;
     s_mechanical_pose_mask = 0U;
-    if (dog_debug_mit_boot_sequence() != DOG_MOTOR_COUNT) {
+    if (dog_debug_mit_boot_sequence() != enabled_motor_count()) {
         s_mechanical_pose_requested = 0U;
         dog_mit_protect_hold();
         DebugUart_Printf("Mechanical wheel pose FAIL: MIT boot incomplete.\r\n");
@@ -7103,7 +7166,7 @@ uint8_t DogStand_EnterMechanicalLimitPose(void)
         vTaskDelay(pdMS_TO_TICKS(1U));
     }
 
-    s_mechanical_pose_mask = 0xFFU;
+    s_mechanical_pose_mask = enabled_motor_mask();
     s_mechanical_pose_ready = 1U;
     DebugUart_Printf("Mechanical wheel pose ready: hip=%+ldmdeg knee=stand-PID hold.\r\n",
                      (long)(DOG_LOW_WHEEL_HIP_LIFT_DEG * 1000.0f));
@@ -7145,7 +7208,7 @@ static void DogStand_Estop(void)
         s_safety_clear_started_ms = 0U;
         s_safety_clear_generation = 0U;
         s_safety_last_action_ms = now;
-        s_estop_pending_mask = 0xFFU;
+        s_estop_pending_mask = enabled_motor_mask();
         (void)fdcan_abort_all_tx(&hfdcan1);
         (void)fdcan_abort_all_tx(&hfdcan2);
         service_estop_pending_locked();
@@ -7161,7 +7224,7 @@ static void DogStand_Estop(void)
         s_safety_clear_started_ms = 0U;
         s_safety_clear_generation = 0U;
         s_safety_last_action_ms = now;
-        s_estop_pending_mask = 0xFFU;
+        s_estop_pending_mask = enabled_motor_mask();
         __set_PRIMASK(primask);
     }
 
@@ -7257,7 +7320,7 @@ static void motor_safety_tick(uint32_t now)
                 s_safety_clear_generation = 0U;
                 if ((uint32_t)(now - s_safety_last_action_ms) >= DOG_SAFETY_RETRY_PERIOD_MS) {
                     s_safety_last_action_ms = now;
-                    s_estop_pending_mask = 0xFFU;
+                    s_estop_pending_mask = enabled_motor_mask();
                     service_estop_pending_locked();
                     repeat_estop = 1U;
                 }
@@ -7332,7 +7395,7 @@ static void motor_safety_tick(uint32_t now)
             motor_tx_guard_give();
         }
         if (cleared != 0U) {
-            DebugUart_Printf("Safety latch cleared: all 8 leg motors idle and fault-free.\r\n");
+            DebugUart_Printf("Safety latch cleared: all enabled leg motors idle and fault-free.\r\n");
         } else {
             send_all_estop();
         }
@@ -7388,6 +7451,14 @@ static uint8_t next_online_motor_on_bus(uint8_t bus, uint8_t *cursor)
 static uint8_t motor_feedback_health_tick(uint32_t now)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
+        if (motor_is_disabled(i) != 0U) {
+            s_motor_online[i] = 0U;
+            s_encoder_est_fresh[i] = 0U;
+            s_motor_configured[i] = 0U;
+            s_motor_loop_requested[i] = 0U;
+            s_mit_boot_ok[i] = 0U;
+            continue;
+        }
         if ((s_motor_online[i] != 0U) &&
             ((uint32_t)(now - s_last_rx_tick_ms[i]) > DOG_RX_TIMEOUT_MS)) {
             s_motor_online[i] = 0U;
@@ -7511,6 +7582,9 @@ void motor_task_init(void)
 
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
         g_mw_node_ids[i] = g_dog_motor_config[i].node_id;
+        if (motor_is_disabled(i) != 0U) {
+            continue;
+        }
         MW_MOTOR_ACCESS_INFO motor = {};
         motor.busId = g_dog_motor_config[i].bus;
         motor.nodeId = g_dog_motor_config[i].node_id;
@@ -7521,6 +7595,8 @@ void motor_task_init(void)
     }
 
     dog_debug_rx_only();
+    DebugUart_Printf("WARNING: disabled motor mask=0x%02X; M3 RF KNEE has no CAN TX/RX and is virtual-settled.\r\n",
+                     (unsigned)DOG_DISABLED_MOTOR_MASK);
     if ((system_can[0] == false) || (system_can[1] == false)) {
         DebugUart_Printf("FDCAN init failed: all motors disabled.\r\n");
         DogStand_Disable();

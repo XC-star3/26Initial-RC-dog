@@ -13,6 +13,9 @@ extern "C" {
 #define DOG_LEG_COUNT           4U
 #define DOG_MOTORS_PER_LEG      2U
 
+/* Maintenance-only: M3 is the damaged RF knee motor. Keep its power phases disconnected. */
+#define DOG_DISABLED_MOTOR_MASK (1U << 3U)
+
 #define DOG_GAIT_SPEED_LOW      0U
 #define DOG_GAIT_SPEED_MID      1U
 #define DOG_GAIT_SPEED_HIGH     2U
