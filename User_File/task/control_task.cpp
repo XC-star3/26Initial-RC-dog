@@ -219,8 +219,7 @@ static SbusLinkState sbus_link_state_update(const SbusState *rc, uint32_t now);
 static uint8_t sbus_auto_zero_tick(uint32_t now);
 static float sbus_axis_to_drive(int16_t value);
 static float sbus_wheel_max_rpm(const SbusState *rc);
-static float sbus_gait_wheel_max_rpm(const SbusState *rc,
-                                     const DogGaitSyncState *sync);
+static float sbus_gait_wheel_max_rpm(const DogGaitSyncState *sync);
 static void sbus_wheel_hold(void);
 static void sbus_wheel_disable(uint8_t lock);
 static uint8_t sbus_wheel_update(const SbusState *rc);
@@ -560,7 +559,7 @@ static void print_sbus_status(void)
                      (long)(gait.active_wheel_contribution * 1000.0f),
                      (long)(gait.active_leg_contribution * 1000.0f),
                      (long)gait.compatible_wheel_rpm,
-                     (long)sbus_gait_wheel_max_rpm(&rc, &gait),
+                     (long)sbus_gait_wheel_max_rpm(&gait),
                      (long)(gait.contact_search_mm[0U] * 1000.0f),
                      (long)(gait.contact_search_mm[1U] * 1000.0f),
                      (long)(gait.contact_search_mm[2U] * 1000.0f),
@@ -895,12 +894,16 @@ static uint8_t sbus_wheel_update(const SbusState *rc)
     return 1U;
 }
 
-static float sbus_gait_wheel_max_rpm(const SbusState *rc,
-                                     const DogGaitSyncState *sync)
+static float sbus_gait_wheel_max_rpm(const DogGaitSyncState *sync)
 {
-    const float operator_limit_rpm = sbus_wheel_max_rpm(rc);
-    if ((sync == nullptr) || (sync->active == 0U) ||
-        (sync->active_swing_ms == 0U)) {
+    if (sync == nullptr) {
+        return 0.0f;
+    }
+    const float active_speed_command = fminf(
+        fmaxf(sync->active_speed_command, 0.0f), 1.0f);
+    const float operator_limit_rpm = SBUS_WHEEL_MIN_RPM +
+        active_speed_command * (WHEEL_MAX_OUTPUT_RPM - SBUS_WHEEL_MIN_RPM);
+    if ((sync->active == 0U) || (sync->active_swing_ms == 0U)) {
         return operator_limit_rpm;
     }
 
@@ -1758,7 +1761,7 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
                 (s_sbus_hybrid_wheel_degraded == 0U)) {
                 WheelDrive_SetOperatingMode(WHEEL_OPERATING_DRIVE);
                 WheelDrive_SetMotion(applied_forward, applied_yaw,
-                                     sbus_gait_wheel_max_rpm(rc, &sync));
+                                     sbus_gait_wheel_max_rpm(&sync));
             } else {
                 sbus_wheel_hold();
             }
