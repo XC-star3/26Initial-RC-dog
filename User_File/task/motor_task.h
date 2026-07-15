@@ -7,14 +7,15 @@
 extern "C" {
 #endif
 
+/* 腿部控制拓扑：CAN1 管理前腿对，CAN2 管理后腿对。 */
 #define DOG_CAN_FRONT_BUS       1U
 #define DOG_CAN_REAR_BUS        2U
 #define DOG_MOTOR_COUNT         8U
 #define DOG_LEG_COUNT           4U
 #define DOG_MOTORS_PER_LEG      2U
 
-/* Maintenance-only: M3 is the damaged RF knee motor. Keep its power phases disconnected. */
-#define DOG_DISABLED_MOTOR_MASK (1U << 3U)
+/* 第 i 位为 1 时，电机 i 不参与注册、控制和安全就绪检查。 */
+#define DOG_DISABLED_MOTOR_MASK 0U
 
 #define DOG_GAIT_SPEED_LOW      0U
 #define DOG_GAIT_SPEED_MID      1U
@@ -142,6 +143,7 @@ enum Dog_Gait_Phase {
     DOG_GAIT_PHASE_SUPPORT_TRANSITION,
 };
 
+/* 步态控制器导出的只读快照，供诊断和界面显示使用。 */
 struct DogGaitSyncState {
     uint8_t active;
     uint8_t stopping;
@@ -293,6 +295,7 @@ struct Dog_Can_Diag {
     uint32_t tx_drop_count;
 };
 
+/* 每个电机的机械参数和 CAN 标定，所有控制路径共用。 */
 struct Dog_Motor_Config {
     uint8_t leg;
     uint8_t joint;
@@ -332,6 +335,7 @@ struct Dog_Remote_Sample {
 extern "C" {
 #endif
 
+/* 运行时电机注册表和标定参数表。 */
 extern uint8_t g_mw_node_ids[DOG_MOTOR_COUNT];
 extern MW_MOTOR_DATA g_mw_motor_data[DOG_MOTOR_COUNT];
 extern Dog_Motor_Config g_dog_motor_config[DOG_MOTOR_COUNT];
@@ -348,6 +352,7 @@ uint8_t dog_debug_target_count(void);
 uint8_t dog_leg_target_expected_mask(void);
 uint8_t dog_debug_target(void);
 
+/* 调试目标选择和底层电机模式控制。 */
 void dog_debug_set_target(uint8_t target);
 void dog_debug_set_target_leg(uint8_t leg);
 void dog_debug_rx_only(void);
@@ -365,6 +370,7 @@ void dog_debug_mit_torque_stop(void);
 void dog_debug_start_position_tx(void);
 void dog_debug_idle(void);
 
+/* MIT 电流环控制、站立、步态和足端轨迹命令。 */
 void dog_mit_reset_integrators(void);
 void dog_mit_clamp_integrators(void);
 void dog_mit_send_control_now(void);
@@ -435,6 +441,7 @@ uint8_t dog_mit_get_pid_telemetry(uint8_t motor_index, Dog_Mit_Pid_Telemetry *te
 uint8_t dog_mit_get_default_vofa_motor_index(void);
 uint8_t dog_control_get_loop_mode(void);
 
+/* 腿部坐标转换、目标管理和反馈诊断。 */
 void dog_leg_set_target_leg_deg(float hip_deg, float knee_deg);
 void dog_leg_set_target_motor_user_deg(float hip_motor_deg, float knee_motor_deg);
 void dog_leg_get_target_leg_angles(float *hip_deg, float *knee_deg);
@@ -473,6 +480,7 @@ void dog_motor_poll_can(void);
 void dog_motor_query_encoder(uint8_t motor_index);
 void dog_motor_query_online_encoders(void);
 
+/* 安全状态、站立状态控制和电机任务周期入口。 */
 void DogImu_Update(const Dog_Imu_Sample *sample);
 void DogRemote_Update(const Dog_Remote_Sample *sample);
 void DogStand_Request(void);

@@ -44,11 +44,8 @@ set(USER_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/User_File/BSP/RGB
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB
     ${CMAKE_SOURCE_DIR}/User_File/motor/MWSDK
-    ${CMAKE_SOURCE_DIR}/User_File/motor/motor_DM
-    ${CMAKE_SOURCE_DIR}/User_File/motor/motor_LZ
     ${CMAKE_SOURCE_DIR}/User_File/remote
     ${CMAKE_SOURCE_DIR}/User_File/task
-    ${CMAKE_SOURCE_DIR}/User_File/task/arm
 )
 
 # Add sources to executable
@@ -60,10 +57,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/vofa_pid.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/system_startup_hooks.c
     ${CMAKE_SOURCE_DIR}/User_File/motor/MWSDK/MWMotor.c
-    ${CMAKE_SOURCE_DIR}/User_File/motor/motor_DM/motor_DM.cpp
-    ${CMAKE_SOURCE_DIR}/User_File/motor/motor_LZ/motor_LZ.cpp
     ${CMAKE_SOURCE_DIR}/User_File/remote/sbus.c
-    ${CMAKE_SOURCE_DIR}/User_File/task/arm/arm_motor_task.cpp
     ${CMAKE_SOURCE_DIR}/User_File/task/control_task.cpp
     ${CMAKE_SOURCE_DIR}/User_File/task/motor_task.cpp
     ${CMAKE_SOURCE_DIR}/User_File/task/obstacle_task.cpp

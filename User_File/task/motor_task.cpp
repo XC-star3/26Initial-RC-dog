@@ -1,6 +1,5 @@
 ﻿#include "motor_task.h"
 
-#include "arm_motor_task.h"
 #include "bsp_fdcan.h"
 #include "control_task.h"
 #include "debug_uart.h"
@@ -18,12 +17,6 @@
 extern FDCAN_HandleTypeDef hfdcan1;
 extern FDCAN_HandleTypeDef hfdcan2;
 extern FDCAN_HandleTypeDef hfdcan3;
-
-#define ARM_J0_DM_CAN_ID               0x01U
-#define ARM_J0_DM_FEEDBACK_ID          0x00U
-#define ARM_J1_EL05_CAN_ID             0x7FU
-#define ARM_J1_EL05_INIT_MODEL_IGNORED 0U
-#define ARM_CMD_PERIOD_MS              5U
 
 #define DOG_CTRL_HZ                    500U
 #define DOG_CMD_PERIOD_MS              (1000U / DOG_CTRL_HZ)
@@ -121,6 +114,7 @@ extern FDCAN_HandleTypeDef hfdcan3;
 uint8_t g_mw_node_ids[DOG_MOTOR_COUNT] = {2U, 1U, 3U, 4U, 1U, 2U, 3U, 4U};
 MW_MOTOR_DATA g_mw_motor_data[DOG_MOTOR_COUNT];
 
+/* 数组下标是稳定的控制编号；CAN 总线和节点号对应实际电机。 */
 Dog_Motor_Config g_dog_motor_config[DOG_MOTOR_COUNT] = {
     /* LF: CAN1 id2=大腿(HIP), id1=小腿(KNEE 传力电机); encoder_gear_ratio=8 => 8 encoder turns / 1 joint turn */
     {DOG_LEG_LF, DOG_JOINT_HIP,  DOG_CAN_FRONT_BUS, 2U, 1.0f,  -1.0f, 0.0f, 8.0f, -120.0f, 120.0f},
@@ -2989,6 +2983,7 @@ static uint8_t mw_cmd_is_valid_response(uint8_t cmd)
     }
 }
 
+/* 校验 CANSimple 响应后，才交给 MWSDK 并更新电机健康状态。 */
 static void dispatch_mw_rx(uint8_t bus, FDCAN_RxHeaderTypeDef &header, uint8_t *buffer)
 {
     uint8_t di = bus_to_diag_index(bus);
@@ -3032,18 +3027,12 @@ static void dispatch_mw_rx(uint8_t bus, FDCAN_RxHeaderTypeDef &header, uint8_t *
 static void CAN1_Callback(FDCAN_RxHeaderTypeDef &header, uint8_t *buffer)
 {
     DebugUart_LogCanRx(1U, header.Identifier, buffer, fdcan_dlc_to_bytes(header.DataLength));
-    if (ArmMotor_OnCanRx(&hfdcan1, &header, buffer) != 0U) {
-        return;
-    }
     dispatch_mw_rx(DOG_CAN_FRONT_BUS, header, buffer);
 }
 
 static void CAN2_Callback(FDCAN_RxHeaderTypeDef &header, uint8_t *buffer)
 {
     DebugUart_LogCanRx(2U, header.Identifier, buffer, fdcan_dlc_to_bytes(header.DataLength));
-    if (ArmMotor_OnCanRx(&hfdcan2, &header, buffer) != 0U) {
-        return;
-    }
     dispatch_mw_rx(DOG_CAN_REAR_BUS, header, buffer);
 }
 
@@ -7020,13 +7009,11 @@ static uint8_t all_leg_motors_clear_confirmed(void)
 void DogStand_Disable(void)
 {
     if (motor_tx_guard_take() == 0U) {
-        ArmMotor_Disable();
         return;
     }
 
     if (s_safety_latched != 0U) {
         motor_tx_guard_give();
-        ArmMotor_Disable();
         return;
     }
 
@@ -7076,7 +7063,6 @@ void DogStand_Disable(void)
                        g_dog_motor_config[i].node_id,
                        MW_AXIS_STATE_IDLE);
     }
-    ArmMotor_Disable();
 }
 
 uint8_t DogStand_ClearDisable(void)
@@ -7236,7 +7222,6 @@ static void DogStand_Estop(void)
     memset(s_motor_loop_requested, 0, sizeof(s_motor_loop_requested));
     memset(s_motor_final_mode_pending, 0, sizeof(s_motor_final_mode_pending));
     memset(s_motor_mit_probe_active, 0, sizeof(s_motor_mit_probe_active));
-    ArmMotor_Disable();
     s_auto_stand_enabled = 0U;
     s_stand_state = DOG_STAND_ESTOP;
 }
@@ -7290,6 +7275,10 @@ uint8_t DogSafety_RequestRearm(void)
     return 1U;
 }
 
+/*
+ * 急停锁存后持续重试，直到所有已启用腿部电机确认停止；只有在相同安全
+ * 代次下满足该条件，重臂流程才会清除错误。
+ */
 static void motor_safety_tick(uint32_t now)
 {
     uint32_t generation = 0U;
@@ -7313,7 +7302,6 @@ static void motor_safety_tick(uint32_t now)
 
     if ((rearm_requested == 0U) || (external_inhibit != 0U) ||
         (all_leg_motors_stopped_online() == 0U)) {
-        uint8_t repeat_estop = 0U;
         if (motor_tx_guard_take() != 0U) {
             if ((s_safety_latched != 0U) && (s_safety_generation == generation)) {
                 s_safety_clear_started_ms = 0U;
@@ -7322,13 +7310,9 @@ static void motor_safety_tick(uint32_t now)
                     s_safety_last_action_ms = now;
                     s_estop_pending_mask = enabled_motor_mask();
                     service_estop_pending_locked();
-                    repeat_estop = 1U;
                 }
             }
             motor_tx_guard_give();
-        }
-        if (repeat_estop != 0U) {
-            ArmMotor_Disable();
         }
         return;
     }
@@ -7448,6 +7432,7 @@ static uint8_t next_online_motor_on_bus(uint8_t bus, uint8_t *cursor)
     return DOG_MOTOR_COUNT;
 }
 
+/* 将 CAN、心跳和编码器新鲜度转换为每个电机的可控制状态。 */
 static uint8_t motor_feedback_health_tick(uint32_t now)
 {
     for (uint8_t i = 0U; i < DOG_MOTOR_COUNT; ++i) {
@@ -7515,6 +7500,7 @@ static void encoder_feedback_query_tick(uint32_t now)
     }
 }
 
+/* 初始化 CAN 所有权，清空控制状态，再向 MWSDK 注册全部已启用电机。 */
 void motor_task_init(void)
 {
     if (s_motor_tx_guard == nullptr) {
@@ -7530,13 +7516,6 @@ void motor_task_init(void)
     bsp_can_init(&hfdcan2, CAN2_Callback);
     bsp_can_init(&hfdcan3, CAN3_Callback);
     WheelDrive_Init(&hfdcan3);
-    ArmMotor_Init(&hfdcan1,
-                  ARM_J0_DM_CAN_ID,
-                  ARM_J0_DM_FEEDBACK_ID,
-                  &hfdcan2,
-                  ARM_J1_EL05_CAN_ID,
-                  ARM_J1_EL05_INIT_MODEL_IGNORED);
-
     memset(g_mw_motor_data, 0, sizeof(g_mw_motor_data));
     memset(s_last_rx_tick_ms, 0, sizeof(s_last_rx_tick_ms));
     memset(s_motor_online, 0, sizeof(s_motor_online));
@@ -7595,19 +7574,22 @@ void motor_task_init(void)
     }
 
     dog_debug_rx_only();
-    DebugUart_Printf("WARNING: disabled motor mask=0x%02X; M3 RF KNEE has no CAN TX/RX and is virtual-settled.\r\n",
-                     (unsigned)DOG_DISABLED_MOTOR_MASK);
+    DebugUart_Printf("All %u leg motors enabled.\r\n", (unsigned)DOG_MOTOR_COUNT);
     if ((system_can[0] == false) || (system_can[1] == false)) {
         DebugUart_Printf("FDCAN init failed: all motors disabled.\r\n");
         DogStand_Disable();
         return;
     }
     if (system_can[2] == false) {
-        DebugUart_Printf("FDCAN3 init failed: wheel drive locked; leg/arm diagnostics remain available.\r\n");
+        DebugUart_Printf("FDCAN3 init failed: wheel drive locked; leg diagnostics remain available.\r\n");
     }
-    DebugUart_Printf("quadruped SDK debug: CAN1 front+J0_DM=0x01 feedback=0x00/0x10 CAN2 rear+J1_EL05=0x7F disabled\r\n");
+    DebugUart_Printf("quadruped SDK debug: CAN1 front leg bus, CAN2 rear leg bus, CAN3 wheel bus.\r\n");
 }
 
+/*
+ * 电机任务执行顺序：清空 CAN 接收队列，更新安全和反馈健康状态，推进站立
+ * 与步态状态，再调度闭环重试和低优先级诊断。
+ */
 void motor_task(void)
 {
     fdcan_poll_rx(&hfdcan1);
@@ -7665,30 +7647,6 @@ void motor_task(void)
     }
 
     encoder_feedback_query_tick(now);
-
-    static uint32_t s_arm_cmd_last_ms = 0U;
-    if ((s_safety_latched == 0U) &&
-        (mit_probe_bus_tx_busy(DOG_CAN_FRONT_BUS) == 0U) &&
-        (mit_probe_bus_tx_busy(DOG_CAN_REAR_BUS) == 0U) &&
-        ((uint32_t)(now - s_arm_cmd_last_ms) >= ARM_CMD_PERIOD_MS) &&
-        (fdcan_tx_free_level(&hfdcan1) >= 1U) &&
-        (fdcan_tx_free_level(&hfdcan2) >= 1U)) {
-        s_arm_cmd_last_ms = now;
-        ArmMotor_Send();
-    }
-
-    uint8_t arm_diagnostic_tx_mask = 0U;
-    if ((system_can[0] != false) &&
-        (mit_probe_bus_tx_busy(DOG_CAN_FRONT_BUS) == 0U) &&
-        (fdcan_tx_free_level(&hfdcan1) >= 1U)) {
-        arm_diagnostic_tx_mask |= ARM_J0_DM4310_MASK;
-    }
-    if ((system_can[1] != false) &&
-        (mit_probe_bus_tx_busy(DOG_CAN_REAR_BUS) == 0U) &&
-        (fdcan_tx_free_level(&hfdcan2) >= 1U)) {
-        arm_diagnostic_tx_mask |= ARM_J1_LZ_MASK;
-    }
-    ArmMotor_DiagnosticPoll(now, arm_diagnostic_tx_mask);
 
     static uint32_t s_slow_feedback_last_ms = 0U;
     if ((uint32_t)(now - s_slow_feedback_last_ms) >= DOG_SLOW_FEEDBACK_SLOT_MS) {

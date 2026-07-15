@@ -1,6 +1,5 @@
 #include "control_task.h"
 
-#include "arm_motor_task.h"
 #include "debug_uart.h"
 #include "motor_task.h"
 #include "obstacle_task.h"
@@ -33,22 +32,8 @@
 #define SBUS_MAIN_MODE_CH      4U
 #define SBUS_SUB_MODE_CH       7U
 #define SBUS_OBSTACLE_STEP_CH  9U
-#define SBUS_ARM_J0_CH         5U
-#define SBUS_ARM_J1_CH         6U
-#define SBUS_ARM_UPDATE_MS     20U
-#define SBUS_ARM_ENABLE_RETRY_MS 200U
-#define SBUS_ARM_ZERO_SETTLE_MS  100U
-#define SBUS_ARM_ZERO_TIMEOUT_MS 800U
-#define SBUS_ARM_ZERO_FRESH_MS    80U
-#define SBUS_ARM_ZERO_TOL_DEG      8.0f
-#define SBUS_ARM_RATE_DEG_S    30.0f
-#define SBUS_ARM_J0_MIN_DEG    (-60.0f)
-#define SBUS_ARM_J0_MAX_DEG    90.0f
-#define SBUS_ARM_J1_MIN_DEG    (-90.0f)
-#define SBUS_ARM_J1_MAX_DEG    90.0f
 #define SBUS_MOVE_ENTER_DEADBAND 25
 #define SBUS_MOVE_EXIT_DEADBAND  12
-#define SBUS_ARM_JOG_DEADBAND    8
 #define SBUS_SPEED_LOW_NORM    (-60)
 #define SBUS_SPEED_HIGH_NORM   60
 #define SBUS_SAFETY_CH         8U
@@ -84,6 +69,7 @@ enum SbusQuadCmd {
     SBUS_QUAD_DRIVE,
 };
 
+/* 操作者请求的模式；模式状态机确认前置条件后才允许激活。 */
 enum SbusRobotMode {
     SBUS_MODE_NONE = 0U,
     SBUS_MODE_MOTOR_CHECK,
@@ -92,13 +78,13 @@ enum SbusRobotMode {
     SBUS_MODE_USB_IDLE,
     SBUS_MODE_STAND_HOLD,
     SBUS_MODE_STAND_WHEEL,
-    SBUS_MODE_STAND_ARM,
     SBUS_MODE_GAIT_WHEEL,
     SBUS_MODE_GAIT_ONLY,
     SBUS_MODE_OBSTACLE,
     SBUS_MODE_USB_RESERVED_STAND,
 };
 
+/* 进入进度和阻塞原因分开保存，供串口诊断输出。 */
 enum SbusModeEntryState {
     SBUS_ENTRY_INACTIVE = 0U,
     SBUS_ENTRY_ENTERING,
@@ -106,7 +92,6 @@ enum SbusModeEntryState {
     SBUS_ENTRY_WAIT_MECHANICAL,
     SBUS_ENTRY_WAIT_GAIT_STOP,
     SBUS_ENTRY_WAIT_STAND,
-    SBUS_ENTRY_WAIT_ARM,
     SBUS_ENTRY_WAIT_OBSTACLE,
     SBUS_ENTRY_ACTIVE,
     SBUS_ENTRY_BLOCKED,
@@ -118,7 +103,6 @@ enum SbusModeBlockReason {
     SBUS_BLOCK_MECHANICAL_PERMIT,
     SBUS_BLOCK_GAIT_STOP,
     SBUS_BLOCK_STAND,
-    SBUS_BLOCK_ARM_FEEDBACK,
     SBUS_BLOCK_WHEEL_FAULT,
     SBUS_BLOCK_WHEEL_STOP,
     SBUS_BLOCK_LEG_FAULT,
@@ -152,15 +136,6 @@ static uint8_t s_sbus_seen_fresh = 0U;
 static uint8_t s_sbus_switch_valid = 0U;
 static uint8_t s_sbus_main_prev = SBUS_SWITCH_LOW;
 static uint8_t s_sbus_sub_prev = SBUS_SWITCH_LOW;
-static uint8_t s_sbus_arm_active = 0U;
-static uint8_t s_sbus_arm_enable_pending = 0U;
-static uint8_t s_sbus_arm_ready_mask = 0U;
-static uint8_t s_sbus_arm_zero_sent_mask = 0U;
-static fp32 s_sbus_arm_j0_target_deg = 0.0f;
-static fp32 s_sbus_arm_j1_target_deg = 0.0f;
-static uint32_t s_sbus_arm_last_ms = 0U;
-static uint32_t s_sbus_arm_enable_last_ms = 0U;
-static uint32_t s_sbus_arm_zero_ms[ARM_JOINT_COUNT] = {};
 static uint8_t s_sbus_safety_active = 0U;
 static uint8_t s_sbus_safety_armed = 0U;
 static uint8_t s_sbus_safety_wait_release_logged = 0U;
@@ -235,6 +210,10 @@ static const char *sbus_robot_mode_name(SbusRobotMode mode);
 static const char *sbus_entry_state_name(SbusModeEntryState state);
 static const char *sbus_block_reason_name(SbusModeBlockReason reason);
 static void sbus_mode_transition(SbusRobotMode requested);
+/*
+ * 执行一次 SBUS 请求模式。各分支在等待站立、机械姿态、反馈或越障
+ * 前置条件期间，负责保持自身的轮毂和腿部状态。
+ */
 static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
                            uint32_t now);
 static const char *control_source_name(ControlInputSource source);
@@ -287,50 +266,6 @@ static void print_wheel_status(void)
     }
 }
 
-static void print_arm_status(void)
-{
-    static const char *const names[ARM_JOINT_COUNT] = {"J0 DM4310", "J1 EL05"};
-    static const char *const frame_types[ARM_JOINT_COUNT] = {"std", "ext"};
-    static const char *const id_names[ARM_JOINT_COUNT] = {"feedback_id", "motor_id"};
-    static const uint8_t buses[ARM_JOINT_COUNT] = {1U, 2U};
-    static const uint16_t ids[ARM_JOINT_COUNT] = {0x00U, 0x7FU};
-
-    DebugUart_Printf("ARM: init=%u ready=0x%X zero_sent=0x%X diag_period=300ms present_timeout=1000ms feedback_timeout=100ms J0_compat=0x10\r\n",
-                     (unsigned)ArmMotor_IsInitialized(),
-                     (unsigned)s_sbus_arm_ready_mask,
-                     (unsigned)s_sbus_arm_zero_sent_mask);
-    for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
-        ArmMotorFeedback feedback = {};
-        const uint8_t online = ArmMotor_GetFeedback(joint, &feedback);
-        DebugUart_Printf("  %s CAN%u %s %s=0x%02X present=%u enabled=%u online=%u feedback_age_ms=",
-                         names[joint],
-                         (unsigned)buses[joint],
-                         frame_types[joint],
-                         id_names[joint],
-                         (unsigned)ids[joint],
-                         (unsigned)feedback.present,
-                         (unsigned)feedback.enabled,
-                         (unsigned)online);
-        if (feedback.feedback_age_ms == ARM_MOTOR_FEEDBACK_AGE_INVALID) {
-            DebugUart_Printf("NA fault=");
-        } else {
-            DebugUart_Printf("%lu fault=", (unsigned long)feedback.feedback_age_ms);
-        }
-        if (feedback.fault_valid == 0U) {
-            DebugUart_Printf("NA");
-        } else {
-            DebugUart_Printf("%u", (unsigned)feedback.fault);
-        }
-        DebugUart_Printf(" err=%u mode=%u angle=%ldmdeg vel=%ldmrad/s torque=%ldmNm temp=%lddC\r\n",
-                         (unsigned)feedback.error,
-                         (unsigned)feedback.mode,
-                         (long)(feedback.angle_deg * 1000.0f),
-                         (long)(feedback.vel_rad_s * 1000.0f),
-                         (long)(feedback.torque_nm * 1000.0f),
-                         (long)(feedback.temperature_c * 10.0f));
-    }
-}
-
 static void print_obstacle_status(void)
 {
     DogObstacleStatus status = {};
@@ -375,7 +310,7 @@ static void print_help(void)
     DebugUart_Printf("  2 : target selected leg hip+knee\r\n");
     DebugUart_Printf("  3 : target front pair LF+RF\r\n");
     DebugUart_Printf("  4 : target rear pair LB+RB\r\n");
-    DebugUart_Printf("  8 : target all enabled leg motors (disabled mask excluded)\r\n");
+    DebugUart_Printf("  8 : target all leg motors\r\n");
     DebugUart_Printf("  r : RX-only, no control TX\r\n");
     DebugUart_Printf("  e : clear errors on active target\r\n");
     DebugUart_Printf("  m : set trapezoidal position mode (Control=3 Input=5)\r\n");
@@ -425,10 +360,9 @@ static void print_help(void)
     DebugUart_Printf("  Wheel: CH1 differential yaw, CH2 forward/reverse, CH3 40..200rpm limit\r\n");
     DebugUart_Printf("  Gait: CH1/CH2 blend, CH3 LOW/MID/HIGH profile, CH9 safety\r\n");
     DebugUart_Printf("  SB+SC: L+L=motor check/OFF, L+M=mechanical wheel, L+H=RX-only/HOLD\r\n");
-    DebugUart_Printf("  SB+SC: M+L=stand/HOLD, M+M=stand wheel, M+H=stand arm/HOLD\r\n");
+    DebugUart_Printf("  SB+SC: M+L=stand/HOLD, M+M=stand wheel, M+H=stand/HOLD\r\n");
     DebugUart_Printf("  SB+SC: H+L=gait only/HOLD, H+M=gait wheel, H+H=reserved stand/HOLD\r\n");
-    DebugUart_Printf("  CH6/CH7 arm jog: J0 DM4310 / J1 EL05, %.0f deg/s max\r\n\r\n",
-                     (double)SBUS_ARM_RATE_DEG_S);
+    DebugUart_Printf("\r\n");
 }
 
 static void enter_rx_only(void)
@@ -489,7 +423,6 @@ static void print_status(void)
     dog_leg_print_angle_status("STAT ");
     dog_leg_dump_target_status();
     print_wheel_status();
-    print_arm_status();
     print_obstacle_status();
 }
 
@@ -561,7 +494,7 @@ static void print_sbus_status(void)
                      sbus_robot_mode_name(s_sbus_active_mode),
                      sbus_entry_state_name(s_sbus_entry_state),
                      sbus_block_reason_name(s_sbus_block_reason));
-    DebugUart_Printf("  decoded: drive=%u stick=(%ld,%ld) req=(%ld,%ld) applied=(%ld,%ld) arm=%u standing=%u active_gait=%u estop=%u disabled=%u current_speed=%s\r\n",
+    DebugUart_Printf("  decoded: drive=%u stick=(%ld,%ld) req=(%ld,%ld) applied=(%ld,%ld) standing=%u active_gait=%u estop=%u disabled=%u current_speed=%s\r\n",
                      (unsigned)drive.active,
                      (long)(drive.forward * 1000.0f),
                      (long)(drive.yaw * 1000.0f),
@@ -569,7 +502,6 @@ static void print_sbus_status(void)
                      (long)(requested_yaw * 1000.0f),
                      (long)(applied_forward * 1000.0f),
                      (long)(applied_yaw * 1000.0f),
-                     (unsigned)(s_sbus_requested_mode == SBUS_MODE_STAND_ARM),
                      (unsigned)s_sbus_quad_standing,
                      (unsigned)dog_mit_march_in_place_is_active(),
                      (unsigned)DogSafety_IsLatched(),
@@ -629,7 +561,6 @@ static void print_sbus_status(void)
                      (unsigned long)CDC_GetRxDropCount_HS(),
                      (unsigned)s_usb_release_hold);
     print_wheel_status();
-    print_arm_status();
     print_obstacle_status();
 }
 
@@ -722,25 +653,6 @@ static void move_target(float delta_inner_deg, float delta_outer_deg)
     dog_leg_set_target_leg_deg(in + delta_inner_deg, out + delta_outer_deg);
 }
 
-static fp32 clamp_fp32_local(fp32 value, fp32 min_value, fp32 max_value)
-{
-    if (value < min_value) {
-        return min_value;
-    }
-    if (value > max_value) {
-        return max_value;
-    }
-    return value;
-}
-
-static int16_t sbus_apply_deadband(int16_t value, int16_t deadband)
-{
-    if ((value > -deadband) && (value < deadband)) {
-        return 0;
-    }
-    return value;
-}
-
 static const char *sbus_switch_name(uint8_t sw)
 {
     switch (sw) {
@@ -765,7 +677,7 @@ static SbusRobotMode sbus_decode_robot_mode(uint8_t main_sw, uint8_t sub_sw)
     if (main_sw == SBUS_SWITCH_MID) {
         if (sub_sw == SBUS_SWITCH_LOW) return SBUS_MODE_STAND_HOLD;
         if (sub_sw == SBUS_SWITCH_MID) return SBUS_MODE_STAND_WHEEL;
-        return SBUS_MODE_STAND_ARM;
+        return SBUS_MODE_STAND_HOLD;
     }
     if (sub_sw == SBUS_SWITCH_LOW) return SBUS_MODE_GAIT_ONLY;
     if (sub_sw == SBUS_SWITCH_MID) return SBUS_MODE_GAIT_WHEEL;
@@ -783,8 +695,7 @@ static uint8_t sbus_mode_is_low(SbusRobotMode mode)
 static uint8_t sbus_mode_is_mid(SbusRobotMode mode)
 {
     return ((mode == SBUS_MODE_STAND_HOLD) ||
-            (mode == SBUS_MODE_STAND_WHEEL) ||
-            (mode == SBUS_MODE_STAND_ARM)) ? 1U : 0U;
+            (mode == SBUS_MODE_STAND_WHEEL)) ? 1U : 0U;
 }
 
 static const char *sbus_robot_mode_name(SbusRobotMode mode)
@@ -796,7 +707,6 @@ static const char *sbus_robot_mode_name(SbusRobotMode mode)
     case SBUS_MODE_USB_IDLE:      return "USB_IDLE";
     case SBUS_MODE_STAND_HOLD:    return "STAND_HOLD";
     case SBUS_MODE_STAND_WHEEL:   return "STAND_WHEEL";
-    case SBUS_MODE_STAND_ARM:     return "STAND_ARM";
     case SBUS_MODE_GAIT_WHEEL:    return "GAIT_WHEEL";
     case SBUS_MODE_GAIT_ONLY:     return "GAIT_ONLY";
     case SBUS_MODE_OBSTACLE:      return "OBSTACLE";
@@ -813,7 +723,6 @@ static const char *sbus_entry_state_name(SbusModeEntryState state)
     case SBUS_ENTRY_WAIT_MECHANICAL: return "WAIT_MECH";
     case SBUS_ENTRY_WAIT_GAIT_STOP:  return "WAIT_GAIT";
     case SBUS_ENTRY_WAIT_STAND:      return "WAIT_STAND";
-    case SBUS_ENTRY_WAIT_ARM:        return "WAIT_ARM";
     case SBUS_ENTRY_WAIT_OBSTACLE:   return "WAIT_OBSTACLE";
     case SBUS_ENTRY_ACTIVE:          return "ACTIVE";
     case SBUS_ENTRY_BLOCKED:         return "BLOCKED";
@@ -828,186 +737,11 @@ static const char *sbus_block_reason_name(SbusModeBlockReason reason)
     case SBUS_BLOCK_MECHANICAL_PERMIT: return "MECH_PERMIT";
     case SBUS_BLOCK_GAIT_STOP:         return "GAIT_STOP";
     case SBUS_BLOCK_STAND:             return "STAND";
-    case SBUS_BLOCK_ARM_FEEDBACK:      return "ARM_FEEDBACK";
     case SBUS_BLOCK_WHEEL_FAULT:       return "WHEEL_FAULT";
     case SBUS_BLOCK_WHEEL_STOP:        return "WHEEL_STOP";
     case SBUS_BLOCK_LEG_FAULT:         return "LEG_FAULT";
     case SBUS_BLOCK_OBSTACLE:           return "OBSTACLE";
     default:                           return "NONE";
-    }
-}
-
-static void sbus_arm_leave(void)
-{
-    ArmMotor_SetPumpEnabled(0U);
-    if ((s_sbus_arm_active == 0U) && (s_sbus_arm_enable_pending == 0U) &&
-        (s_sbus_arm_ready_mask == 0U) && (s_sbus_arm_zero_sent_mask == 0U)) {
-        return;
-    }
-    s_sbus_arm_active = 0U;
-    s_sbus_arm_enable_pending = 0U;
-    s_sbus_arm_ready_mask = 0U;
-    s_sbus_arm_zero_sent_mask = 0U;
-    s_sbus_arm_last_ms = 0U;
-    s_sbus_arm_enable_last_ms = 0U;
-    memset(s_sbus_arm_zero_ms, 0, sizeof(s_sbus_arm_zero_ms));
-    ArmMotor_Disable();
-    DebugUart_Printf("SBUS arm mode OFF.\r\n");
-}
-
-static uint8_t sbus_arm_joint_healthy(uint8_t online,
-                                      const ArmMotorFeedback *feedback)
-{
-    return ((online != 0U) && (feedback != nullptr) &&
-            (feedback->fault_valid != 0U) && (feedback->fault == 0U)) ? 1U : 0U;
-}
-
-static void sbus_arm_set_zero_target(uint8_t joint)
-{
-    if (joint == ARM_J0_DM4310) {
-        s_sbus_arm_j0_target_deg = 0.0f;
-    } else if (joint == ARM_J1_LZ) {
-        s_sbus_arm_j1_target_deg = 0.0f;
-    }
-    ArmMotor_SetTargetDeg(joint, 0.0f, 0.0f, 0.0f);
-}
-
-static void sbus_arm_enter(uint32_t now)
-{
-    if ((DogSafety_IsLatched() != 0U) || (s_sbus_safety_active != 0U) ||
-        (s_sbus_remote_lockout != 0U)) {
-        ArmMotor_SetPumpEnabled(0U);
-        return;
-    }
-
-    if ((s_sbus_arm_active == 0U) && (s_sbus_arm_enable_pending == 0U)) {
-        s_sbus_arm_enable_pending = 1U;
-        s_sbus_arm_enable_last_ms = now;
-        ArmMotor_Enable();
-        DebugUart_Printf("SBUS arm init: enable J0/J1, then zero each available joint.\r\n");
-    } else if ((s_sbus_arm_enable_pending != 0U) &&
-               ((s_sbus_arm_enable_last_ms == 0U) ||
-                ((uint32_t)(now - s_sbus_arm_enable_last_ms) >=
-                 SBUS_ARM_ENABLE_RETRY_MS))) {
-        s_sbus_arm_enable_last_ms = now;
-        ArmMotor_Enable();
-    }
-
-    const uint8_t was_active = s_sbus_arm_active;
-    ArmMotorFeedback feedback[ARM_JOINT_COUNT] = {};
-    for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
-        const uint8_t bit = (uint8_t)(1U << joint);
-        const uint8_t online = ArmMotor_GetFeedback(joint, &feedback[joint]);
-        const uint8_t healthy = sbus_arm_joint_healthy(online, &feedback[joint]);
-
-        if ((s_sbus_arm_ready_mask & bit) != 0U) {
-            if (healthy == 0U) {
-                s_sbus_arm_ready_mask &= (uint8_t)~bit;
-                s_sbus_arm_zero_sent_mask &= (uint8_t)~bit;
-                s_sbus_arm_zero_ms[joint] = 0U;
-                DebugUart_Printf("SBUS arm J%u lost ready state; reinitializing.\r\n",
-                                 (unsigned)joint);
-            }
-            continue;
-        }
-        if (healthy == 0U) {
-            continue;
-        }
-
-        if ((s_sbus_arm_zero_sent_mask & bit) == 0U) {
-            ArmMotor_Zero(joint);
-            s_sbus_arm_zero_sent_mask |= bit;
-            s_sbus_arm_zero_ms[joint] = now;
-            DebugUart_Printf("SBUS arm J%u zero requested.\r\n", (unsigned)joint);
-            continue;
-        }
-
-        const uint32_t zero_elapsed_ms = (uint32_t)(now - s_sbus_arm_zero_ms[joint]);
-        const uint8_t zero_feedback_ok =
-            ((zero_elapsed_ms >= SBUS_ARM_ZERO_SETTLE_MS) &&
-             (feedback[joint].feedback_age_ms <= SBUS_ARM_ZERO_FRESH_MS) &&
-             (fabsf(feedback[joint].angle_deg) <= SBUS_ARM_ZERO_TOL_DEG)) ? 1U : 0U;
-        if (zero_feedback_ok != 0U) {
-            s_sbus_arm_ready_mask |= bit;
-            sbus_arm_set_zero_target(joint);
-            DebugUart_Printf("SBUS arm J%u ready at %ldmdeg.\r\n",
-                             (unsigned)joint,
-                             (long)(feedback[joint].angle_deg * 1000.0f));
-        } else if (zero_elapsed_ms >= SBUS_ARM_ZERO_TIMEOUT_MS) {
-            s_sbus_arm_zero_sent_mask &= (uint8_t)~bit;
-            s_sbus_arm_zero_ms[joint] = 0U;
-            DebugUart_Printf("SBUS arm J%u zero not confirmed angle=%ldmdeg; retrying.\r\n",
-                             (unsigned)joint,
-                             (long)(feedback[joint].angle_deg * 1000.0f));
-        }
-    }
-
-    s_sbus_arm_active = (s_sbus_arm_ready_mask != 0U) ? 1U : 0U;
-    s_sbus_arm_enable_pending =
-        (s_sbus_arm_ready_mask != ((1U << ARM_JOINT_COUNT) - 1U)) ? 1U : 0U;
-    if (s_sbus_arm_active == 0U) {
-        ArmMotor_SetPumpEnabled(0U);
-    }
-    if ((was_active == 0U) && (s_sbus_arm_active != 0U)) {
-        s_sbus_arm_last_ms = now;
-        ArmMotor_SetPumpEnabled(1U);
-        DebugUart_Printf("SBUS arm mode ON ready=0x%X; unavailable joint keeps retrying.\r\n",
-                         (unsigned)s_sbus_arm_ready_mask);
-    } else if ((was_active != 0U) && (s_sbus_arm_active == 0U)) {
-        DebugUart_Printf("SBUS arm mode waiting: no initialized joint remains ready.\r\n");
-    }
-}
-
-static void sbus_arm_update(const SbusState *rc, uint32_t now)
-{
-    if ((rc == nullptr) || (s_sbus_arm_active == 0U)) {
-        return;
-    }
-
-    if ((uint32_t)(now - s_sbus_arm_last_ms) < SBUS_ARM_UPDATE_MS) {
-        return;
-    }
-
-    ArmMotorFeedback j0_feedback = {};
-    ArmMotorFeedback j1_feedback = {};
-    const uint8_t j0_online = ArmMotor_GetFeedback(ARM_J0_DM4310, &j0_feedback);
-    const uint8_t j1_online = ArmMotor_GetFeedback(ARM_J1_LZ, &j1_feedback);
-
-    fp32 dt_s = (fp32)(now - s_sbus_arm_last_ms) * 0.001f;
-    if (dt_s > 0.1f) {
-        dt_s = 0.1f;
-    }
-    s_sbus_arm_last_ms = now;
-
-    const int16_t j0_norm = sbus_apply_deadband(rc->norm[SBUS_ARM_J0_CH],
-                                                SBUS_ARM_JOG_DEADBAND);
-    const int16_t j1_norm = sbus_apply_deadband(rc->norm[SBUS_ARM_J1_CH],
-                                                SBUS_ARM_JOG_DEADBAND);
-    const fp32 j0_delta_deg = ((fp32)j0_norm / 100.0f) *
-                              SBUS_ARM_RATE_DEG_S * dt_s;
-    const fp32 j1_delta_deg = ((fp32)j1_norm / 100.0f) *
-                              SBUS_ARM_RATE_DEG_S * dt_s;
-
-    if ((j0_online != 0U) &&
-        ((s_sbus_arm_ready_mask & ARM_J0_DM4310_MASK) != 0U)) {
-        s_sbus_arm_j0_target_deg = clamp_fp32_local(s_sbus_arm_j0_target_deg + j0_delta_deg,
-                                                    SBUS_ARM_J0_MIN_DEG,
-                                                    SBUS_ARM_J0_MAX_DEG);
-    }
-    if ((j1_online != 0U) &&
-        ((s_sbus_arm_ready_mask & ARM_J1_LZ_MASK) != 0U)) {
-        s_sbus_arm_j1_target_deg = clamp_fp32_local(s_sbus_arm_j1_target_deg + j1_delta_deg,
-                                                    SBUS_ARM_J1_MIN_DEG,
-                                                    SBUS_ARM_J1_MAX_DEG);
-    }
-
-    if ((j0_online != 0U) &&
-        ((s_sbus_arm_ready_mask & ARM_J0_DM4310_MASK) != 0U)) {
-        ArmMotor_SetTargetDeg(ARM_J0_DM4310, s_sbus_arm_j0_target_deg, 0.0f, 0.0f);
-    }
-    if ((j1_online != 0U) &&
-        ((s_sbus_arm_ready_mask & ARM_J1_LZ_MASK) != 0U)) {
-        ArmMotor_SetTargetDeg(ARM_J1_LZ, s_sbus_arm_j1_target_deg, 0.0f, 0.0f);
     }
 }
 
@@ -1531,20 +1265,7 @@ static void sbus_motor_check_print(uint32_t now)
 
     WheelDriveDiag wheel = {};
     WheelDrive_GetDiag(&wheel);
-    uint8_t arm_online_mask = 0U;
-    uint8_t arm_fault_mask = 0U;
-    int32_t arm_temperature_deci_c[ARM_JOINT_COUNT] = {};
-    for (uint8_t joint = 0U; joint < ARM_JOINT_COUNT; ++joint) {
-        ArmMotorFeedback feedback = {};
-        if (ArmMotor_GetFeedback(joint, &feedback) != 0U) {
-            arm_online_mask |= (uint8_t)(1U << joint);
-        }
-        if (feedback.error != 0U) {
-            arm_fault_mask |= (uint8_t)(1U << joint);
-        }
-        arm_temperature_deci_c[joint] = (int32_t)(feedback.temperature_c * 10.0f);
-    }
-    DebugUart_Printf("MOTOR_CHECK: leg feedback=0x%02X ready=0x%02X fault=0x%02X temp=N/A; wheel feedback=0x%X online=%u lock=%u hot=0x%X temp=%u/%u/%u/%uC; arm feedback=0x%X fault=0x%X temp=%ld.%01ld/%ld.%01ldC\r\n",
+    DebugUart_Printf("MOTOR_CHECK: leg feedback=0x%02X ready=0x%02X fault=0x%02X temp=N/A; wheel feedback=0x%X online=%u lock=%u hot=0x%X temp=%u/%u/%u/%uC\r\n",
                      (unsigned)DogStand_GetOnlineMask(),
                      (unsigned)DogStand_GetReadyMask(),
                      (unsigned)DogStand_GetFaultMask(),
@@ -1554,14 +1275,8 @@ static void sbus_motor_check_print(uint32_t now)
                      (unsigned)wheel.overtemp_mask,
                      (unsigned)wheel.motor[0].temperature_c,
                      (unsigned)wheel.motor[1].temperature_c,
-                     (unsigned)wheel.motor[2].temperature_c,
-                     (unsigned)wheel.motor[3].temperature_c,
-                     (unsigned)arm_online_mask,
-                     (unsigned)arm_fault_mask,
-                     (long)(arm_temperature_deci_c[0] / 10),
-                     (long)labs(arm_temperature_deci_c[0] % 10),
-                     (long)(arm_temperature_deci_c[1] / 10),
-                     (long)labs(arm_temperature_deci_c[1] % 10));
+                      (unsigned)wheel.motor[2].temperature_c,
+                      (unsigned)wheel.motor[3].temperature_c);
 }
 
 static void sbus_mode_transition(SbusRobotMode requested)
@@ -1592,7 +1307,6 @@ static void sbus_mode_transition(SbusRobotMode requested)
         DogObstacle_SetModeRequested(0U);
     }
 
-    sbus_arm_leave();
     if ((s_sbus_lowering_pending != 0U) && (sbus_mode_is_low(requested) == 0U)) {
         dog_mit_lower_to_start_pose_cancel();
         s_sbus_lowering_pending = 0U;
@@ -1617,7 +1331,6 @@ static void sbus_mode_transition(SbusRobotMode requested)
     if (requested == SBUS_MODE_MOTOR_CHECK) {
         sbus_quad_stop_motion_immediate(0U);
         sbus_mechanical_cancel();
-        ArmMotor_Disable();
         if (s_sbus_lowering_pending == 0U) {
             dog_debug_rx_only();
             s_mode = MODE_RX_ONLY;
@@ -1883,29 +1596,6 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
         }
         break;
 
-    case SBUS_MODE_STAND_ARM:
-        WheelDrive_SetProfile(WHEEL_PROFILE_NORMAL);
-        sbus_wheel_hold();
-        if (sbus_mode_prepare_stand(now) != 0U) {
-            if (WheelDrive_IsAvailable() == 0U) {
-                sbus_arm_leave();
-                s_sbus_active_mode = SBUS_MODE_NONE;
-                s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
-                s_sbus_block_reason = SBUS_BLOCK_WHEEL_FAULT;
-                break;
-            }
-            sbus_arm_enter(now);
-            sbus_arm_update(rc, now);
-            if (s_sbus_arm_active != 0U) {
-                sbus_mode_set_active(requested);
-            } else {
-                s_sbus_active_mode = SBUS_MODE_NONE;
-                s_sbus_entry_state = SBUS_ENTRY_WAIT_ARM;
-                s_sbus_block_reason = SBUS_BLOCK_ARM_FEEDBACK;
-            }
-        }
-        break;
-
     case SBUS_MODE_GAIT_WHEEL:
     case SBUS_MODE_GAIT_ONLY:
     {
@@ -2022,7 +1712,6 @@ static void sbus_safety_trigger(void)
     s_sbus_lowering_pending = 0U;
     sbus_mechanical_cancel();
     sbus_wheel_disable(1U);
-    sbus_arm_leave();
     dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
     DogSafety_SetSdEstop(1U);
     sbus_quad_reset_state();
@@ -2087,7 +1776,6 @@ static void sbus_remote_transient_inhibit(uint32_t now)
 {
     Dog_Remote_Sample sample = {};
     sbus_wheel_hold();
-    sbus_arm_leave();
     sbus_quad_stop_motion(0U);
     sample.tick_ms = now;
     DogRemote_Update(&sample);
@@ -2109,14 +1797,11 @@ static void sbus_remote_failsafe(uint32_t now)
         s_sbus_mechanical_permit = 0U;
         s_sbus_mechanical_prepare_since_ms = 0U;
         sbus_wheel_hold();
-        sbus_arm_leave();
         sbus_quad_reset_state();
         s_sbus_active_mode = SBUS_MODE_NONE;
         s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
         s_sbus_block_reason = SBUS_BLOCK_NONE;
         s_mode = MODE_RX_ONLY;
-        s_sbus_arm_active = 0U;
-        s_sbus_arm_last_ms = 0U;
         s_sbus_failsafe_stop_sent = 1U;
         s_sbus_safety_recovery_since_ms = 0U;
     }
@@ -2184,7 +1869,7 @@ static uint8_t usb_physical_authorized(const SbusState *rc,
         (sub_sw != SBUS_SWITCH_LOW)) {
         return 0U;
     }
-    const uint8_t channels[] = {0U, 1U, SBUS_ARM_J0_CH, SBUS_ARM_J1_CH};
+    const uint8_t channels[] = {0U, 1U};
     for (uint8_t i = 0U; i < (uint8_t)(sizeof(channels) / sizeof(channels[0])); ++i) {
         const int16_t value = rc->norm[channels[i]];
         if ((value < -SBUS_MOVE_EXIT_DEADBAND) ||
@@ -2260,7 +1945,7 @@ static SbusRobotMode usb_decode_robot_mode(uint8_t main_sw, uint8_t sub_sw)
     case 2U: return SBUS_MODE_LOW_SAFE;
     case 3U: return SBUS_MODE_STAND_HOLD;
     case 4U: return SBUS_MODE_STAND_WHEEL;
-    case 5U: return SBUS_MODE_STAND_ARM;
+    case 5U: return SBUS_MODE_STAND_HOLD;
     case 6U: return SBUS_MODE_GAIT_ONLY;
     case 7U: return SBUS_MODE_GAIT_WHEEL;
     case 8U: return SBUS_MODE_USB_RESERVED_STAND;
@@ -2285,8 +1970,6 @@ static void usb_build_control_view(const SbusState *physical_rc,
     control_rc->norm[0U] = 0;
     control_rc->norm[1U] = 0;
     control_rc->norm[SBUS_SPEED_CH] = -100;
-    control_rc->norm[SBUS_ARM_J0_CH] = 0;
-    control_rc->norm[SBUS_ARM_J1_CH] = 0;
 
     const uint8_t motion_enable =
         ((s_usb_applied_rc.command_flags & USB_RC_FLAG_MOTION_ENABLE) != 0U) ? 1U : 0U;
@@ -2313,10 +1996,6 @@ static void usb_build_control_view(const SbusState *physical_rc,
     if ((deadman != 0U) && (smooth_stop == 0U)) {
         control_rc->norm[0U] = usb_permille_to_norm(s_usb_applied_rc.yaw_permille);
         control_rc->norm[1U] = usb_permille_to_norm(s_usb_applied_rc.forward_permille);
-        control_rc->norm[SBUS_ARM_J0_CH] =
-            usb_permille_to_norm(s_usb_applied_rc.arm_j0_permille);
-        control_rc->norm[SBUS_ARM_J1_CH] =
-            usb_permille_to_norm(s_usb_applied_rc.arm_j1_permille);
     }
 }
 
@@ -2353,6 +2032,10 @@ void control_task_safety_poll(void)
     s_sbus_safety_active = 0U;
 }
 
+/*
+ * 输入仲裁顺序固定：实体 SBUS 安全输入、锁存安全恢复、USB 授权，
+ * 最后才执行请求模式。在此前不接受任何运动命令。
+ */
 static void sbus_control_update(void)
 {
     SbusState physical_rc = {};
@@ -2418,7 +2101,6 @@ static void sbus_control_update(void)
 
     if ((DogSafety_IsLatched() != 0U) && (s_sbus_safety_needs_clear == 0U)) {
         usb_control_revoke(1U);
-        sbus_arm_leave();
         sbus_quad_reset_state();
         s_sbus_safety_needs_clear = 1U;
         s_sbus_safety_recovery_since_ms = 0U;
@@ -2429,7 +2111,6 @@ static void sbus_control_update(void)
 
     if ((DogStand_IsDisabled() != 0U) && (s_sbus_remote_lockout == 0U)) {
         usb_control_revoke(1U);
-        sbus_arm_leave();
         sbus_quad_reset_state();
         s_sbus_remote_lockout = 1U;
         s_sbus_remote_lockout_logged = 0U;
@@ -2971,6 +2652,7 @@ static void control_init_wait(uint32_t timeout_ms, uint8_t stop_when_host_open)
     }
 }
 
+/* 控制任务负责操作者输入状态；CAN 电机状态始终由 motor_task 管理。 */
 void control_task_init(void)
 {
     VofaPid_Init();
@@ -3001,6 +2683,7 @@ void control_task_init(void)
     enter_rx_only();
 }
 
+/* 常规控制循环：处理异步输入，更新模式状态机，然后让出任务时间。 */
 void control_task(void)
 {
     usb_cdc_process_input();
