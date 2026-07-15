@@ -13,8 +13,8 @@ extern "C" {
 #define DOG_LEG_COUNT           4U
 #define DOG_MOTORS_PER_LEG      2U
 
-/* Maintenance-only: M3 is the damaged RF knee motor. Keep its power phases disconnected. */
-#define DOG_DISABLED_MOTOR_MASK (1U << 3U)
+/* Maintenance-only: M3 (RF knee) and M7 (RB knee) are unavailable. */
+#define DOG_DISABLED_MOTOR_MASK ((1U << 3U) | (1U << 7U))
 
 #define DOG_GAIT_SPEED_LOW      0U
 #define DOG_GAIT_SPEED_MID      1U
@@ -52,8 +52,6 @@ extern "C" {
 #define DOG_STAND_RISE_MS               1500U
 #define DOG_STAND_LOWER_SETTLE_MS        200U
 #define DOG_STAND_LOWER_SETTLE_VEL_DPS     8.0f
-#define DOG_LOW_WHEEL_HIP_LIFT_DEG       (-15.0f)
-#define DOG_LOW_WHEEL_HIP_LIFT_MS         800U
 #define DOG_JUMP_FOOT_X_MM              DOG_STAND_FOOT_X_MM
 #define DOG_JUMP_APEX_Z_MM              400.0f
 #define DOG_JUMP_LAND_Z_MM              DOG_STAND_FOOT_Z_MM
@@ -479,11 +477,11 @@ void DogStand_Request(void);
 void DogStand_Disable(void);
 uint8_t DogStand_ClearDisable(void);
 uint8_t DogStand_IsDisabled(void);
-uint8_t DogStand_EnterMechanicalLimitPose(void);
-uint8_t DogStand_IsMechanicalLimitPose(void);
-uint8_t DogStand_IsMechanicalLimitPoseReady(void);
-uint8_t DogStand_GetMechanicalLimitPoseMask(void);
-void DogStand_ExitMechanicalLimitPose(void);
+uint8_t DogStand_EnterMechanicalLimitIdle(void);
+uint8_t DogStand_IsMechanicalLimitIdle(void);
+uint8_t DogStand_IsMechanicalLimitIdleReady(void);
+uint8_t DogStand_GetMechanicalLimitIdleMask(void);
+void DogStand_ExitMechanicalLimitIdle(void);
 Dog_Stand_State DogStand_GetState(void);
 uint8_t DogStand_GetOnlineMask(void);
 uint8_t DogStand_GetReadyMask(void);

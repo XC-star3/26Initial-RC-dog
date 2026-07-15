@@ -59,7 +59,6 @@
 #define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
 #define SBUS_FAULT_CLEAR_RETRY_MS 1000U
-#define SBUS_WHEEL_REVERSE_NEUTRAL_MS 200U
 #define SBUS_OBSTACLE_WHEEL_STOP_MS 200U
 #define SBUS_MECHANICAL_PREPARE_MS     200U
 #define SBUS_WHEEL_MIN_RPM               40.0f
@@ -180,9 +179,6 @@ static uint8_t s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
 static uint32_t s_sbus_gait_retry_ms = 0U;
 static uint8_t s_sbus_drive_reverse_pending = 0U;
 static uint8_t s_sbus_speed_profile = DOG_GAIT_SPEED_DEFAULT;
-static int8_t s_sbus_low_wheel_direction = 0;
-static uint8_t s_sbus_low_wheel_reverse_rearm = 0U;
-static uint32_t s_sbus_low_wheel_neutral_since_ms = 0U;
 static uint8_t s_sbus_mechanical_permit = 0U;
 static uint32_t s_sbus_mechanical_prepare_since_ms = 0U;
 static SbusRobotMode s_sbus_requested_mode = SBUS_MODE_NONE;
@@ -229,7 +225,6 @@ static float sbus_gait_wheel_max_rpm(const SbusState *rc,
 static void sbus_wheel_hold(void);
 static void sbus_wheel_disable(uint8_t lock);
 static uint8_t sbus_wheel_update(const SbusState *rc);
-static uint8_t sbus_low_wheel_update(const SbusState *rc, uint32_t now);
 static SbusRobotMode sbus_decode_robot_mode(uint8_t main_sw, uint8_t sub_sw);
 static const char *sbus_robot_mode_name(SbusRobotMode mode);
 static const char *sbus_entry_state_name(SbusModeEntryState state);
@@ -575,11 +570,10 @@ static void print_sbus_status(void)
                      (unsigned)DogSafety_IsLatched(),
                      (unsigned)DogStand_IsDisabled(),
                       dog_mit_gait_speed_profile_name());
-    DebugUart_Printf("  mechanical: pose=%u pose_mask=0x%02X pose_ready=%u hip_lift=%ldmdeg permit=%u prep_ms=%lu\r\n",
-                     (unsigned)DogStand_IsMechanicalLimitPose(),
-                     (unsigned)DogStand_GetMechanicalLimitPoseMask(),
-                     (unsigned)DogStand_IsMechanicalLimitPoseReady(),
-                     (long)(DOG_LOW_WHEEL_HIP_LIFT_DEG * 1000.0f),
+    DebugUart_Printf("  mechanical: idle=%u idle_mask=0x%02X idle_ready=%u permit=%u prep_ms=%lu\r\n",
+                     (unsigned)DogStand_IsMechanicalLimitIdle(),
+                     (unsigned)DogStand_GetMechanicalLimitIdleMask(),
+                     (unsigned)DogStand_IsMechanicalLimitIdleReady(),
                      (unsigned)s_sbus_mechanical_permit,
                      (unsigned long)((s_sbus_mechanical_prepare_since_ms == 0U) ? 0U :
                                      (now - s_sbus_mechanical_prepare_since_ms)));
@@ -1058,9 +1052,6 @@ static void sbus_quad_reset_state(void)
 
 static void sbus_wheel_disable(uint8_t lock)
 {
-    s_sbus_low_wheel_direction = 0;
-    s_sbus_low_wheel_reverse_rearm = 0U;
-    s_sbus_low_wheel_neutral_since_ms = 0U;
     WheelDrive_SetOperatingMode(WHEEL_OPERATING_OFF);
     if (lock != 0U) {
         WheelDrive_StopAndLock();
@@ -1076,7 +1067,7 @@ static void sbus_mechanical_cancel(void)
 {
     s_sbus_mechanical_permit = 0U;
     s_sbus_mechanical_prepare_since_ms = 0U;
-    DogStand_ExitMechanicalLimitPose();
+    DogStand_ExitMechanicalLimitIdle();
 }
 
 static void sbus_mechanical_prepare(const SbusState *rc, uint32_t now)
@@ -1145,59 +1136,6 @@ static float sbus_gait_wheel_max_rpm(const SbusState *rc,
         SBUS_HYBRID_WHEEL_MIN_RPM,
         matched_rpm * SBUS_HYBRID_WHEEL_SPEED_GAIN);
     return fminf(operator_limit_rpm, assist_limit_rpm);
-}
-
-static uint8_t sbus_low_wheel_update(const SbusState *rc, uint32_t now)
-{
-    if ((rc == nullptr) || (WheelDrive_IsAvailable() == 0U)) {
-        sbus_wheel_hold();
-        return 0U;
-    }
-
-    const int16_t move = rc->norm[1U];
-    const uint8_t neutral = ((move >= -SBUS_MOVE_EXIT_DEADBAND) &&
-                             (move <= SBUS_MOVE_EXIT_DEADBAND)) ? 1U : 0U;
-    int8_t requested = s_sbus_low_wheel_direction;
-    if (move > SBUS_MOVE_ENTER_DEADBAND) {
-        requested = 1;
-    } else if (move < -SBUS_MOVE_ENTER_DEADBAND) {
-        requested = -1;
-    } else if (neutral != 0U) {
-        requested = 0;
-    }
-
-    if ((requested != 0) && (s_sbus_low_wheel_direction != 0) &&
-        (requested != s_sbus_low_wheel_direction)) {
-        s_sbus_low_wheel_reverse_rearm = 1U;
-        s_sbus_low_wheel_neutral_since_ms = 0U;
-        requested = 0;
-    }
-    if (s_sbus_low_wheel_reverse_rearm != 0U) {
-        requested = 0;
-        if (neutral != 0U) {
-            if (s_sbus_low_wheel_neutral_since_ms == 0U) {
-                s_sbus_low_wheel_neutral_since_ms = now;
-            } else if ((uint32_t)(now - s_sbus_low_wheel_neutral_since_ms) >=
-                       SBUS_WHEEL_REVERSE_NEUTRAL_MS) {
-                s_sbus_low_wheel_reverse_rearm = 0U;
-                s_sbus_low_wheel_neutral_since_ms = 0U;
-            }
-        } else {
-            s_sbus_low_wheel_neutral_since_ms = 0U;
-        }
-    }
-
-    if (requested != s_sbus_low_wheel_direction) {
-        DebugUart_Printf("LOW wheel CH2=%d direction=%d max=%ldrpm.\r\n",
-                         (int)move, (int)requested,
-                         (long)sbus_wheel_max_rpm(rc));
-    }
-    s_sbus_low_wheel_direction = requested;
-    WheelDrive_SetOperatingMode(WHEEL_OPERATING_DRIVE);
-    WheelDrive_SetMotion((float)requested,
-                         sbus_axis_to_drive(rc->norm[0U]),
-                         sbus_wheel_max_rpm(rc));
-    return 1U;
 }
 
 static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc)
@@ -1719,7 +1657,7 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
     switch (requested) {
     case SBUS_MODE_MOTOR_CHECK:
         sbus_wheel_disable(0U);
-        DogStand_ExitMechanicalLimitPose();
+        DogStand_ExitMechanicalLimitIdle();
         WheelDrive_SetProfile(WHEEL_PROFILE_NORMAL);
         (void)DogStand_ClearDisable();
         (void)WheelDrive_TryClearLock();
@@ -1731,23 +1669,21 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
     case SBUS_MODE_LOW_WHEEL:
         WheelDrive_SetProfile(WHEEL_PROFILE_MECHANICAL_CRAWL);
         s_sbus_mechanical_prepare_since_ms = 0U;
-        if ((DogStand_IsMechanicalLimitPose() == 0U) &&
+        if ((DogStand_IsMechanicalLimitIdle() == 0U) &&
             (s_sbus_mechanical_permit != 0U)) {
             s_sbus_mechanical_permit = 0U;
-            /* The blocking leg transition exceeds the wheel command watchdog.
-             * Keep wheels explicitly OFF so it is not mistaken for a timeout. */
             sbus_wheel_disable(0U);
             sbus_quad_stop_motion_immediate(0U);
             sbus_quad_reset_state();
-            if (DogStand_EnterMechanicalLimitPose() == 0U) {
+            if (DogStand_EnterMechanicalLimitIdle() == 0U) {
                 s_sbus_active_mode = SBUS_MODE_NONE;
                 s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
                 s_sbus_block_reason = SBUS_BLOCK_LEG_FAULT;
                 break;
             }
         }
-        if (DogStand_IsMechanicalLimitPoseReady() != 0U) {
-            if (sbus_low_wheel_update(rc, now) != 0U) {
+        if (DogStand_IsMechanicalLimitIdleReady() != 0U) {
+            if (sbus_wheel_update(rc) != 0U) {
                 sbus_mode_set_active(requested);
             } else {
                 s_sbus_active_mode = SBUS_MODE_NONE;
