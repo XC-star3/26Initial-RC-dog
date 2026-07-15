@@ -52,6 +52,10 @@ static constexpr uint8_t kFrontLegMask =
     (uint8_t)((1U << DOG_LEG_LF) | (1U << DOG_LEG_RF));
 static constexpr uint8_t kRearLegMask =
     (uint8_t)((1U << DOG_LEG_LB) | (1U << DOG_LEG_RB));
+static constexpr uint8_t kLeftFrontLegMask = (uint8_t)(1U << DOG_LEG_LF);
+static constexpr uint8_t kRightFrontLegMask = (uint8_t)(1U << DOG_LEG_RF);
+static constexpr uint8_t kLeftRearLegMask = (uint8_t)(1U << DOG_LEG_LB);
+static constexpr uint8_t kRightRearLegMask = (uint8_t)(1U << DOG_LEG_RB);
 static constexpr uint8_t kCheckpointUnprepared = 0xFFU;
 
 enum BridgeMotionKind {
@@ -82,7 +86,9 @@ static uint32_t s_recovery_duration_ms = 0U;
 
 static constexpr uint8_t kStairWaypointCount =
     (uint8_t)(DOG_STAIR_PHASE_TOP_READY + 1U);
-static constexpr uint8_t kStairMaxSegments = 16U;
+static constexpr uint8_t kStairMaxSegments = 24U;
+static_assert(kStairMaxSegments >= 22U,
+              "Stair sequence capacity is too small for single-leg top entry");
 
 struct StairSegment {
     uint8_t source_phase;
@@ -137,6 +143,26 @@ static void stair_set_waypoint(uint8_t phase, float front_x, float front_z,
     }
 }
 
+static void stair_copy_waypoint(uint8_t target_phase, uint8_t source_phase)
+{
+    if ((target_phase >= kStairWaypointCount) ||
+        (source_phase >= kStairWaypointCount)) {
+        return;
+    }
+    memcpy(s_stair.waypoint[target_phase], s_stair.waypoint[source_phase],
+           sizeof(s_stair.waypoint[target_phase]));
+}
+
+static void stair_set_leg_waypoint(uint8_t phase, uint8_t leg,
+                                   float x_mm, float z_mm)
+{
+    if ((phase >= kStairWaypointCount) || (leg >= DOG_LEG_COUNT)) {
+        return;
+    }
+    s_stair.waypoint[phase][leg].x_mm = x_mm;
+    s_stair.waypoint[phase][leg].z_mm = z_mm;
+}
+
 static void stair_build_geometry(void)
 {
     const float front_z = stair_front_normal_z();
@@ -152,36 +178,96 @@ static void stair_build_geometry(void)
     stair_set_waypoint(DOG_STAIR_PHASE_IDLE, 0.0f, front_z, 0.0f, rear_z);
     stair_set_waypoint(DOG_STAIR_PHASE_PREP_BODY_SHIFT,
                        -compact, front_z, -compact, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_PREP_REAR_COMPACT,
-                       -compact, front_z, compact, rear_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT,
+                        DOG_STAIR_PHASE_PREP_BODY_SHIFT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT,
+                           DOG_LEG_LB, compact, rear_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_PREP_REAR_COMPACT,
+                        DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_PREP_REAR_COMPACT,
+                           DOG_LEG_RB, compact, rear_z);
     stair_set_waypoint(DOG_STAIR_PHASE_LEVEL_READY,
                        -compact, front_z, compact, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_FRONT_LIFT,
-                       -compact, front_lift_z, compact, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_FRONT_FORWARD,
-                       front_forward, front_lift_z, compact, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_FRONT_LAND,
-                       front_forward, front_upper_z, compact, rear_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
+                        DOG_STAIR_PHASE_LEVEL_READY);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
+                           DOG_LEG_LF, -compact, front_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
+                        DOG_STAIR_PHASE_LEFT_FRONT_LIFT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
+                           DOG_LEG_LF, front_forward, front_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LAND,
+                        DOG_STAIR_PHASE_LEFT_FRONT_FORWARD);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LAND,
+                           DOG_LEG_LF, front_forward, front_upper_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
+                        DOG_STAIR_PHASE_LEFT_FRONT_LAND);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
+                           DOG_LEG_RF, -compact, front_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
+                        DOG_STAIR_PHASE_RIGHT_FRONT_LIFT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
+                           DOG_LEG_RF, front_forward, front_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LAND,
+                        DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LAND,
+                           DOG_LEG_RF, front_forward, front_upper_z);
     stair_set_waypoint(DOG_STAIR_PHASE_BODY_SHIFT,
                        -compact, front_upper_z, rear_shift, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_REAR_LIFT,
-                       -compact, front_upper_z, rear_shift, rear_lift_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_REAR_FORWARD,
-                       -compact, front_upper_z, compact, rear_lift_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_REAR_LAND,
-                       -compact, front_upper_z, compact, rear_upper_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LIFT,
+                        DOG_STAIR_PHASE_BODY_SHIFT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LIFT,
+                           DOG_LEG_LB, rear_shift, rear_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
+                        DOG_STAIR_PHASE_LEFT_REAR_LIFT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
+                           DOG_LEG_LB, compact, rear_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LAND,
+                        DOG_STAIR_PHASE_LEFT_REAR_FORWARD);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LAND,
+                           DOG_LEG_LB, compact, rear_upper_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
+                        DOG_STAIR_PHASE_LEFT_REAR_LAND);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
+                           DOG_LEG_RB, rear_shift, rear_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
+                        DOG_STAIR_PHASE_RIGHT_REAR_LIFT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
+                           DOG_LEG_RB, compact, rear_lift_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LAND,
+                        DOG_STAIR_PHASE_RIGHT_REAR_FORWARD);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LAND,
+                           DOG_LEG_RB, compact, rear_upper_z);
     stair_set_waypoint(DOG_STAIR_PHASE_BODY_RAISE,
                        -compact, front_z, compact, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
-                       front_forward, front_z, compact, rear_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE,
+                        DOG_STAIR_PHASE_BODY_RAISE);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE,
+                           DOG_LEG_LF, front_forward, front_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_TOP_RIGHT_FRONT_ADVANCE,
+                        DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_TOP_RIGHT_FRONT_ADVANCE,
+                           DOG_LEG_RF, front_forward, front_z);
     stair_set_waypoint(DOG_STAIR_PHASE_TOP_BODY_SHIFT,
                        -compact, front_z, rear_shift, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
-                       -compact, front_z, compact, rear_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE,
+                        DOG_STAIR_PHASE_TOP_BODY_SHIFT);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE,
+                           DOG_LEG_LB, compact, rear_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_TOP_RIGHT_REAR_ADVANCE,
+                        DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_TOP_RIGHT_REAR_ADVANCE,
+                           DOG_LEG_RB, compact, rear_z);
     stair_set_waypoint(DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
                        -(2.0f * compact), front_z, 0.0f, rear_z);
-    stair_set_waypoint(DOG_STAIR_PHASE_TOP_FRONT_NORMAL,
-                       0.0f, front_z, 0.0f, rear_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL,
+                        DOG_STAIR_PHASE_TOP_BODY_NORMALIZE);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL,
+                           DOG_LEG_LF, 0.0f, front_z);
+    stair_copy_waypoint(DOG_STAIR_PHASE_TOP_RIGHT_FRONT_NORMAL,
+                        DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL);
+    stair_set_leg_waypoint(DOG_STAIR_PHASE_TOP_RIGHT_FRONT_NORMAL,
+                           DOG_LEG_RF, 0.0f, front_z);
     stair_set_waypoint(DOG_STAIR_PHASE_TOP_READY,
                        0.0f, front_z, 0.0f, rear_z);
     s_stair.geometry_ready = 1U;
@@ -681,34 +767,74 @@ static uint8_t stair_geometry_valid(void)
     static const StairPathCheck checks[] = {
         {DOG_STAIR_PHASE_IDLE, DOG_STAIR_PHASE_PREP_BODY_SHIFT,
          DOG_LEG_MASK_ALL, 0.0f},
-        {DOG_STAIR_PHASE_PREP_BODY_SHIFT, DOG_STAIR_PHASE_PREP_REAR_COMPACT,
-         kRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
-        {DOG_STAIR_PHASE_LEVEL_READY, DOG_STAIR_PHASE_FRONT_LIFT,
-         kFrontLegMask, 0.0f},
-        {DOG_STAIR_PHASE_FRONT_LIFT, DOG_STAIR_PHASE_FRONT_FORWARD,
-         kFrontLegMask, 0.0f},
-        {DOG_STAIR_PHASE_FRONT_FORWARD, DOG_STAIR_PHASE_FRONT_LAND,
-         kFrontLegMask, 0.0f},
-        {DOG_STAIR_PHASE_FRONT_LAND, DOG_STAIR_PHASE_BODY_SHIFT,
+        {DOG_STAIR_PHASE_PREP_BODY_SHIFT,
+         DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT,
+         kLeftRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT,
+         DOG_STAIR_PHASE_PREP_REAR_COMPACT,
+         kRightRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_LEVEL_READY, DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
+         kLeftFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
+         DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
+         kLeftFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
+         DOG_STAIR_PHASE_LEFT_FRONT_LAND,
+         kLeftFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_LEFT_FRONT_LAND,
+         DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
+         kRightFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
+         DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
+         kRightFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
+         DOG_STAIR_PHASE_RIGHT_FRONT_LAND,
+         kRightFrontLegMask, 0.0f},
+        {DOG_STAIR_PHASE_RIGHT_FRONT_LAND, DOG_STAIR_PHASE_BODY_SHIFT,
          DOG_LEG_MASK_ALL, 0.0f},
-        {DOG_STAIR_PHASE_BODY_SHIFT, DOG_STAIR_PHASE_REAR_LIFT,
-         kRearLegMask, 0.0f},
-        {DOG_STAIR_PHASE_REAR_LIFT, DOG_STAIR_PHASE_REAR_FORWARD,
-         kRearLegMask, 0.0f},
-        {DOG_STAIR_PHASE_REAR_FORWARD, DOG_STAIR_PHASE_REAR_LAND,
-         kRearLegMask, 0.0f},
-        {DOG_STAIR_PHASE_REAR_LAND, DOG_STAIR_PHASE_BODY_RAISE,
+        {DOG_STAIR_PHASE_BODY_SHIFT, DOG_STAIR_PHASE_LEFT_REAR_LIFT,
+         kLeftRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_LEFT_REAR_LIFT,
+         DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
+         kLeftRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
+         DOG_STAIR_PHASE_LEFT_REAR_LAND,
+         kLeftRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_LEFT_REAR_LAND,
+         DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
+         kRightRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
+         DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
+         kRightRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
+         DOG_STAIR_PHASE_RIGHT_REAR_LAND,
+         kRightRearLegMask, 0.0f},
+        {DOG_STAIR_PHASE_RIGHT_REAR_LAND, DOG_STAIR_PHASE_BODY_RAISE,
          DOG_LEG_MASK_ALL, 0.0f},
-        {DOG_STAIR_PHASE_LEVEL_READY, DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
-         kFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
-        {DOG_STAIR_PHASE_TOP_FRONT_ADVANCE, DOG_STAIR_PHASE_TOP_BODY_SHIFT,
+        {DOG_STAIR_PHASE_BODY_RAISE,
+         DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE,
+         kLeftFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE,
+         DOG_STAIR_PHASE_TOP_RIGHT_FRONT_ADVANCE,
+         kRightFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_RIGHT_FRONT_ADVANCE,
+         DOG_STAIR_PHASE_TOP_BODY_SHIFT,
          DOG_LEG_MASK_ALL, 0.0f},
-        {DOG_STAIR_PHASE_TOP_BODY_SHIFT, DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
-         kRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
-        {DOG_STAIR_PHASE_TOP_REAR_ADVANCE, DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
+        {DOG_STAIR_PHASE_TOP_BODY_SHIFT,
+         DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE,
+         kLeftRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE,
+         DOG_STAIR_PHASE_TOP_RIGHT_REAR_ADVANCE,
+         kRightRearLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_RIGHT_REAR_ADVANCE,
+         DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
          DOG_LEG_MASK_ALL, 0.0f},
-        {DOG_STAIR_PHASE_TOP_BODY_NORMALIZE, DOG_STAIR_PHASE_TOP_FRONT_NORMAL,
-         kFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
+         DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL,
+         kLeftFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
+        {DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL,
+         DOG_STAIR_PHASE_TOP_RIGHT_FRONT_NORMAL,
+         kRightFrontLegMask, DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM},
     };
     for (uint8_t i = 0U; i < (uint8_t)(sizeof(checks) / sizeof(checks[0])); ++i) {
         if (stair_path_valid(checks[i].source, checks[i].target,
@@ -757,34 +883,58 @@ static uint8_t stair_sequence_add(uint8_t source, uint8_t target,
 static uint8_t stair_add_level_sequence(uint8_t source_phase)
 {
     return
-        stair_sequence_add(source_phase, DOG_STAIR_PHASE_FRONT_LIFT,
-                           kFrontLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
+        stair_sequence_add(source_phase, DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
+                           kLeftFrontLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
                            0.0f, 0U) &&
-        stair_sequence_add(DOG_STAIR_PHASE_FRONT_LIFT,
-                           DOG_STAIR_PHASE_FRONT_FORWARD,
-                           kFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+        stair_sequence_add(DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
+                           DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
+                           kLeftFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
                            0.0f, 0U) &&
-        stair_sequence_add(DOG_STAIR_PHASE_FRONT_FORWARD,
-                           DOG_STAIR_PHASE_FRONT_LAND,
-                           kFrontLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
+        stair_sequence_add(DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
+                           DOG_STAIR_PHASE_LEFT_FRONT_LAND,
+                           kLeftFrontLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
                            0.0f, DOG_OBSTACLE_STAIR_DWELL_MS) &&
-        stair_sequence_add(DOG_STAIR_PHASE_FRONT_LAND,
+        stair_sequence_add(DOG_STAIR_PHASE_LEFT_FRONT_LAND,
+                           DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
+                           kRightFrontLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
+                           DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
+                           kRightFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
+                           DOG_STAIR_PHASE_RIGHT_FRONT_LAND,
+                           kRightFrontLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
+                           0.0f, DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_RIGHT_FRONT_LAND,
                            DOG_STAIR_PHASE_BODY_SHIFT,
                            DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_BODY_SHIFT_MS,
                            0.0f, 0U) &&
         stair_sequence_add(DOG_STAIR_PHASE_BODY_SHIFT,
-                           DOG_STAIR_PHASE_REAR_LIFT,
-                           kRearLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
+                           DOG_STAIR_PHASE_LEFT_REAR_LIFT,
+                           kLeftRearLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
                            0.0f, 0U) &&
-        stair_sequence_add(DOG_STAIR_PHASE_REAR_LIFT,
-                           DOG_STAIR_PHASE_REAR_FORWARD,
-                           kRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+        stair_sequence_add(DOG_STAIR_PHASE_LEFT_REAR_LIFT,
+                           DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
+                           kLeftRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
                            0.0f, 0U) &&
-        stair_sequence_add(DOG_STAIR_PHASE_REAR_FORWARD,
-                           DOG_STAIR_PHASE_REAR_LAND,
-                           kRearLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
+        stair_sequence_add(DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
+                           DOG_STAIR_PHASE_LEFT_REAR_LAND,
+                           kLeftRearLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
                            0.0f, DOG_OBSTACLE_STAIR_DWELL_MS) &&
-        stair_sequence_add(DOG_STAIR_PHASE_REAR_LAND,
+        stair_sequence_add(DOG_STAIR_PHASE_LEFT_REAR_LAND,
+                           DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
+                           kRightRearLegMask, DOG_OBSTACLE_STAIR_LIFT_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
+                           DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
+                           kRightRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           0.0f, 0U) &&
+        stair_sequence_add(DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
+                           DOG_STAIR_PHASE_RIGHT_REAR_LAND,
+                           kRightRearLegMask, DOG_OBSTACLE_STAIR_LAND_MS,
+                           0.0f, DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_RIGHT_REAR_LAND,
                            DOG_STAIR_PHASE_BODY_RAISE,
                            DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_BODY_RAISE_MS,
                            0.0f, DOG_OBSTACLE_STAIR_DWELL_MS);
@@ -794,25 +944,41 @@ static uint8_t stair_add_top_sequence(void)
 {
     return
         stair_sequence_add(DOG_STAIR_PHASE_BODY_RAISE,
-                           DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
-                           kFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
-                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM, 0U) &&
-        stair_sequence_add(DOG_STAIR_PHASE_TOP_FRONT_ADVANCE,
+                           DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE,
+                           kLeftFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                           DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE,
+                           DOG_STAIR_PHASE_TOP_RIGHT_FRONT_ADVANCE,
+                           kRightFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                           DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_RIGHT_FRONT_ADVANCE,
                            DOG_STAIR_PHASE_TOP_BODY_SHIFT,
                            DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_BODY_SHIFT_MS,
                            0.0f, 0U) &&
         stair_sequence_add(DOG_STAIR_PHASE_TOP_BODY_SHIFT,
-                           DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
-                           kRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE,
+                           kLeftRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
                            DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
                            DOG_OBSTACLE_STAIR_DWELL_MS) &&
-        stair_sequence_add(DOG_STAIR_PHASE_TOP_REAR_ADVANCE,
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE,
+                           DOG_STAIR_PHASE_TOP_RIGHT_REAR_ADVANCE,
+                           kRightRearLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                           DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_RIGHT_REAR_ADVANCE,
                            DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
                            DOG_LEG_MASK_ALL, DOG_OBSTACLE_STAIR_PREPARE_MS,
                            0.0f, 0U) &&
         stair_sequence_add(DOG_STAIR_PHASE_TOP_BODY_NORMALIZE,
-                           DOG_STAIR_PHASE_TOP_FRONT_NORMAL,
-                           kFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL,
+                           kLeftFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
+                           DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                           DOG_OBSTACLE_STAIR_DWELL_MS) &&
+        stair_sequence_add(DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL,
+                           DOG_STAIR_PHASE_TOP_RIGHT_FRONT_NORMAL,
+                           kRightFrontLegMask, DOG_OBSTACLE_STAIR_FORWARD_MS,
                            DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
                            DOG_OBSTACLE_STAIR_DWELL_MS);
 }
@@ -834,8 +1000,14 @@ static uint8_t stair_build_forward_sequence(void)
                                 DOG_OBSTACLE_STAIR_PREPARE_MS,
                                 0.0f, 0U) == 0U) ||
             (stair_sequence_add(DOG_STAIR_PHASE_PREP_BODY_SHIFT,
+                                DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT,
+                                kLeftRearLegMask,
+                                DOG_OBSTACLE_STAIR_PREPARE_MS,
+                                DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
+                                DOG_OBSTACLE_STAIR_DWELL_MS) == 0U) ||
+            (stair_sequence_add(DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT,
                                 DOG_STAIR_PHASE_PREP_REAR_COMPACT,
-                                kRearLegMask,
+                                kRightRearLegMask,
                                 DOG_OBSTACLE_STAIR_PREPARE_MS,
                                 DOG_OBSTACLE_STAIR_FLAT_CLEARANCE_MM,
                                 DOG_OBSTACLE_STAIR_DWELL_MS) == 0U)) {
@@ -1387,25 +1559,35 @@ const char *DogObstacle_StateName(uint8_t state)
 const char *DogObstacle_StairPhaseName(uint8_t phase)
 {
     switch (phase) {
-    case DOG_STAIR_PHASE_IDLE:               return "IDLE";
-    case DOG_STAIR_PHASE_PREP_BODY_SHIFT:    return "PREP_BODY_SHIFT";
-    case DOG_STAIR_PHASE_PREP_REAR_COMPACT:  return "PREP_REAR_COMPACT";
-    case DOG_STAIR_PHASE_LEVEL_READY:        return "LEVEL_READY";
-    case DOG_STAIR_PHASE_FRONT_LIFT:         return "FRONT_LIFT";
-    case DOG_STAIR_PHASE_FRONT_FORWARD:      return "FRONT_FORWARD";
-    case DOG_STAIR_PHASE_FRONT_LAND:         return "FRONT_LAND";
-    case DOG_STAIR_PHASE_BODY_SHIFT:         return "BODY_SHIFT";
-    case DOG_STAIR_PHASE_REAR_LIFT:          return "REAR_LIFT";
-    case DOG_STAIR_PHASE_REAR_FORWARD:       return "REAR_FORWARD";
-    case DOG_STAIR_PHASE_REAR_LAND:          return "REAR_LAND";
-    case DOG_STAIR_PHASE_BODY_RAISE:         return "BODY_RAISE";
-    case DOG_STAIR_PHASE_TOP_FRONT_ADVANCE:  return "TOP_FRONT_ADVANCE";
-    case DOG_STAIR_PHASE_TOP_BODY_SHIFT:     return "TOP_BODY_SHIFT";
-    case DOG_STAIR_PHASE_TOP_REAR_ADVANCE:   return "TOP_REAR_ADVANCE";
-    case DOG_STAIR_PHASE_TOP_BODY_NORMALIZE: return "TOP_BODY_NORMALIZE";
-    case DOG_STAIR_PHASE_TOP_FRONT_NORMAL:   return "TOP_FRONT_NORMAL";
-    case DOG_STAIR_PHASE_TOP_READY:          return "TOP_READY";
-    case DOG_STAIR_PHASE_RECOVERY:           return "RECOVERY";
-    default:                                 return "UNKNOWN";
+    case DOG_STAIR_PHASE_IDLE:                    return "IDLE";
+    case DOG_STAIR_PHASE_PREP_BODY_SHIFT:         return "PREP_BODY_SHIFT";
+    case DOG_STAIR_PHASE_PREP_LEFT_REAR_COMPACT:  return "PREP_LEFT_REAR_COMPACT";
+    case DOG_STAIR_PHASE_PREP_REAR_COMPACT:       return "PREP_REAR_COMPACT";
+    case DOG_STAIR_PHASE_LEVEL_READY:             return "LEVEL_READY";
+    case DOG_STAIR_PHASE_LEFT_FRONT_LIFT:         return "LEFT_FRONT_LIFT";
+    case DOG_STAIR_PHASE_LEFT_FRONT_FORWARD:      return "LEFT_FRONT_FORWARD";
+    case DOG_STAIR_PHASE_LEFT_FRONT_LAND:         return "LEFT_FRONT_LAND";
+    case DOG_STAIR_PHASE_RIGHT_FRONT_LIFT:        return "RIGHT_FRONT_LIFT";
+    case DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD:     return "RIGHT_FRONT_FORWARD";
+    case DOG_STAIR_PHASE_RIGHT_FRONT_LAND:        return "RIGHT_FRONT_LAND";
+    case DOG_STAIR_PHASE_BODY_SHIFT:              return "BODY_SHIFT";
+    case DOG_STAIR_PHASE_LEFT_REAR_LIFT:          return "LEFT_REAR_LIFT";
+    case DOG_STAIR_PHASE_LEFT_REAR_FORWARD:       return "LEFT_REAR_FORWARD";
+    case DOG_STAIR_PHASE_LEFT_REAR_LAND:          return "LEFT_REAR_LAND";
+    case DOG_STAIR_PHASE_RIGHT_REAR_LIFT:         return "RIGHT_REAR_LIFT";
+    case DOG_STAIR_PHASE_RIGHT_REAR_FORWARD:      return "RIGHT_REAR_FORWARD";
+    case DOG_STAIR_PHASE_RIGHT_REAR_LAND:         return "RIGHT_REAR_LAND";
+    case DOG_STAIR_PHASE_BODY_RAISE:              return "BODY_RAISE";
+    case DOG_STAIR_PHASE_TOP_LEFT_FRONT_ADVANCE:  return "TOP_LEFT_FRONT_ADVANCE";
+    case DOG_STAIR_PHASE_TOP_RIGHT_FRONT_ADVANCE: return "TOP_RIGHT_FRONT_ADVANCE";
+    case DOG_STAIR_PHASE_TOP_BODY_SHIFT:          return "TOP_BODY_SHIFT";
+    case DOG_STAIR_PHASE_TOP_LEFT_REAR_ADVANCE:   return "TOP_LEFT_REAR_ADVANCE";
+    case DOG_STAIR_PHASE_TOP_RIGHT_REAR_ADVANCE:  return "TOP_RIGHT_REAR_ADVANCE";
+    case DOG_STAIR_PHASE_TOP_BODY_NORMALIZE:      return "TOP_BODY_NORMALIZE";
+    case DOG_STAIR_PHASE_TOP_LEFT_FRONT_NORMAL:   return "TOP_LEFT_FRONT_NORMAL";
+    case DOG_STAIR_PHASE_TOP_RIGHT_FRONT_NORMAL:  return "TOP_RIGHT_FRONT_NORMAL";
+    case DOG_STAIR_PHASE_TOP_READY:               return "TOP_READY";
+    case DOG_STAIR_PHASE_RECOVERY:                return "RECOVERY";
+    default:                                      return "UNKNOWN";
     }
 }
