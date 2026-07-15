@@ -125,7 +125,7 @@ Dog_Motor_Config g_dog_motor_config[DOG_MOTOR_COUNT] = {
     {DOG_LEG_RF, DOG_JOINT_KNEE, DOG_CAN_FRONT_BUS, 3U,  1.0f,  1.0f, 0.0f, 8.0f,   -120.0f, 143.0f},//33.0
     {DOG_LEG_LB, DOG_JOINT_HIP,  DOG_CAN_REAR_BUS,  2U, 1.0f,  -1.0f, 0.0f, 8.0f, -120.0f, 120.0f},
     {DOG_LEG_LB, DOG_JOINT_KNEE, DOG_CAN_REAR_BUS,  1U,  -1.0f, -1.0f, 0.0f, 8.0f,   -120.0f, 143.0f},//33.0
-    {DOG_LEG_RB, DOG_JOINT_HIP,  DOG_CAN_REAR_BUS,  4U,  -1.0f, 1.0f, 0.0f, 8.0f, -120.0f, 120.0f},
+    {DOG_LEG_RB, DOG_JOINT_HIP,  DOG_CAN_REAR_BUS,  4U,  -1.0f, -1.0f, 0.0f, 8.0f, -120.0f, 120.0f},
     {DOG_LEG_RB, DOG_JOINT_KNEE, DOG_CAN_REAR_BUS,  3U, 1.0f,  1.0f, 0.0f, 8.0f,   -120.0f, 143.0f},//33.0
 };
 
