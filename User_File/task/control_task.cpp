@@ -39,6 +39,7 @@
 #define SBUS_MOVE_EXIT_DEADBAND  12
 #define SBUS_SPEED_LOW_NORM    (-60)
 #define SBUS_SPEED_HIGH_NORM   60
+#define SBUS_GAIT_SPEED_FILTER_MS 200.0f
 #define SBUS_SAFETY_CH         8U
 #define SBUS_SAFETY_HIGH_NORM  50
 #define SBUS_SAFETY_RELEASE_NORM 20
@@ -169,6 +170,10 @@ static uint8_t s_sbus_gait_retry_cmd = SBUS_QUAD_STOP;
 static uint32_t s_sbus_gait_retry_ms = 0U;
 static uint8_t s_sbus_drive_reverse_pending = 0U;
 static uint8_t s_sbus_speed_profile = DOG_GAIT_SPEED_DEFAULT;
+static float s_sbus_gait_speed_command = 0.5f;
+static uint8_t s_sbus_gait_speed_initialized = 0U;
+static uint32_t s_sbus_gait_speed_last_frame = 0U;
+static uint32_t s_sbus_gait_speed_last_ms = 0U;
 static int8_t s_sbus_low_wheel_direction = 0;
 static uint8_t s_sbus_low_wheel_reverse_rearm = 0U;
 static uint32_t s_sbus_low_wheel_neutral_since_ms = 0U;
@@ -363,10 +368,10 @@ static void print_help(void)
     DebugUart_Printf("  ? : print this help\r\n\r\n");
     DebugUart_Printf("SBUS remote on UART5:\r\n");
     DebugUart_Printf("  Wheel: CH1 differential yaw, CH2 forward/reverse, CH3 40..200rpm limit\r\n");
-    DebugUart_Printf("  Gait: CH1/CH2 blend, CH3 LOW/MID/HIGH profile, CH9 safety\r\n");
+    DebugUart_Printf("  Gait: CH1/CH2 blend, CH3 continuous LOW/MID/HIGH anchors, CH9 safety\r\n");
     DebugUart_Printf("  SB+SC: L+L=motor check/OFF, L+M=mechanical wheel, L+H=RX-only/HOLD\r\n");
     DebugUart_Printf("  SB+SC: M+L=stand/HOLD, M+M=stand wheel, M+H=stand/HOLD\r\n");
-    DebugUart_Printf("  SB+SC: H+L=gait only/HOLD, H+M=gait wheel, H+H=reserved stand/HOLD\r\n");
+    DebugUart_Printf("  SB+SC: H+L=trot only/HOLD, H+M=trot+wheel, H+H=single stair/HOLD\r\n");
     DebugUart_Printf("\r\n");
 }
 #endif
@@ -449,7 +454,6 @@ static void print_sbus_status(void)
                             (uint32_t)(now - s_sbus_link_bad_since_ms);
     const uint8_t main_sw = Sbus_Switch3(SBUS_MAIN_MODE_CH);
     const uint8_t sub_sw = Sbus_Switch3(SBUS_SUB_MODE_CH);
-    const uint8_t speed = sbus_speed_profile_from_ch3(&rc);
     const uint8_t safety_active = sbus_safety_raw_is_high(&rc);
     SbusDriveInput drive = {};
     sbus_drive_input_from_sticks(&rc, &drive);
@@ -479,7 +483,7 @@ static void print_sbus_status(void)
                      (unsigned)s_sbus_link_good_frames,
                      (unsigned)SBUS_RECOVERY_GOOD_FRAMES,
                      (unsigned)s_sbus_failsafe_stop_sent);
-    DebugUart_Printf("  CH1 turn raw=%u norm=%d  CH2 move raw=%u norm=%d  CH3 speed raw=%u norm=%d -> wheel=%ldrpm gait=%s\r\n",
+    DebugUart_Printf("  CH1 turn raw=%u norm=%d  CH2 move raw=%u norm=%d  CH3 speed raw=%u norm=%d -> wheel=%ldrpm gait=%s cmd=%ld/1000\r\n",
                      (unsigned)rc.ch[0],
                      (int)rc.norm[0],
                      (unsigned)rc.ch[1],
@@ -487,8 +491,8 @@ static void print_sbus_status(void)
                      (unsigned)rc.ch[SBUS_SPEED_CH],
                      (int)rc.norm[SBUS_SPEED_CH],
                      (long)sbus_wheel_max_rpm(&rc),
-                     (speed == DOG_GAIT_SPEED_LOW) ? "LOW" :
-                     ((speed == DOG_GAIT_SPEED_HIGH) ? "HIGH" : "MID"));
+                     dog_mit_gait_speed_profile_name(),
+                     (long)(dog_mit_get_gait_speed_command() * 1000.0f));
     DebugUart_Printf("  CH5 main raw=%u -> %s  CH8 sub raw=%u -> %s  CH9 safety raw=%u norm=%d high=%u armed=%u\r\n",
                      (unsigned)rc.ch[SBUS_MAIN_MODE_CH],
                      sbus_switch_name(main_sw),
@@ -510,7 +514,7 @@ static void print_sbus_status(void)
                      sbus_robot_mode_name(s_sbus_active_mode),
                      sbus_entry_state_name(s_sbus_entry_state),
                      sbus_block_reason_name(s_sbus_block_reason));
-    DebugUart_Printf("  decoded: drive=%u stick=(%ld,%ld) req=(%ld,%ld) applied=(%ld,%ld) standing=%u active_gait=%u estop=%u disabled=%u current_speed=%s\r\n",
+    DebugUart_Printf("  decoded: drive=%u stick=(%ld,%ld) req=(%ld,%ld) applied=(%ld,%ld) standing=%u active_gait=%u estop=%u disabled=%u current_speed=%s command=%ld/1000\r\n",
                      (unsigned)drive.active,
                      (long)(drive.forward * 1000.0f),
                      (long)(drive.yaw * 1000.0f),
@@ -522,7 +526,8 @@ static void print_sbus_status(void)
                      (unsigned)dog_mit_march_in_place_is_active(),
                      (unsigned)DogSafety_IsLatched(),
                      (unsigned)DogStand_IsDisabled(),
-                      dog_mit_gait_speed_profile_name());
+                     dog_mit_gait_speed_profile_name(),
+                     (long)(dog_mit_get_gait_speed_command() * 1000.0f));
     DebugUart_Printf("  mechanical: pose=%u pose_mask=0x%02X pose_ready=%u hip_normal=%ldmdeg hip_reverse_zero=%ldmdeg permit=%u switch_prep=%u prep_ms=%lu\r\n",
                      (unsigned)DogStand_IsMechanicalLimitPose(),
                      (unsigned)DogStand_GetMechanicalLimitPoseMask(),
@@ -533,12 +538,17 @@ static void print_sbus_status(void)
                      (unsigned)s_sbus_mechanical_switch_prepare,
                      (unsigned long)((s_sbus_mechanical_prepare_since_ms == 0U) ? 0U :
                                      (now - s_sbus_mechanical_prepare_since_ms)));
-    DebugUart_Printf("  gait sync: phase=%u gen=%lu speed=%u->%u degrade=%u swing=0x%X contact=0x%X search=0x%X fail=0x%X progress=%ld/%ld/%ld/%ld wheel=%ld leg=%ld compat=%ldrpm limit=%ldrpm search_um=%ld/%ld/%ld/%ld wheel_degraded=%u\r\n",
+    DebugUart_Printf("  gait sync: phase=%u gen=%lu speed=%u->%u cmd=%ld->%ld upblock=%u degrade=%u hz=%ldmHz height=%ldmm swing=0x%X contact=0x%X search=0x%X fail=0x%X progress=%ld/%ld/%ld/%ld wheel=%ld leg=%ld compat=%ldrpm limit=%ldrpm search_um=%ld/%ld/%ld/%ld wheel_degraded=%u\r\n",
                      (unsigned)gait.phase,
                      (unsigned long)gait.half_step_generation,
                      (unsigned)gait.speed_profile,
                      (unsigned)gait.requested_speed_profile,
+                     (long)(gait.active_speed_command * 1000.0f),
+                     (long)(gait.requested_speed_command * 1000.0f),
+                     (unsigned)gait.speed_upshift_blocked,
                      (unsigned)gait.stability_degrade_level,
+                     (long)(gait.active_trot_hz * 1000.0f),
+                     (long)gait.active_swing_height_mm,
                      (unsigned)gait.swing_mask,
                      (unsigned)gait.contact_mask,
                      (unsigned)gait.contact_search_mask,
@@ -973,6 +983,15 @@ static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc)
     return DOG_GAIT_SPEED_MID;
 }
 
+static float sbus_gait_speed_command_from_ch3(const SbusState *rc)
+{
+    if (rc == nullptr) {
+        return 0.5f;
+    }
+    const float normalized = ((float)rc->norm[SBUS_SPEED_CH] + 100.0f) * 0.005f;
+    return fminf(fmaxf(normalized, 0.0f), 1.0f);
+}
+
 static uint8_t sbus_stair_profile_from_ch3(const SbusState *rc)
 {
     const uint8_t profile = sbus_speed_profile_from_ch3(rc);
@@ -1055,13 +1074,38 @@ static void sbus_obstacle_step_input(const SbusState *rc,
     }
 }
 
-static void sbus_update_speed_profile(const SbusState *rc, uint8_t changed)
+static void sbus_update_speed_profile(const SbusState *rc, uint8_t changed,
+                                      uint32_t now)
 {
-    const uint8_t profile = sbus_speed_profile_from_ch3(rc);
+    if (rc == nullptr) {
+        return;
+    }
+
+    const uint8_t fresh_frame = (rc->frame_count != s_sbus_gait_speed_last_frame) ?
+        1U : 0U;
+    if ((s_sbus_gait_speed_initialized == 0U) || (fresh_frame != 0U)) {
+        const float target = sbus_gait_speed_command_from_ch3(rc);
+        if (s_sbus_gait_speed_initialized == 0U) {
+            s_sbus_gait_speed_command = target;
+            s_sbus_gait_speed_initialized = 1U;
+        } else {
+            const uint32_t dt_ms = (s_sbus_gait_speed_last_ms == 0U) ? 0U :
+                (uint32_t)(now - s_sbus_gait_speed_last_ms);
+            const float alpha = (dt_ms == 0U) ? 0.0f :
+                ((float)dt_ms / (SBUS_GAIT_SPEED_FILTER_MS + (float)dt_ms));
+            s_sbus_gait_speed_command +=
+                alpha * (target - s_sbus_gait_speed_command);
+        }
+        s_sbus_gait_speed_last_frame = rc->frame_count;
+        s_sbus_gait_speed_last_ms = now;
+        dog_mit_set_gait_speed_command(s_sbus_gait_speed_command);
+    }
+
+    const uint8_t profile = dog_mit_get_gait_speed_profile();
     if ((changed != 0U) || (profile != s_sbus_speed_profile)) {
         s_sbus_speed_profile = profile;
-        dog_mit_set_gait_speed_profile(profile);
-        DebugUart_Printf("SBUS CH3 speed=%s hz=%ld.%01ld step=%ldmm height=%ldmm dwell=%lums stagger=%lums turn=%ldmm\r\n",
+        DebugUart_Printf("SBUS CH3 command=%ld/1000 anchor=%s hz=%ld.%01ld step=%ldmm height=%ldmm dwell=%lums stagger=%lums turn=%ldmm\r\n",
+                         (long)(dog_mit_get_gait_speed_command() * 1000.0f),
                          dog_mit_gait_speed_profile_name(),
                          (long)dog_mit_gait_trot_hz(),
                          (long)(dog_mit_gait_trot_hz() * 10.0f) % 10L,
@@ -1072,8 +1116,9 @@ static void sbus_update_speed_profile(const SbusState *rc, uint8_t changed)
                          (long)dog_mit_gait_turn_stride_x_mm());
         DogGaitSyncState sync = {};
         dog_mit_get_gait_sync_state(&sync);
-        if ((sync.active != 0U) && (sync.speed_profile != profile)) {
-            DebugUart_Printf("SBUS CH3 profile queued for next all-support boundary.\r\n");
+        if ((sync.active != 0U) &&
+            (fabsf(sync.active_speed_command - sync.requested_speed_command) > 0.01f)) {
+            DebugUart_Printf("SBUS CH3 target queued for half-step ramp.\r\n");
         }
     }
 }
@@ -2304,7 +2349,7 @@ static void sbus_control_update(void)
                              (control_main != s_sbus_main_prev) ||
                              (control_sub != s_sbus_sub_prev) ||
                              (previous_source != s_control_source)) ? 1U : 0U;
-    sbus_update_speed_profile(&control_rc, changed);
+    sbus_update_speed_profile(&control_rc, changed, now);
     sample.mode = control_mode;
     sbus_mode_tick(requested_mode, &control_rc, now);
 

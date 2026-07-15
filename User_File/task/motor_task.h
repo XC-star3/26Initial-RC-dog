@@ -109,8 +109,8 @@ extern "C" {
 #define DOG_TROT_TOUCHDOWN_IQ_ALPHA      0.10f
 #define DOG_TROT_TOUCHDOWN_IQ_START      0.80f
 #define DOG_TROT_TOUCHDOWN_CONFIRM_MS    20U
-#define DOG_TROT_TOUCHDOWN_FALLBACK_MS   40U
-#define DOG_TROT_TOUCHDOWN_TIMEOUT_MS   200U
+#define DOG_TROT_TOUCHDOWN_SEARCH_LIMIT_MS 40U
+#define DOG_TROT_TOUCHDOWN_TIMEOUT_MS   500U
 #define DOG_TROT_TOUCHDOWN_SEARCH_MM      5.0f
 #define DOG_TROT_TOUCHDOWN_SEARCH_MM_S   12.0f
 #define DOG_GAIT_LOW_TOUCHDOWN_ERR_DEG    4.0f
@@ -123,6 +123,8 @@ extern "C" {
 #define DOG_GAIT_RECOVERY_HALF_STEPS       2U
 #define DOG_GAIT_DEGRADED_SCALE_L1         0.65f
 #define DOG_GAIT_DEGRADED_SCALE_L2         0.40f
+#define DOG_GAIT_SPEED_COMMAND_UP_STEP      0.12f
+#define DOG_GAIT_SPEED_COMMAND_DOWN_STEP    0.25f
 
 #define DOG_TURN_STRIDE_X_MM             30.0f    /* in-place turn step per leg side */
 
@@ -168,9 +170,14 @@ struct DogGaitSyncState {
     float compatible_wheel_rpm;
     float active_forward_stride_x_mm;
     float active_turn_stride_x_mm;
+    float active_trot_hz;
+    float active_swing_height_mm;
+    float requested_speed_command;
+    float active_speed_command;
     float stop_progress;
     uint8_t requested_speed_profile;
     uint8_t stability_degrade_level;
+    uint8_t speed_upshift_blocked;
 };
 
 enum Dog_Foot_Motion_State {
@@ -400,6 +407,8 @@ uint8_t dog_mit_turn_march_is_active(void);
 void dog_mit_set_gait_speed_profile(uint8_t profile);
 uint8_t dog_mit_get_gait_speed_profile(void);
 const char *dog_mit_gait_speed_profile_name(void);
+void dog_mit_set_gait_speed_command(float command);
+float dog_mit_get_gait_speed_command(void);
 float dog_mit_gait_trot_hz(void);
 float dog_mit_gait_forward_stride_x_mm(void);
 float dog_mit_gait_turn_stride_x_mm(void);
