@@ -40,7 +40,6 @@
 #define SBUS_SPEED_LOW_NORM    (-60)
 #define SBUS_SPEED_HIGH_NORM   60
 #define SBUS_SAFETY_CH         8U
-#define SBUS_OBSTACLE_ROLLBACK_NORM (-95)
 #define SBUS_SAFETY_HIGH_NORM  50
 #define SBUS_SAFETY_RELEASE_NORM 20
 #define SBUS_OBSTACLE_STEP_LOW_RAW       800U
@@ -189,9 +188,8 @@ static uint8_t s_sbus_obstacle_step_switch_state = 0U;
 static uint8_t s_sbus_obstacle_step_candidate_state = 0U;
 static uint8_t s_sbus_obstacle_step_candidate_frames = 0U;
 static uint32_t s_sbus_obstacle_step_last_frame = 0U;
-static uint8_t s_sbus_obstacle_fault_seen = 0U;
-static uint8_t s_sbus_obstacle_rollback_armed = 0U;
-static uint8_t s_sbus_obstacle_rollback_sent = 0U;
+static uint8_t s_sbus_obstacle_profile_latched = 0U;
+static uint8_t s_sbus_obstacle_profile = DOG_STAIR_PROFILE_MID;
 static uint32_t s_sbus_obstacle_wheel_stopped_since_ms = 0U;
 static uint8_t s_sbus_obstacle_started = 0U;
 static uint8_t s_sbus_obstacle_wheel_violation = 0U;
@@ -287,35 +285,24 @@ static void print_obstacle_status(void)
 {
     DogObstacleStatus status = {};
     DogObstacle_GetStatus(&status);
-    if (status.selected == DOG_OBSTACLE_STAIRS) {
-        DebugUart_Printf("OBSTACLE: request=%u selected=%s state=%s fault=%u prepared=%u phase=%s level=%u/%u motion=%u can_exit=%u stair=%ldx%ldmm\r\n",
-                         (unsigned)status.mode_requested,
-                         DogObstacle_TypeName(status.selected),
-                         DogObstacle_StateName(status.state),
-                         (unsigned)status.fault,
-                         (unsigned)status.prepared,
-                         DogObstacle_StairPhaseName(status.phase),
-                         (unsigned)status.completed_levels,
-                         (unsigned)status.total_levels,
-                         (unsigned)status.motion_state,
-                         (unsigned)status.can_exit,
-                         (long)status.step_height_mm,
-                         (long)status.tread_depth_mm);
-        return;
-    }
-    DebugUart_Printf("OBSTACLE: request=%u selected=%s state=%s fault=%u prepared=%u cp=%u target=%u gaps=%u motion=%u can_exit=%u gap=%ld/%ldmm\r\n",
+    const char *profile = (status.profile == DOG_STAIR_PROFILE_LOW) ? "LOW" :
+        ((status.profile == DOG_STAIR_PROFILE_HIGH) ? "HIGH" : "MID");
+    DebugUart_Printf("STAIR: request=%u profile=%s state=%s fault=%u prepared=%u phase=%s target=%s level=%u/%u motion=%u can_exit=%u landing=%ldmm peak=%ldmm body_raise=%ldmm tread=%ldmm\r\n",
                      (unsigned)status.mode_requested,
-                     DogObstacle_TypeName(status.selected),
+                     profile,
                      DogObstacle_StateName(status.state),
                      (unsigned)status.fault,
                      (unsigned)status.prepared,
-                     (unsigned)status.checkpoint,
-                     (unsigned)status.target_checkpoint,
-                     (unsigned)status.completed_gaps,
+                     DogObstacle_StairPhaseName(status.phase),
+                     DogObstacle_StairPhaseName(status.target_phase),
+                     (unsigned)status.completed_levels,
+                     (unsigned)status.total_levels,
                      (unsigned)status.motion_state,
                      (unsigned)status.can_exit,
-                     (long)status.active_gap_mm,
-                     (long)status.final_gap_mm);
+                     (long)status.landing_height_mm,
+                     (long)status.swing_peak_mm,
+                     (long)status.body_preraise_mm,
+                     (long)status.tread_depth_mm);
 }
 
 #if DOG_ENABLE_ENGINEERING_USB_DEBUG
@@ -986,16 +973,16 @@ static uint8_t sbus_speed_profile_from_ch3(const SbusState *rc)
     return DOG_GAIT_SPEED_MID;
 }
 
-static uint8_t sbus_obstacle_selection_from_ch3(const SbusState *rc)
+static uint8_t sbus_stair_profile_from_ch3(const SbusState *rc)
 {
     const uint8_t profile = sbus_speed_profile_from_ch3(rc);
     if (profile == DOG_GAIT_SPEED_LOW) {
-        return DOG_OBSTACLE_BRIDGE_B;
+        return DOG_STAIR_PROFILE_LOW;
     }
     if (profile == DOG_GAIT_SPEED_HIGH) {
-        return DOG_OBSTACLE_GRAVEL;
+        return DOG_STAIR_PROFILE_HIGH;
     }
-    return DOG_OBSTACLE_STAIRS;
+    return DOG_STAIR_PROFILE_MID;
 }
 
 static void sbus_obstacle_input_reset(void)
@@ -1005,9 +992,8 @@ static void sbus_obstacle_input_reset(void)
     s_sbus_obstacle_step_candidate_state = 0U;
     s_sbus_obstacle_step_candidate_frames = 0U;
     s_sbus_obstacle_step_last_frame = 0U;
-    s_sbus_obstacle_fault_seen = 0U;
-    s_sbus_obstacle_rollback_armed = 0U;
-    s_sbus_obstacle_rollback_sent = 0U;
+    s_sbus_obstacle_profile_latched = 0U;
+    s_sbus_obstacle_profile = DOG_STAIR_PROFILE_MID;
 }
 
 static uint8_t sbus_obstacle_step_switch_state(const SbusState *rc)
@@ -1062,36 +1048,10 @@ static void sbus_obstacle_step_input(const SbusState *rc,
                     DebugUart_Printf("Obstacle step: SA raw=%u state=%u.\r\n",
                                      (unsigned)rc->ch[SBUS_OBSTACLE_STEP_CH],
                                      (unsigned)step_switch_state);
-                    DogObstacle_RequestStep(1);
+                    DogObstacle_RequestStep();
                 }
             }
         }
-    }
-
-    const int16_t forward = rc->norm[1U];
-    if (obstacle->state != DOG_OBSTACLE_FAULT) {
-        s_sbus_obstacle_fault_seen = 0U;
-        s_sbus_obstacle_rollback_armed = 0U;
-        s_sbus_obstacle_rollback_sent = 0U;
-        return;
-    }
-    if (s_sbus_obstacle_fault_seen == 0U) {
-        s_sbus_obstacle_fault_seen = 1U;
-        s_sbus_obstacle_rollback_armed = 0U;
-        s_sbus_obstacle_rollback_sent = 0U;
-        return;
-    }
-
-    if ((forward >= -SBUS_MOVE_EXIT_DEADBAND) &&
-        (forward <= SBUS_MOVE_EXIT_DEADBAND) &&
-        (s_sbus_obstacle_rollback_sent == 0U)) {
-        s_sbus_obstacle_rollback_armed = 1U;
-    } else if ((forward <= SBUS_OBSTACLE_ROLLBACK_NORM) &&
-               (s_sbus_obstacle_rollback_armed != 0U) &&
-               (s_sbus_obstacle_rollback_sent == 0U)) {
-        s_sbus_obstacle_rollback_armed = 0U;
-        s_sbus_obstacle_rollback_sent = 1U;
-        DogObstacle_RequestStep(-1);
     }
 }
 
@@ -1595,6 +1555,16 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
     {
         WheelDrive_SetProfile(WHEEL_PROFILE_NORMAL);
         sbus_wheel_hold();
+        if (s_sbus_obstacle_profile_latched == 0U) {
+            s_sbus_obstacle_profile = sbus_stair_profile_from_ch3(rc);
+            s_sbus_obstacle_profile_latched = 1U;
+            DogObstacle_SetStairProfile(s_sbus_obstacle_profile);
+            DebugUart_Printf("Stair entry: CH3 profile=%s latched.\r\n",
+                             (s_sbus_obstacle_profile == DOG_STAIR_PROFILE_LOW) ?
+                                 "LOW" :
+                             ((s_sbus_obstacle_profile == DOG_STAIR_PROFILE_HIGH) ?
+                                 "HIGH" : "MID"));
+        }
         if (sbus_mode_prepare_stand(now) == 0U) {
             DogObstacle_SetModeRequested(0U);
             break;
@@ -1640,7 +1610,6 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
             }
         }
 
-        DogObstacle_Select(sbus_obstacle_selection_from_ch3(rc));
         DogObstacle_SetModeRequested(1U);
         if (s_sbus_obstacle_started == 0U) {
             s_sbus_obstacle_started = 1U;
@@ -1650,10 +1619,8 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
         DogObstacleStatus obstacle = {};
         DogObstacle_GetStatus(&obstacle);
         sbus_obstacle_step_input(rc, &obstacle);
-        if ((obstacle.state == DOG_OBSTACLE_FAULT) ||
-            (obstacle.state == DOG_OBSTACLE_UNAVAILABLE)) {
-            if ((obstacle.state == DOG_OBSTACLE_FAULT) &&
-                (obstacle.can_exit != 0U) && (obstacle.prepared == 0U) &&
+        if (obstacle.state == DOG_OBSTACLE_FAULT) {
+            if ((obstacle.can_exit != 0U) && (obstacle.prepared == 0U) &&
                 ((obstacle.fault == DOG_OBSTACLE_FAULT_SAFETY) ||
                  (obstacle.fault == DOG_OBSTACLE_FAULT_MOTION_RUNTIME))) {
                 s_sbus_quad_standing = 0U;
