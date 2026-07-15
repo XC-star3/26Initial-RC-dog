@@ -83,6 +83,7 @@ static int8_t s_motion_direction = 0;
 static uint8_t s_recovery_leg_mask = DOG_LEG_MASK_ALL;
 static float s_recovery_clearance_mm = 0.0f;
 static uint32_t s_recovery_duration_ms = 0U;
+static uint8_t s_bridge_exit_recovery_attempted = 0U;
 
 static constexpr uint8_t kStairWaypointCount =
     (uint8_t)(DOG_STAIR_PHASE_TOP_READY + 1U);
@@ -399,6 +400,7 @@ static void obstacle_control_abort(uint8_t fault)
     s_recovery_leg_mask = DOG_LEG_MASK_ALL;
     s_recovery_clearance_mm = 0.0f;
     s_recovery_duration_ms = 0U;
+    s_bridge_exit_recovery_attempted = 0U;
     stair_context_reset();
     s_status.phase = DOG_STAIR_PHASE_IDLE;
     s_status.completed_levels = 0U;
@@ -424,6 +426,7 @@ static void obstacle_reset_selection(uint8_t selection)
     s_recovery_leg_mask = DOG_LEG_MASK_ALL;
     s_recovery_clearance_mm = 0.0f;
     s_recovery_duration_ms = 0U;
+    s_bridge_exit_recovery_attempted = 0U;
     stair_context_reset();
     obstacle_set_state(DOG_OBSTACLE_DISABLED);
 }
@@ -709,6 +712,7 @@ static void bridge_motion_complete(void)
     s_recovery_leg_mask = DOG_LEG_MASK_ALL;
     s_recovery_clearance_mm = 0.0f;
     s_recovery_duration_ms = 0U;
+    s_bridge_exit_recovery_attempted = 0U;
     s_status.target_checkpoint = s_status.checkpoint;
     obstacle_set_state(DOG_OBSTACLE_READY);
 }
@@ -720,11 +724,20 @@ static void bridge_exit_tick(void)
         return;
     }
     if (s_status.state == DOG_OBSTACLE_FAULT) {
+        if (s_bridge_exit_recovery_attempted != 0U) {
+            if (s_bridge_exit_recovery_attempted == 1U) {
+                DebugUart_Printf("OBSTACLE exit recovery stopped after repeated motion failure; use CH9 safety abort.\r\n");
+                s_bridge_exit_recovery_attempted = 2U;
+            }
+            s_status.can_exit = 0U;
+            return;
+        }
         if (bridge_recover_interrupted_motion() == 0U) {
             return;
         }
         if ((s_status.state == DOG_OBSTACLE_MOVING) ||
             (s_status.state == DOG_OBSTACLE_ROLLBACK)) {
+            s_bridge_exit_recovery_attempted = 1U;
             return;
         }
         s_status.fault = DOG_OBSTACLE_FAULT_NONE;
@@ -736,8 +749,10 @@ static void bridge_exit_tick(void)
         return;
     }
     if ((s_status.checkpoint == 0U) || (s_status.checkpoint == 4U)) {
+        s_bridge_exit_recovery_attempted = 1U;
         (void)bridge_start_unprepare();
     } else {
+        s_bridge_exit_recovery_attempted = 1U;
         bridge_backward_step();
     }
 }
@@ -1261,6 +1276,7 @@ void DogObstacle_Init(void)
     s_recovery_leg_mask = DOG_LEG_MASK_ALL;
     s_recovery_clearance_mm = 0.0f;
     s_recovery_duration_ms = 0U;
+    s_bridge_exit_recovery_attempted = 0U;
     stair_context_reset();
     obstacle_publish_status();
 }

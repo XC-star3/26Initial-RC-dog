@@ -4056,8 +4056,28 @@ static uint8_t foot_motion_fault_if_current(uint32_t generation)
     return changed;
 }
 
+static void foot_motion_print_timeout_diag(uint8_t leg_mask)
+{
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        if ((leg_mask & (uint8_t)(1U << leg)) == 0U) {
+            continue;
+        }
+        const uint8_t hip = leg_joint_index(leg, DOG_JOINT_HIP);
+        const uint8_t knee = leg_joint_index(leg, DOG_JOINT_KNEE);
+        if ((hip >= DOG_MOTOR_COUNT) || (knee >= DOG_MOTOR_COUNT)) {
+            continue;
+        }
+        DebugUart_Printf("  timeout %s hip err=%ldmdeg vel=%ldmdps knee err=%ldmdeg vel=%ldmdps\r\n",
+                         dog_leg_name(leg),
+                         (long)((s_target_deg[hip] - user_deg(hip)) * 1000.0f),
+                         (long)(user_vel_dps(hip) * 1000.0f),
+                         (long)((s_target_deg[knee] - user_deg(knee)) * 1000.0f),
+                         (long)(user_vel_dps(knee) * 1000.0f));
+    }
+}
+
 static uint8_t foot_motion_runtime_guard(uint32_t generation, uint8_t moving_leg_mask,
-                                         uint32_t now_ms)
+                                          uint32_t now_ms)
 {
     uint8_t support_stable = 1U;
     if (moving_leg_mask != DOG_LEG_MASK_ALL) {
@@ -4150,6 +4170,7 @@ void dog_foot_motion_tick(uint32_t now_ms)
             DebugUart_Printf("Foot motion FAULT: timeout mask=0x%X elapsed=%lums.\r\n",
                              (unsigned)motion.leg_mask,
                              (unsigned long)elapsed_ms);
+            foot_motion_print_timeout_diag(motion.leg_mask);
         }
         return;
     }

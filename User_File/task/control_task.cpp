@@ -43,7 +43,9 @@
 #define SBUS_OBSTACLE_ROLLBACK_NORM (-95)
 #define SBUS_SAFETY_HIGH_NORM  50
 #define SBUS_SAFETY_RELEASE_NORM 20
-#define SBUS_OBSTACLE_STEP_STABLE_FRAMES 3U
+#define SBUS_OBSTACLE_STEP_LOW_RAW       800U
+#define SBUS_OBSTACLE_STEP_HIGH_RAW     1200U
+#define SBUS_OBSTACLE_STEP_STABLE_FRAMES   8U
 #define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
 #define SBUS_FAULT_CLEAR_RETRY_MS 1000U
@@ -507,6 +509,12 @@ static void print_sbus_status(void)
                      (int)rc.norm[SBUS_SAFETY_CH],
                      (unsigned)safety_active,
                      (unsigned)s_sbus_safety_armed);
+    DebugUart_Printf("  CH10 step raw=%u norm=%d state=%u candidate=%u/%u\r\n",
+                     (unsigned)rc.ch[SBUS_OBSTACLE_STEP_CH],
+                     (int)rc.norm[SBUS_OBSTACLE_STEP_CH],
+                     (unsigned)s_sbus_obstacle_step_switch_state,
+                     (unsigned)s_sbus_obstacle_step_candidate_frames,
+                     (unsigned)SBUS_OBSTACLE_STEP_STABLE_FRAMES);
     DebugUart_Printf("  mode: decoded=%s requested=%s active=%s entry=%s block=%s\r\n",
                      sbus_robot_mode_name(sbus_decode_robot_mode(main_sw, sub_sw)),
                      sbus_robot_mode_name(s_sbus_requested_mode),
@@ -995,6 +1003,24 @@ static void sbus_obstacle_input_reset(void)
     s_sbus_obstacle_rollback_sent = 0U;
 }
 
+static uint8_t sbus_obstacle_step_switch_state(const SbusState *rc)
+{
+    if ((rc == nullptr) || (SBUS_OBSTACLE_STEP_CH >= SBUS_CHANNEL_COUNT)) {
+        return s_sbus_obstacle_step_switch_state;
+    }
+
+    const uint16_t raw = rc->ch[SBUS_OBSTACLE_STEP_CH];
+    if (raw <= SBUS_OBSTACLE_STEP_LOW_RAW) {
+        return 0U;
+    }
+    if (raw >= SBUS_OBSTACLE_STEP_HIGH_RAW) {
+        return 1U;
+    }
+
+    /* Keep the confirmed state through the center band of a two-position SA. */
+    return s_sbus_obstacle_step_switch_state;
+}
+
 static void sbus_obstacle_step_input(const SbusState *rc,
                                      const DogObstacleStatus *obstacle)
 {
@@ -1004,8 +1030,7 @@ static void sbus_obstacle_step_input(const SbusState *rc,
 
     if (rc->frame_count != s_sbus_obstacle_step_last_frame) {
         s_sbus_obstacle_step_last_frame = rc->frame_count;
-        const uint8_t step_switch_state =
-            (rc->norm[SBUS_OBSTACLE_STEP_CH] >= 0) ? 1U : 0U;
+        const uint8_t step_switch_state = sbus_obstacle_step_switch_state(rc);
         if (s_sbus_obstacle_step_switch_seen == 0U) {
             s_sbus_obstacle_step_switch_seen = 1U;
             s_sbus_obstacle_step_switch_state = step_switch_state;
@@ -1027,6 +1052,9 @@ static void sbus_obstacle_step_input(const SbusState *rc,
                 s_sbus_obstacle_step_switch_state = step_switch_state;
                 s_sbus_obstacle_step_candidate_frames = 0U;
                 if (obstacle->state == DOG_OBSTACLE_READY) {
+                    DebugUart_Printf("Obstacle step: SA raw=%u state=%u.\r\n",
+                                     (unsigned)rc->ch[SBUS_OBSTACLE_STEP_CH],
+                                     (unsigned)step_switch_state);
                     DogObstacle_RequestStep(1);
                 }
             }
@@ -1543,39 +1571,42 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
             s_sbus_block_reason = SBUS_BLOCK_WHEEL_FAULT;
             break;
         }
-        if (WheelDrive_IsStopped() == 0U) {
-            DogObstacle_SetModeRequested(0U);
-            s_sbus_obstacle_wheel_stopped_since_ms = 0U;
-            if (s_sbus_obstacle_started != 0U) {
-                s_sbus_obstacle_wheel_violation = 1U;
-            }
-            s_sbus_active_mode = SBUS_MODE_NONE;
-            s_sbus_entry_state = SBUS_ENTRY_WAIT_OBSTACLE;
-            s_sbus_block_reason = SBUS_BLOCK_WHEEL_STOP;
-            break;
-        }
         if (s_sbus_obstacle_wheel_violation != 0U) {
             DogObstacle_SetModeRequested(0U);
             s_sbus_active_mode = SBUS_MODE_NONE;
             s_sbus_entry_state = SBUS_ENTRY_BLOCKED;
-            s_sbus_block_reason = SBUS_BLOCK_WHEEL_STOP;
+            s_sbus_block_reason = SBUS_BLOCK_WHEEL_FAULT;
             break;
         }
-        if (s_sbus_obstacle_wheel_stopped_since_ms == 0U) {
-            s_sbus_obstacle_wheel_stopped_since_ms = now;
-        }
-        if ((uint32_t)(now - s_sbus_obstacle_wheel_stopped_since_ms) <
-            SBUS_OBSTACLE_WHEEL_STOP_MS) {
-            DogObstacle_SetModeRequested(0U);
-            s_sbus_active_mode = SBUS_MODE_NONE;
-            s_sbus_entry_state = SBUS_ENTRY_WAIT_OBSTACLE;
-            s_sbus_block_reason = SBUS_BLOCK_WHEEL_STOP;
-            break;
+
+        if (s_sbus_obstacle_started == 0U) {
+            if (WheelDrive_IsStopped() == 0U) {
+                DogObstacle_SetModeRequested(0U);
+                s_sbus_obstacle_wheel_stopped_since_ms = 0U;
+                s_sbus_active_mode = SBUS_MODE_NONE;
+                s_sbus_entry_state = SBUS_ENTRY_WAIT_OBSTACLE;
+                s_sbus_block_reason = SBUS_BLOCK_WHEEL_STOP;
+                break;
+            }
+            if (s_sbus_obstacle_wheel_stopped_since_ms == 0U) {
+                s_sbus_obstacle_wheel_stopped_since_ms = now;
+            }
+            if ((uint32_t)(now - s_sbus_obstacle_wheel_stopped_since_ms) <
+                SBUS_OBSTACLE_WHEEL_STOP_MS) {
+                DogObstacle_SetModeRequested(0U);
+                s_sbus_active_mode = SBUS_MODE_NONE;
+                s_sbus_entry_state = SBUS_ENTRY_WAIT_OBSTACLE;
+                s_sbus_block_reason = SBUS_BLOCK_WHEEL_STOP;
+                break;
+            }
         }
 
         DogObstacle_Select(sbus_obstacle_selection_from_ch3(rc));
         DogObstacle_SetModeRequested(1U);
-        s_sbus_obstacle_started = 1U;
+        if (s_sbus_obstacle_started == 0U) {
+            s_sbus_obstacle_started = 1U;
+            DebugUart_Printf("Obstacle entry: wheel stop gate passed; HOLD remains active during leg motion.\r\n");
+        }
 
         DogObstacleStatus obstacle = {};
         DogObstacle_GetStatus(&obstacle);
