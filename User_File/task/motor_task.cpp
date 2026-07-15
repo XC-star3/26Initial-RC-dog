@@ -7115,9 +7115,50 @@ uint8_t DogStand_IsDisabled(void)
     return s_control_disabled;
 }
 
-uint8_t DogStand_EnterMechanicalLimitPose(void)
+static uint8_t mechanical_pose_move_hips(const float *hip_start_deg,
+                                          const float *hip_target_deg,
+                                          const float *knee_hold_deg)
 {
-    if ((s_safety_latched != 0U) || (s_safety_external_inhibit != 0U) ||
+    float max_move_deg = 0.0f;
+    for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+        max_move_deg = fmaxf(max_move_deg,
+                            fabsf(hip_target_deg[leg] - hip_start_deg[leg]));
+    }
+    if (max_move_deg <= 1.0e-3f) {
+        return 1U;
+    }
+
+    const uint32_t t0 = HAL_GetTick();
+    while (1) {
+        const uint32_t now = HAL_GetTick();
+        const float raw_progress = (DOG_LOW_WHEEL_HIP_LIFT_MS == 0U) ? 1.0f :
+            clampf((float)(now - t0) / (float)DOG_LOW_WHEEL_HIP_LIFT_MS,
+                   0.0f, 1.0f);
+        const float progress = smoothstep5_01(raw_progress);
+        for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
+            dog_leg_set_motor_user_deg_for_leg(
+                leg,
+                hip_start_deg[leg] +
+                    (hip_target_deg[leg] - hip_start_deg[leg]) * progress,
+                knee_hold_deg[leg]);
+        }
+        if (mit_pump_control() == 0U) {
+            return 0U;
+        }
+        if (raw_progress >= 1.0f) {
+            return 1U;
+        }
+        /* Control_Task has higher priority than CAN_Task and Wheel_Task.
+         * Yield so feedback and wheel control remain alive during the pose. */
+        vTaskDelay(pdMS_TO_TICKS(1U));
+    }
+}
+
+static uint8_t dog_stand_enter_mechanical_limit_pose(float hip_value_deg,
+                                                      uint8_t zero_referenced)
+{
+    if ((!isfinite(hip_value_deg)) ||
+        (s_safety_latched != 0U) || (s_safety_external_inhibit != 0U) ||
         (s_control_disabled != 0U)) {
         return 0U;
     }
@@ -7136,6 +7177,8 @@ uint8_t DogStand_EnterMechanicalLimitPose(void)
     }
 
     float hip_start_deg[DOG_LEG_COUNT] = {};
+    float hip_zero_deg[DOG_LEG_COUNT] = {};
+    float hip_target_deg[DOG_LEG_COUNT] = {};
     float knee_hold_deg[DOG_LEG_COUNT] = {};
     for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
         const uint8_t hip = leg_joint_index(leg, DOG_JOINT_HIP);
@@ -7147,44 +7190,47 @@ uint8_t DogStand_EnterMechanicalLimitPose(void)
             return 0U;
         }
         hip_start_deg[leg] = user_deg(hip);
+        hip_target_deg[leg] = (zero_referenced != 0U) ?
+            hip_value_deg : (hip_start_deg[leg] + hip_value_deg);
         knee_hold_deg[leg] = user_deg(knee);
     }
 
     mit_set_all_stand_pid_mode();
     dog_mit_reset_integrators();
-    const uint32_t t0 = HAL_GetTick();
-    while (1) {
-        const uint32_t now = HAL_GetTick();
-        const float raw_progress = (DOG_LOW_WHEEL_HIP_LIFT_MS == 0U) ? 1.0f :
-            clampf((float)(now - t0) / (float)DOG_LOW_WHEEL_HIP_LIFT_MS,
-                   0.0f, 1.0f);
-        const float progress = smoothstep5_01(raw_progress);
-        for (uint8_t leg = 0U; leg < DOG_LEG_COUNT; ++leg) {
-            dog_leg_set_motor_user_deg_for_leg(
-                leg,
-                hip_start_deg[leg] + DOG_LOW_WHEEL_HIP_LIFT_DEG * progress,
-                knee_hold_deg[leg]);
-        }
-        if (mit_pump_control() == 0U) {
-            s_mechanical_pose_requested = 0U;
-            dog_mit_protect_hold();
-            DebugUart_Printf("Mechanical wheel pose FAIL: control interrupted.\r\n");
-            return 0U;
-        }
-        if (raw_progress >= 1.0f) {
-            break;
-        }
-        /* Control_Task has higher priority than CAN_Task and Wheel_Task.
-         * Block for one RTOS tick so both feedback and wheel control remain
-         * alive throughout the 800 ms mechanical-pose transition. */
-        vTaskDelay(pdMS_TO_TICKS(1U));
+    uint8_t control_ok = 1U;
+    if (zero_referenced != 0U) {
+        control_ok = mechanical_pose_move_hips(
+            hip_start_deg, hip_zero_deg, knee_hold_deg);
+    }
+    if (control_ok != 0U) {
+        control_ok = mechanical_pose_move_hips(
+            (zero_referenced != 0U) ? hip_zero_deg : hip_start_deg,
+            hip_target_deg,
+            knee_hold_deg);
+    }
+    if (control_ok == 0U) {
+        s_mechanical_pose_requested = 0U;
+        dog_mit_protect_hold();
+        DebugUart_Printf("Mechanical wheel pose FAIL: control interrupted.\r\n");
+        return 0U;
     }
 
     s_mechanical_pose_mask = enabled_motor_mask();
     s_mechanical_pose_ready = 1U;
-    DebugUart_Printf("Mechanical wheel pose ready: hip=%+ldmdeg knee=stand-PID hold.\r\n",
-                     (long)(DOG_LOW_WHEEL_HIP_LIFT_DEG * 1000.0f));
+    DebugUart_Printf("Mechanical wheel pose ready: hip=%+ldmdeg ref=%s knee=stand-PID hold.\r\n",
+                     (long)(hip_value_deg * 1000.0f),
+                     (zero_referenced != 0U) ? "zero" : "entry");
     return 1U;
+}
+
+uint8_t DogStand_EnterMechanicalLimitPose(float hip_delta_deg)
+{
+    return dog_stand_enter_mechanical_limit_pose(hip_delta_deg, 0U);
+}
+
+uint8_t DogStand_EnterMechanicalLimitPoseFromZero(float hip_target_deg)
+{
+    return dog_stand_enter_mechanical_limit_pose(hip_target_deg, 1U);
 }
 
 uint8_t DogStand_IsMechanicalLimitPose(void)
