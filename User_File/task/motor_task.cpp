@@ -308,9 +308,12 @@ struct Dog_Gait_Speed_Profile {
 };
 
 static const Dog_Gait_Speed_Profile s_gait_speed_profiles[] = {
-    {"LOW",  1.0f, 40.0f, DOG_TURN_STRIDE_X_MM, 70.0f, 160U, 40U},
-    {"MID",  2.0f, 60.0f, DOG_TURN_STRIDE_X_MM, 70.0f,  60U,  0U},
-    {"HIGH", 2.5f, 80.0f, DOG_TURN_STRIDE_X_MM, 70.0f, 30U,  0U},
+    {"LOW",  1.0f, 40.0f, DOG_TURN_STRIDE_X_MM,
+     DOG_GAIT_SWING_CLEARANCE_MM, 160U, 40U},
+    {"MID",  2.0f, 60.0f, DOG_TURN_STRIDE_X_MM,
+     DOG_GAIT_SWING_CLEARANCE_MM,  60U,  0U},
+    {"HIGH", 2.5f, 80.0f, DOG_TURN_STRIDE_X_MM,
+     DOG_GAIT_SWING_CLEARANCE_MM, 30U,  0U},
 };
 
 static float s_leg_foot_x_offset[DOG_LEG_COUNT] = {};
@@ -4167,7 +4170,7 @@ uint8_t dog_foot_motion_start(uint8_t leg_mask,
     }
     s_foot_motion_generation++;
 
-    if (clearance_mm > 0.0f) {
+    if (leg_mask != DOG_LEG_MASK_ALL) {
         mit_set_mixed_swing_leg_mask(leg_mask);
     } else {
         mit_set_all_stand_pid_mode();

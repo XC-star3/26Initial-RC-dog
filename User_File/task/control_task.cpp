@@ -291,7 +291,7 @@ static void print_obstacle_status(void)
     DogObstacle_GetStatus(&status);
     const char *profile = (status.profile == DOG_STAIR_PROFILE_LOW) ? "LOW" :
         ((status.profile == DOG_STAIR_PROFILE_HIGH) ? "HIGH" : "MID");
-    DebugUart_Printf("STAIR: request=%u profile=%s state=%s fault=%u prepared=%u phase=%s target=%s level=%u/%u motion=%u can_exit=%u landing=%ldmm peak=%ldmm body_raise=%ldmm tread=%ldmm\r\n",
+    DebugUart_Printf("STAIR: request=%u profile=%s state=%s fault=%u prepared=%u phase=%s target=%s level=%u/%u motion=%u can_exit=%u landing=%ldmm clearance=%ldmm peak=%ldmm body_raise=%ldmm tread=%ldmm\r\n",
                      (unsigned)status.mode_requested,
                      profile,
                      DogObstacle_StateName(status.state),
@@ -304,6 +304,7 @@ static void print_obstacle_status(void)
                      (unsigned)status.motion_state,
                      (unsigned)status.can_exit,
                      (long)status.landing_height_mm,
+                     (long)status.swing_clearance_mm,
                      (long)status.swing_peak_mm,
                      (long)status.body_preraise_mm,
                      (long)status.tread_depth_mm);

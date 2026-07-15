@@ -74,6 +74,7 @@ struct DogObstacleStatus {
     uint8_t completed_levels;
     uint8_t total_levels;
     float landing_height_mm;
+    float swing_clearance_mm;
     float swing_peak_mm;
     float body_preraise_mm;
     float tread_depth_mm;

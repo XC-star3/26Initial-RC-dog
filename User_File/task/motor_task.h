@@ -21,6 +21,7 @@ extern "C" {
 #define DOG_GAIT_SPEED_MID      1U
 #define DOG_GAIT_SPEED_HIGH     2U
 #define DOG_GAIT_SPEED_DEFAULT  DOG_GAIT_SPEED_MID
+#define DOG_GAIT_SWING_CLEARANCE_MM 70.0f
 
 #define DOG_LEG_LF              0U
 #define DOG_LEG_RF              1U

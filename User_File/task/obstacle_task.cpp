@@ -15,15 +15,26 @@ static_assert(DOG_OBSTACLE_STAIR_MID_LANDING_MM > 0.0f,
               "Mid stair landing height must be positive");
 static_assert(DOG_OBSTACLE_STAIR_HIGH_LANDING_MM > 0.0f,
               "High stair landing height must be positive");
-static_assert(DOG_OBSTACLE_STAIR_LOW_SWING_PEAK_MM >=
+static_assert(DOG_GAIT_SWING_CLEARANCE_MM > 0.0f,
+              "Shared gait and stair swing clearance must be positive");
+static_assert(DOG_OBSTACLE_STAIR_LOW_LANDING_MM +
+                  DOG_GAIT_SWING_CLEARANCE_MM >
                   DOG_OBSTACLE_STAIR_LOW_LANDING_MM,
-              "Low stair swing peak must reach the landing");
-static_assert(DOG_OBSTACLE_STAIR_MID_SWING_PEAK_MM >=
+              "Low stair total lift must exceed its landing height");
+static_assert(DOG_OBSTACLE_STAIR_MID_LANDING_MM +
+                  DOG_GAIT_SWING_CLEARANCE_MM >
                   DOG_OBSTACLE_STAIR_MID_LANDING_MM,
-              "Mid stair swing peak must reach the landing");
-static_assert(DOG_OBSTACLE_STAIR_HIGH_SWING_PEAK_MM >=
+              "Mid stair total lift must exceed its landing height");
+static_assert(DOG_OBSTACLE_STAIR_HIGH_LANDING_MM +
+                  DOG_GAIT_SWING_CLEARANCE_MM >
                   DOG_OBSTACLE_STAIR_HIGH_LANDING_MM,
-              "High stair swing peak must reach the landing");
+              "High stair total lift must exceed its landing height");
+static_assert(DOG_STAND_FOOT_Z_MM -
+                  (DOG_OBSTACLE_STAIR_HIGH_LANDING_MM +
+                   DOG_GAIT_SWING_CLEARANCE_MM) <
+                  DOG_STAND_FOOT_Z_MM -
+                      DOG_OBSTACLE_STAIR_HIGH_LANDING_MM,
+              "Stair swing Z must decrease to lift in the +Z-down frame");
 static_assert(DOG_OBSTACLE_STAIR_TREAD_MM >
                   (2.0f * DOG_OBSTACLE_STAIR_EDGE_MARGIN_MM),
               "Stair tread is too short for the wheel edge margins");
@@ -106,21 +117,21 @@ static void stair_apply_profile(uint8_t profile)
     switch (s_status.profile) {
     case DOG_STAIR_PROFILE_LOW:
         s_status.landing_height_mm = DOG_OBSTACLE_STAIR_LOW_LANDING_MM;
-        s_status.swing_peak_mm = DOG_OBSTACLE_STAIR_LOW_SWING_PEAK_MM;
         s_status.body_preraise_mm = DOG_OBSTACLE_STAIR_LOW_BODY_RAISE_MM;
         break;
     case DOG_STAIR_PROFILE_HIGH:
         s_status.landing_height_mm = DOG_OBSTACLE_STAIR_HIGH_LANDING_MM;
-        s_status.swing_peak_mm = DOG_OBSTACLE_STAIR_HIGH_SWING_PEAK_MM;
         s_status.body_preraise_mm = DOG_OBSTACLE_STAIR_HIGH_BODY_RAISE_MM;
         break;
     case DOG_STAIR_PROFILE_MID:
     default:
         s_status.landing_height_mm = DOG_OBSTACLE_STAIR_MID_LANDING_MM;
-        s_status.swing_peak_mm = DOG_OBSTACLE_STAIR_MID_SWING_PEAK_MM;
         s_status.body_preraise_mm = DOG_OBSTACLE_STAIR_MID_BODY_RAISE_MM;
         break;
     }
+    s_status.swing_clearance_mm = DOG_GAIT_SWING_CLEARANCE_MM;
+    s_status.swing_peak_mm = s_status.landing_height_mm +
+        s_status.swing_clearance_mm;
 }
 
 static float stair_front_normal_z(void)
@@ -173,10 +184,14 @@ static void stair_build_geometry(void)
     const float rear_normal_z = stair_rear_normal_z();
     const float front_support_z = front_normal_z + s_status.body_preraise_mm;
     const float rear_support_z = rear_normal_z + s_status.body_preraise_mm;
-    const float front_upper_z = front_support_z - s_status.landing_height_mm;
-    const float rear_upper_z = rear_support_z - s_status.landing_height_mm;
-    const float front_lift_z = front_support_z - s_status.swing_peak_mm;
-    const float rear_lift_z = rear_support_z - s_status.swing_peak_mm;
+    const float front_landing_z =
+        front_support_z - s_status.landing_height_mm;
+    const float rear_landing_z =
+        rear_support_z - s_status.landing_height_mm;
+    const float front_swing_z =
+        front_landing_z - s_status.swing_clearance_mm;
+    const float rear_swing_z =
+        rear_landing_z - s_status.swing_clearance_mm;
     const float compact = DOG_OBSTACLE_STAIR_COMPACT_X_MM;
     const float front_forward = DOG_OBSTACLE_STAIR_FRONT_FORWARD_X_MM;
     const float rear_shift = DOG_OBSTACLE_STAIR_REAR_SHIFT_X_MM;
@@ -201,56 +216,56 @@ static void stair_build_geometry(void)
     stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
                         DOG_STAIR_PHASE_LEVEL_READY);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LIFT,
-                           DOG_LEG_LF, -compact, front_lift_z);
+                           DOG_LEG_LF, -compact, front_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
                         DOG_STAIR_PHASE_LEFT_FRONT_LIFT);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_FORWARD,
-                           DOG_LEG_LF, front_forward, front_lift_z);
+                           DOG_LEG_LF, front_forward, front_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LAND,
                         DOG_STAIR_PHASE_LEFT_FRONT_FORWARD);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_FRONT_LAND,
-                           DOG_LEG_LF, front_forward, front_upper_z);
+                           DOG_LEG_LF, front_forward, front_landing_z);
 
     stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
                         DOG_STAIR_PHASE_LEFT_FRONT_LAND);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LIFT,
-                           DOG_LEG_RF, -compact, front_lift_z);
+                           DOG_LEG_RF, -compact, front_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
                         DOG_STAIR_PHASE_RIGHT_FRONT_LIFT);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD,
-                           DOG_LEG_RF, front_forward, front_lift_z);
+                           DOG_LEG_RF, front_forward, front_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LAND,
                         DOG_STAIR_PHASE_RIGHT_FRONT_FORWARD);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_FRONT_LAND,
-                           DOG_LEG_RF, front_forward, front_upper_z);
+                           DOG_LEG_RF, front_forward, front_landing_z);
 
     stair_set_waypoint(DOG_STAIR_PHASE_BODY_SHIFT,
-                       -compact, front_upper_z, rear_shift, rear_support_z);
+                       -compact, front_landing_z, rear_shift, rear_support_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LIFT,
                         DOG_STAIR_PHASE_BODY_SHIFT);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LIFT,
-                           DOG_LEG_LB, rear_shift, rear_lift_z);
+                           DOG_LEG_LB, rear_shift, rear_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
                         DOG_STAIR_PHASE_LEFT_REAR_LIFT);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_REAR_FORWARD,
-                           DOG_LEG_LB, compact, rear_lift_z);
+                           DOG_LEG_LB, compact, rear_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LAND,
                         DOG_STAIR_PHASE_LEFT_REAR_FORWARD);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_LEFT_REAR_LAND,
-                           DOG_LEG_LB, compact, rear_upper_z);
+                           DOG_LEG_LB, compact, rear_landing_z);
 
     stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
                         DOG_STAIR_PHASE_LEFT_REAR_LAND);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LIFT,
-                           DOG_LEG_RB, rear_shift, rear_lift_z);
+                           DOG_LEG_RB, rear_shift, rear_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
                         DOG_STAIR_PHASE_RIGHT_REAR_LIFT);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_FORWARD,
-                           DOG_LEG_RB, compact, rear_lift_z);
+                           DOG_LEG_RB, compact, rear_swing_z);
     stair_copy_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LAND,
                         DOG_STAIR_PHASE_RIGHT_REAR_FORWARD);
     stair_set_leg_waypoint(DOG_STAIR_PHASE_RIGHT_REAR_LAND,
-                           DOG_LEG_RB, compact, rear_upper_z);
+                           DOG_LEG_RB, compact, rear_landing_z);
 
     stair_set_waypoint(DOG_STAIR_PHASE_BODY_RAISE,
                        -compact, front_normal_z, compact, rear_normal_z);
