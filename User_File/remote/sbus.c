@@ -168,6 +168,7 @@ void Sbus_Process(void)
 {
     uint8_t frame[SBUS_FRAME_LEN];
     uint8_t ready = 0U;
+    const uint32_t primask = __get_PRIMASK();
 
     __disable_irq();
     if (s_frame_ready != 0U) {
@@ -175,7 +176,7 @@ void Sbus_Process(void)
         s_frame_ready = 0U;
         ready = 1U;
     }
-    __enable_irq();
+    __set_PRIMASK(primask);
 
     if (ready == 0U) {
         return;
