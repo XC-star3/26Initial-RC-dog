@@ -47,6 +47,7 @@
 #define SBUS_SAFETY_RECOVERY_MS 150U
 #define SBUS_GAIT_RETRY_MS     500U
 #define SBUS_FAULT_CLEAR_RETRY_MS 1000U
+#define SBUS_AUTO_ZERO_RETRY_MS 1000U
 #define SBUS_WHEEL_REVERSE_NEUTRAL_MS 200U
 #define SBUS_OBSTACLE_WHEEL_STOP_MS 200U
 #define SBUS_MECHANICAL_PREPARE_MS     200U
@@ -118,6 +119,12 @@ enum SbusLinkState {
     SBUS_LINK_LOST,
 };
 
+enum SbusAutoZeroState {
+    SBUS_AUTO_ZERO_WAIT_LINK = 0U,
+    SBUS_AUTO_ZERO_WAIT_MOTORS,
+    SBUS_AUTO_ZERO_COMPLETE,
+};
+
 enum ControlInputSource {
     CONTROL_SOURCE_SBUS = 0U,
     CONTROL_SOURCE_USB,
@@ -150,6 +157,8 @@ static uint8_t s_sbus_failsafe_stop_sent = 0U;
 static uint32_t s_sbus_link_bad_since_ms = 0U;
 static uint32_t s_sbus_link_last_frame = 0U;
 static uint8_t s_sbus_link_good_frames = 0U;
+static SbusAutoZeroState s_sbus_auto_zero_state = SBUS_AUTO_ZERO_WAIT_LINK;
+static uint32_t s_sbus_auto_zero_last_attempt_ms = 0U;
 static uint8_t s_sbus_remote_lockout = 0U;
 static uint8_t s_sbus_remote_lockout_logged = 0U;
 static uint8_t s_sbus_quad_standing = 0U;
@@ -200,6 +209,7 @@ static uint8_t sbus_safety_raw_is_released(const SbusState *rc);
 static uint8_t sbus_safety_update(const SbusState *rc);
 static void sbus_update_switch_state(uint8_t main_sw, uint8_t sub_sw);
 static SbusLinkState sbus_link_state_update(const SbusState *rc, uint32_t now);
+static uint8_t sbus_auto_zero_tick(uint32_t now);
 static float sbus_axis_to_drive(int16_t value);
 static float sbus_wheel_max_rpm(const SbusState *rc);
 static float sbus_gait_wheel_max_rpm(const SbusState *rc,
@@ -1785,6 +1795,47 @@ static SbusLinkState sbus_link_state_update(const SbusState *rc, uint32_t now)
     return SBUS_LINK_GOOD;
 }
 
+static uint8_t sbus_auto_zero_tick(uint32_t now)
+{
+    if (s_sbus_auto_zero_state == SBUS_AUTO_ZERO_COMPLETE) {
+        return 1U;
+    }
+
+    if (s_sbus_auto_zero_state == SBUS_AUTO_ZERO_WAIT_LINK) {
+        s_sbus_auto_zero_state = SBUS_AUTO_ZERO_WAIT_MOTORS;
+        s_sbus_auto_zero_last_attempt_ms = 0U;
+        DebugUart_Printf("SBUS online: waiting for all leg motors before automatic user-zero capture.\r\n");
+    }
+
+    if ((s_sbus_auto_zero_last_attempt_ms != 0U) &&
+        ((uint32_t)(now - s_sbus_auto_zero_last_attempt_ms) <
+         SBUS_AUTO_ZERO_RETRY_MS)) {
+        return 0U;
+    }
+    s_sbus_auto_zero_last_attempt_ms = now;
+
+    sbus_wheel_hold();
+    sbus_quad_stop_motion_immediate(0U);
+    dog_debug_set_target(DOG_DEBUG_TARGET_ALL);
+
+    const uint8_t expected = dog_debug_target_count();
+    const uint8_t captured = dog_debug_mit_boot_sequence();
+    if ((expected == 0U) || (captured != expected)) {
+        s_sbus_auto_zero_last_attempt_ms = HAL_GetTick();
+        DebugUart_Printf("SBUS auto zero pending: all %u motors are not ready; retry in %lums.\r\n",
+                         (unsigned)expected,
+                         (unsigned long)SBUS_AUTO_ZERO_RETRY_MS);
+        return 0U;
+    }
+
+    s_sbus_auto_zero_state = SBUS_AUTO_ZERO_COMPLETE;
+    s_mode = MODE_MIT_DEBUG;
+    DebugUart_Printf("SBUS auto zero OK %u/%u: current encoder positions are user zero.\r\n",
+                     (unsigned)captured,
+                     (unsigned)expected);
+    return 1U;
+}
+
 static void sbus_remote_transient_inhibit(uint32_t now)
 {
     Dog_Remote_Sample sample = {};
@@ -2177,6 +2228,13 @@ static void sbus_control_update(void)
             sbus_update_switch_state(physical_main, physical_sub);
             return;
         }
+    }
+
+    if (sbus_auto_zero_tick(now) == 0U) {
+        usb_control_revoke(1U);
+        sbus_remote_transient_inhibit(now);
+        sbus_update_switch_state(physical_main, physical_sub);
+        return;
     }
 
     const ControlInputSource previous_source = s_control_source;
@@ -2682,6 +2740,8 @@ void control_task_init(void)
     s_usb_last_generation = 0U;
     s_usb_last_accepted_ms = 0U;
     s_usb_blocked_session_id = 0U;
+    s_sbus_auto_zero_state = SBUS_AUTO_ZERO_WAIT_LINK;
+    s_sbus_auto_zero_last_attempt_ms = 0U;
     s_sbus_start_ms = HAL_GetTick();
 
     DebugUart_SetLogVerbose(0U);
