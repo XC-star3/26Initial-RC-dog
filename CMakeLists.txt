@@ -32,6 +32,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 project(${CMAKE_PROJECT_NAME} C CXX ASM)
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
+option(DOG_ENABLE_ENGINEERING_USB_DEBUG
+    "Enable motion-capable USB console commands and VOFA PID tuning"
+    OFF
+)
+
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
 
@@ -54,7 +59,6 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/User_File/BSP/RGB/board_rgb.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/debug_uart.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/usb_frame_protocol.cpp
-    ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/vofa_pid.cpp
     ${CMAKE_SOURCE_DIR}/User_File/BSP/system_startup_hooks.c
     ${CMAKE_SOURCE_DIR}/User_File/motor/MWSDK/MWMotor.c
     ${CMAKE_SOURCE_DIR}/User_File/remote/sbus.c
@@ -76,6 +80,19 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     ARM_MATH_CHECK
 )
 
+if(DOG_ENABLE_ENGINEERING_USB_DEBUG)
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+        ${CMAKE_SOURCE_DIR}/User_File/BSP/USB/vofa_pid.cpp
+    )
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+        DOG_ENABLE_ENGINEERING_USB_DEBUG=1
+    )
+else()
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+        DOG_ENABLE_ENGINEERING_USB_DEBUG=0
+    )
+endif()
+
 # Remove wrong libob.a library dependency when using cpp files
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 
@@ -94,10 +111,20 @@ endif()
 # while the linker names it after the CMake target. Keep both names available.
 get_filename_component(STM32_WORKSPACE_NAME "${CMAKE_SOURCE_DIR}" NAME)
 if(NOT STM32_WORKSPACE_NAME STREQUAL CMAKE_PROJECT_NAME)
-    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_PROJECT_NAME}.map"
-            "${CMAKE_CURRENT_BINARY_DIR}/${STM32_WORKSPACE_NAME}.map"
-        VERBATIM
-    )
+    if(CMAKE_COMMAND AND EXISTS "${CMAKE_COMMAND}")
+        set(MAP_COPY_CMAKE_COMMAND "${CMAKE_COMMAND}")
+    else()
+        find_program(MAP_COPY_CMAKE_COMMAND NAMES cmake cube-cmake NO_CACHE)
+    endif()
+
+    if(MAP_COPY_CMAKE_COMMAND)
+        add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+            COMMAND "${MAP_COPY_CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_PROJECT_NAME}.map"
+                "${CMAKE_CURRENT_BINARY_DIR}/${STM32_WORKSPACE_NAME}.map"
+            VERBATIM
+        )
+    else()
+        message(WARNING "CMake executable not found; workspace map alias will not be copied")
+    endif()
 endif()

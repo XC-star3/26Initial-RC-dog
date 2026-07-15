@@ -309,15 +309,6 @@ struct Dog_Motor_Config {
     float max_deg;
 };
 
-struct Dog_Imu_Sample {
-    float roll_deg;
-    float pitch_deg;
-    float yaw_deg;
-    float gyro_dps[3];
-    float accel_mps2[3];
-    uint32_t tick_ms;
-};
-
 struct Dog_Remote_Sample {
     uint8_t stand_request;
     uint8_t estop_request;
@@ -481,7 +472,6 @@ void dog_motor_query_encoder(uint8_t motor_index);
 void dog_motor_query_online_encoders(void);
 
 /* 安全状态、站立状态控制和电机任务周期入口。 */
-void DogImu_Update(const Dog_Imu_Sample *sample);
 void DogRemote_Update(const Dog_Remote_Sample *sample);
 void DogStand_Request(void);
 void DogStand_Disable(void);

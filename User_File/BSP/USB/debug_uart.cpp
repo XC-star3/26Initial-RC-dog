@@ -11,27 +11,35 @@
 
 #define DEBUG_UART_TX_BUFFER_SIZE 4096U
 #define DEBUG_UART_TX_CHUNK_SIZE  256U
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 #define DEBUG_UART_CAN_RING_SIZE  64U
 #define DEBUG_UART_CAN_DRAIN_MAX  16U
+#endif
 
 extern USBD_HandleTypeDef hUsbDeviceHS;
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 typedef struct {
     uint8_t port;
     uint32_t id;
     uint8_t len;
     uint8_t data[64];
 } debug_uart_can_frame_t;
+#endif
 
 static uint8_t s_debug_uart_ready = 0U;
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static debug_uart_can_frame_t s_can_ring[DEBUG_UART_CAN_RING_SIZE];
 static volatile uint32_t s_can_ring_head = 0U;
 static volatile uint32_t s_can_ring_tail = 0U;
 static volatile uint32_t s_can_ring_drops = 0U;
+#endif
 static uint8_t s_tx_pending[DEBUG_UART_TX_BUFFER_SIZE];
 static uint16_t s_tx_pending_len = 0U;
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static volatile uint8_t s_log_verbose = 1U;
 static volatile uint8_t s_can_rx_verbose = 1U;
+#endif
 
 static void DebugUart_FlushTx(void)
 {
@@ -63,13 +71,17 @@ void DebugUart_Init(void)
         return;
     }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     memset(s_can_ring, 0, sizeof(s_can_ring));
     s_can_ring_head = 0U;
     s_can_ring_tail = 0U;
     s_can_ring_drops = 0U;
+#endif
     s_tx_pending_len = 0U;
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     s_log_verbose = 1U;
     s_can_rx_verbose = 1U;
+#endif
     s_debug_uart_ready = 1U;
 }
 
@@ -129,6 +141,7 @@ void DebugUart_Printf(const char *fmt, ...)
 
 void DebugUart_LogCanRx(uint8_t port, uint32_t id, const uint8_t *data, uint8_t len)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     if ((s_can_rx_verbose == 0U) || (data == nullptr)) {
         return;
     }
@@ -155,26 +168,48 @@ void DebugUart_LogCanRx(uint8_t port, uint32_t id, const uint8_t *data, uint8_t 
     s_can_ring_head = head + 1U;
 
     __set_PRIMASK(primask);
+#else
+    (void)port;
+    (void)id;
+    (void)data;
+    (void)len;
+#endif
 }
 
 void DebugUart_SetLogVerbose(uint8_t enable)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     s_log_verbose = (enable != 0U) ? 1U : 0U;
+#else
+    (void)enable;
+#endif
 }
 
 uint8_t DebugUart_GetLogVerbose(void)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     return s_log_verbose;
+#else
+    return 0U;
+#endif
 }
 
 void DebugUart_SetCanRxVerbose(uint8_t enable)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     s_can_rx_verbose = (enable != 0U) ? 1U : 0U;
+#else
+    (void)enable;
+#endif
 }
 
 uint8_t DebugUart_GetCanRxVerbose(void)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     return s_can_rx_verbose;
+#else
+    return 0U;
+#endif
 }
 
 uint8_t DebugUart_IsHostOpen(void)
@@ -221,6 +256,7 @@ void DebugUart_Process(void)
 
     DebugUart_FlushTx();
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     uint32_t drops = s_can_ring_drops;
@@ -264,4 +300,5 @@ void DebugUart_Process(void)
     }
 
     DebugUart_FlushTx();
+#endif
 }

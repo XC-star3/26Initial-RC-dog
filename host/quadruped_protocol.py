@@ -27,7 +27,7 @@ class RobotMode(IntEnum):
     SAFE_HOLD = 2
     STAND_HOLD = 3
     STAND_WHEEL = 4
-    STAND_ARM = 5
+    RESERVED_STAND = 5
     GAIT_ONLY = 6
     GAIT_WHEEL = 7
     RESERVED = 8
@@ -62,8 +62,6 @@ class VirtualRemoteCommand:
     yaw: float = 0.0
     forward: float = 0.0
     speed_axis: float = -1.0
-    arm_j0: float = 0.0
-    arm_j1: float = 0.0
     motion_enable: bool = False
     deadman: bool = False
     smooth_stop: bool = False
@@ -76,7 +74,7 @@ class VirtualRemoteCommand:
         if not self.motion_enable:
             return VirtualRemoteCommand.safe_zero()
         if not self.deadman or self.smooth_stop:
-            return replace(self, yaw=0.0, forward=0.0, arm_j0=0.0, arm_j1=0.0)
+            return replace(self, yaw=0.0, forward=0.0)
         return self
 
 
@@ -112,8 +110,8 @@ class ControlStream:
             _permille(command.yaw),
             _permille(command.forward),
             _permille(command.speed_axis),
-            _permille(command.arm_j0),
-            _permille(command.arm_j1),
+            0,
+            0,
             CHANNEL_VALID_MASK,
             self.command_counter,
         )

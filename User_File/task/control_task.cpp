@@ -7,20 +7,23 @@
 #include "tim.h"
 #include "usb_frame_protocol.h"
 #include "usbd_cdc_if.h"
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 #include "vofa_pid.h"
+#endif
 #include "wheel_motor_task.h"
 
 #include "cmsis_os2.h"
 
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
 
+#ifndef DOG_ENABLE_ENGINEERING_USB_DEBUG
+#define DOG_ENABLE_ENGINEERING_USB_DEBUG 0
+#endif
+
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 #define DEBUG_LF_STATUS_MS 1000U
 #define STEP_DEG           30.0f
-
-#ifndef USB_CDC_PRODUCTION_INTERFACE
-#define USB_CDC_PRODUCTION_INTERFACE 1
 #endif
 
 #define USB_RC_TIMEOUT_MS      150U
@@ -128,8 +131,8 @@ struct SbusDriveInput {
 };
 
 static ControlMode s_mode = MODE_RX_ONLY;
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static uint8_t s_can_rx_log_enabled = 0U;
-#if !USB_CDC_PRODUCTION_INTERFACE
 static uint32_t s_last_lf_status_ms = 0U;
 #endif
 static uint8_t s_sbus_seen_fresh = 0U;
@@ -301,6 +304,7 @@ static void print_obstacle_status(void)
                      (long)status.final_gap_mm);
 }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static void print_help(void)
 {
     DebugUart_Printf("\r\nMWSDK CANSimple debug commands:\r\n");
@@ -364,6 +368,7 @@ static void print_help(void)
     DebugUart_Printf("  SB+SC: H+L=gait only/HOLD, H+M=gait wheel, H+H=reserved stand/HOLD\r\n");
     DebugUart_Printf("\r\n");
 }
+#endif
 
 static void enter_rx_only(void)
 {
@@ -372,12 +377,15 @@ static void enter_rx_only(void)
     s_mode = MODE_RX_ONLY;
     DebugUart_SetLogVerbose(0U);
     DebugUart_SetCanRxVerbose(0U);
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     s_can_rx_log_enabled = 0U;
+#endif
     DebugUart_Printf("RX-only leg=%s target=%s\r\n",
                      dog_leg_name(dog_leg_target_leg()),
                      dog_debug_target_name());
 }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static void print_pid_gains(void)
 {
     const Dog_Mit_Ang_Pid *active = dog_mit_active_ang_pid();
@@ -417,6 +425,7 @@ static void toggle_vofa(void)
     DebugUart_Printf("VOFA OFF. Text log still muted; send 'c' to re-enable CAN log.\r\n");
     print_pid_gains();
 }
+#endif
 
 static void print_status(void)
 {
@@ -564,6 +573,7 @@ static void print_sbus_status(void)
     print_obstacle_status();
 }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static void set_target(uint8_t target)
 {
     dog_debug_set_target(target);
@@ -652,6 +662,7 @@ static void move_target(float delta_inner_deg, float delta_outer_deg)
     }
     dog_leg_set_target_leg_deg(in + delta_inner_deg, out + delta_outer_deg);
 }
+#endif
 
 static const char *sbus_switch_name(uint8_t sw)
 {
@@ -1673,6 +1684,7 @@ static void sbus_mode_tick(SbusRobotMode requested, const SbusState *rc,
     }
 }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static uint8_t command_allowed_while_inhibited(char c)
 {
     switch (c) {
@@ -1703,6 +1715,7 @@ static uint8_t command_allowed_while_inhibited(char c)
         return 0U;
     }
 }
+#endif
 
 static void sbus_safety_trigger(void)
 {
@@ -1858,8 +1871,7 @@ static uint8_t usb_rc_is_safe_zero(const UsbVirtualRcSample *rc)
     return ((rc->main_switch == 0U) && (rc->sub_switch == 0U) &&
             (rc->command_flags == 0U) &&
             (rc->yaw_permille == 0) && (rc->forward_permille == 0) &&
-            (rc->speed_permille == -1000) &&
-            (rc->arm_j0_permille == 0) && (rc->arm_j1_permille == 0)) ? 1U : 0U;
+            (rc->speed_permille == -1000)) ? 1U : 0U;
 }
 
 static uint8_t usb_physical_authorized(const SbusState *rc,
@@ -2204,6 +2216,7 @@ static void sbus_control_update(void)
     sbus_update_switch_state(control_main, control_sub);
 }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static void handle_command(char c)
 {
     if ((c == '\r') || (c == '\n') || (c == ' ')) {
@@ -2578,6 +2591,7 @@ static void handle_command(char c)
         break;
     }
 }
+#endif
 
 static void update_target(void)
 {
@@ -2595,26 +2609,26 @@ static void usb_cdc_process_input(void)
         if (UsbFrameProtocol_FeedByte((uint8_t)ch, now) != 0U) {
             continue;
         }
-#if USB_CDC_PRODUCTION_INTERFACE
-        if ((ch == 'p') || (ch == 'Y') || (ch == 'y')) {
-            handle_command((char)ch);
-        }
-#else
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
         if (VofaPid_IsEnabled() != 0U) {
             if (VofaPid_FeedRxByte((uint8_t)ch) != 0U) {
                 continue;
             }
         }
         handle_command((char)ch);
+#else
+        if (ch == 'p') {
+            print_status();
+        } else if ((ch == 'Y') || (ch == 'y')) {
+            print_sbus_status();
+        }
 #endif
     }
 }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 static void lf_periodic_status(void)
 {
-#if USB_CDC_PRODUCTION_INTERFACE
-    return;
-#else
     if (VofaPid_IsEnabled() != 0U) {
         return;
     }
@@ -2636,8 +2650,8 @@ static void lf_periodic_status(void)
     }
 
     dog_lf_print_periodic_status();
-#endif
 }
+#endif
 
 static void control_init_wait(uint32_t timeout_ms, uint8_t stop_when_host_open)
 {
@@ -2655,7 +2669,9 @@ static void control_init_wait(uint32_t timeout_ms, uint8_t stop_when_host_open)
 /* 控制任务负责操作者输入状态；CAN 电机状态始终由 motor_task 管理。 */
 void control_task_init(void)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     VofaPid_Init();
+#endif
     Sbus_Init();
     UsbFrameProtocol_Init();
     s_control_source = CONTROL_SOURCE_SBUS;
@@ -2668,16 +2684,16 @@ void control_task_init(void)
     s_usb_blocked_session_id = 0U;
     s_sbus_start_ms = HAL_GetTick();
 
-#if USB_CDC_PRODUCTION_INTERFACE
     DebugUart_SetLogVerbose(0U);
     DebugUart_SetCanRxVerbose(0U);
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     s_can_rx_log_enabled = 0U;
 #endif
 
     control_init_wait(1500U, 1U);
     control_init_wait(500U, 0U);
 
-#if !USB_CDC_PRODUCTION_INTERFACE
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     print_help();
 #endif
     enter_rx_only();
@@ -2688,7 +2704,9 @@ void control_task(void)
 {
     usb_cdc_process_input();
     update_target();
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     lf_periodic_status();
+#endif
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)

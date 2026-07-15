@@ -4,7 +4,9 @@
 #include "control_task.h"
 #include "debug_uart.h"
 #include "obstacle_task.h"
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
 #include "vofa_pid.h"
+#endif
 #include "wheel_motor_task.h"
 
 #include "FreeRTOS.h"
@@ -369,7 +371,6 @@ static uint8_t s_mit_torque_test_active = 0U;
 static uint8_t s_mit_torque_test_index = DOG_MOTOR_COUNT;
 static float s_mit_torque_test_nm = 0.0f;
 static uint8_t s_jump_active = 0U;
-static Dog_Imu_Sample s_imu_sample;
 static Dog_Remote_Sample s_remote_sample;
 
 static void motor_safety_tick(uint32_t now);
@@ -1483,7 +1484,10 @@ static void send_mit_torque_commands(uint32_t now)
         }
 
         if ((s_mit_debug_active != 0U) && (fabsf(err_deg) > DOG_MIT_DEBUG_SAFETY_ERR_DEG)) {
-            if (VofaPid_IsEnabled() == 0U) {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
+            if (VofaPid_IsEnabled() == 0U)
+#endif
+            {
                 Dog_Motor_Config *cfg = &g_dog_motor_config[i];
                 DebugUart_Printf("SAFETY M%u %s %s bus%u id%u user=%ldmdeg tgt=%ldmdeg err=%ldmdeg -> fault hold\r\n",
                                  (unsigned)i,
@@ -1548,12 +1552,14 @@ static void send_mit_torque_commands(uint32_t now)
         }
     }
 
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     if (VofaPid_IsEnabled() != 0U) {
         Dog_Mit_Pid_Telemetry telemetry = {};
         if (dog_mit_get_pid_telemetry(VofaPid_GetMotorIndex(), &telemetry) != 0U) {
             VofaPid_SendTelemetry(&telemetry);
         }
     }
+#endif
 }
 
 static void send_mit_torque_test_keepalive(uint32_t now)
@@ -3026,19 +3032,25 @@ static void dispatch_mw_rx(uint8_t bus, FDCAN_RxHeaderTypeDef &header, uint8_t *
 
 static void CAN1_Callback(FDCAN_RxHeaderTypeDef &header, uint8_t *buffer)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     DebugUart_LogCanRx(1U, header.Identifier, buffer, fdcan_dlc_to_bytes(header.DataLength));
+#endif
     dispatch_mw_rx(DOG_CAN_FRONT_BUS, header, buffer);
 }
 
 static void CAN2_Callback(FDCAN_RxHeaderTypeDef &header, uint8_t *buffer)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     DebugUart_LogCanRx(2U, header.Identifier, buffer, fdcan_dlc_to_bytes(header.DataLength));
+#endif
     dispatch_mw_rx(DOG_CAN_REAR_BUS, header, buffer);
 }
 
 static void CAN3_Callback(FDCAN_RxHeaderTypeDef &header, uint8_t *buffer)
 {
+#if DOG_ENABLE_ENGINEERING_USB_DEBUG
     DebugUart_LogCanRx(3U, header.Identifier, buffer, fdcan_dlc_to_bytes(header.DataLength));
+#endif
     (void)WheelDrive_OnCanRx(&header, buffer);
 }
 
@@ -6850,11 +6862,6 @@ void dog_motor_query_online_encoders(void)
             mw_query_encoder(i);
         }
     }
-}
-
-void DogImu_Update(const Dog_Imu_Sample *sample)
-{
-    if (sample != nullptr) s_imu_sample = *sample;
 }
 
 void DogRemote_Update(const Dog_Remote_Sample *sample)

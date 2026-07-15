@@ -21,7 +21,6 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
-#include "FreeRTOS.h"
 #include "cmsis_os2.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -55,18 +54,6 @@ static volatile uint8_t s_app_ready = 0U;
 static volatile uint8_t s_motor_ready = 0U;
 
 /* USER CODE END Variables */
-/* Definitions for Start_INS_Task */
-osThreadId_t Start_INS_TaskHandle;
-uint32_t Start_INS_TaskBuffer[1024];
-osStaticThreadDef_t Start_INS_TaskControlBlock;
-const osThreadAttr_t Start_INS_Task_attributes = {
-  .name = "Start_INS_Task",
-  .cb_mem = &Start_INS_TaskControlBlock,
-  .cb_size = sizeof(Start_INS_TaskControlBlock),
-  .stack_mem = &Start_INS_TaskBuffer[0],
-  .stack_size = sizeof(Start_INS_TaskBuffer),
-  .priority = (osPriority_t) osPriorityHigh,
-};
 /* Definitions for Start_Control_Task */
 osThreadId_t Start_Control_TaskHandle;
 uint32_t Start_Control_TaskBuffer[1024];
@@ -109,7 +96,6 @@ const osThreadAttr_t Start_Wheel_Task_attributes = {
 
 /* USER CODE END FunctionPrototypes */
 
-void INS_Task(void *argument);
 void Control_Task(void *argument);
 void CAN_Task(void *argument);
 void Wheel_Task(void *argument);
@@ -144,9 +130,6 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of Start_INS_Task */
-  Start_INS_TaskHandle = osThreadNew(INS_Task, NULL, &Start_INS_Task_attributes);
-
   /* creation of Start_Control_Task */
   Start_Control_TaskHandle = osThreadNew(Control_Task, NULL, &Start_Control_Task_attributes);
 
@@ -164,24 +147,6 @@ void MX_FREERTOS_Init(void) {
   /* add events, ... */
   /* USER CODE END RTOS_EVENTS */
 
-}
-
-/* USER CODE BEGIN Header_INS_Task */
-/**
-  * @brief  Function implementing the Start_INS_Task thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_INS_Task */
-void INS_Task(void *argument)
-{
-  /* USER CODE BEGIN INS_Task */
-  (void)argument;
-  for(;;)
-  {
-    osDelay(2);
-  }
-  /* USER CODE END INS_Task */
 }
 
 /* USER CODE BEGIN Header_Control_Task */

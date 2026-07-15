@@ -58,8 +58,6 @@ class QuadrupedProtocolTest(unittest.TestCase):
                 forward=0.8,
                 yaw=-0.4,
                 speed_axis=0.5,
-                arm_j0=1.0,
-                arm_j1=-1.0,
                 motion_enable=True,
                 deadman=False,
             ),

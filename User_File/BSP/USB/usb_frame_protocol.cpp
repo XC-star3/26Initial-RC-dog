@@ -66,8 +66,8 @@ static uint8_t decode_virtual_rc(uint32_t now_ms)
     sample.yaw_permille = read_i16_le(&payload[12]);
     sample.forward_permille = read_i16_le(&payload[14]);
     sample.speed_permille = read_i16_le(&payload[16]);
-    sample.arm_j0_permille = read_i16_le(&payload[18]);
-    sample.arm_j1_permille = read_i16_le(&payload[20]);
+    const int16_t legacy_reserved_axis_0 = read_i16_le(&payload[18]);
+    const int16_t legacy_reserved_axis_1 = read_i16_le(&payload[20]);
     sample.channel_valid_mask = read_u16_le(&payload[22]);
     sample.command_counter = read_u32_le(&payload[24]);
     sample.frame_seq = read_u16_le(&s_frame[6]);
@@ -82,8 +82,8 @@ static uint8_t decode_virtual_rc(uint32_t now_ms)
          (permille_is_valid(sample.yaw_permille) != 0U) &&
          (permille_is_valid(sample.forward_permille) != 0U) &&
          (permille_is_valid(sample.speed_permille) != 0U) &&
-         (permille_is_valid(sample.arm_j0_permille) != 0U) &&
-         (permille_is_valid(sample.arm_j1_permille) != 0U)) ? 1U : 0U;
+         (permille_is_valid(legacy_reserved_axis_0) != 0U) &&
+         (permille_is_valid(legacy_reserved_axis_1) != 0U)) ? 1U : 0U;
     if (valid == 0U) {
         s_diag.payload_reject_count++;
         return 0U;

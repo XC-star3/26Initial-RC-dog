@@ -126,12 +126,42 @@ static void test_timeout_and_resync(void)
     assert(diag.valid_control_frames == 1U);
 }
 
+static void test_legacy_reserved_axes_are_ignored(void)
+{
+    UsbFrameProtocol_Init();
+    uint8_t frame[USB_FRAME_SIZE] = {};
+    frame[0] = 0xA5U;
+    frame[1] = 0x5AU;
+    frame[2] = 0x01U;
+    frame[3] = USB_FRAME_MSG_VIRTUAL_RC;
+    frame[8] = USB_FRAME_PAYLOAD_SIZE;
+    write_u32_le(&frame[10], 1U);
+    write_u16_le(&frame[26], (uint16_t)(int16_t)-1000);
+    write_u16_le(&frame[28], (uint16_t)(int16_t)1000);
+    write_u16_le(&frame[30], (uint16_t)(int16_t)-1000);
+    write_u16_le(&frame[32], USB_RC_CHANNEL_VALID_MASK);
+    write_u16_le(&frame[38], UsbFrameProtocol_Crc16(&frame[2], 36U));
+
+    for (uint8_t i = 0U; i < USB_FRAME_SIZE; ++i) {
+        assert(UsbFrameProtocol_FeedByte(frame[i], 300U) == 1U);
+    }
+
+    UsbVirtualRcSample sample = {};
+    UsbFrameProtocolDiag diag = {};
+    assert(UsbFrameProtocol_GetVirtualRc(&sample) == 1U);
+    assert(sample.session_id == 1U);
+    UsbFrameProtocol_GetDiag(&diag);
+    assert(diag.payload_reject_count == 0U);
+    assert(diag.valid_control_frames == 1U);
+}
+
 int main(void)
 {
     UsbFrameProtocol_Init();
     test_control_vector();
     test_crc_reject_and_imu_ignore();
     test_timeout_and_resync();
+    test_legacy_reserved_axes_are_ignored();
     puts("usb_frame_protocol_test: PASS");
     return 0;
 }

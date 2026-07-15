@@ -17,9 +17,8 @@
 
 | 通道 | 物理层 | 方向 | 用途 |
 | --- | --- | --- | --- |
-| 四足运动控制 | USB CDC | PC -> STM32 | 模式、运动轴、机械臂 jog |
+| 四足运动控制 | USB CDC | PC -> STM32 | 模式、前后、转向和速度轴 |
 | IMU 姿态 | USB CDC | PC -> STM32 | 可选姿态增强专项数据 |
-| 机械臂动作 | UART TTL，115200 8N1 | PC -> 机械臂控制器 | HOME、抓取、放置和吸盘 |
 | ROS2 内部 | DDS topics/services/actions | 节点间 | 导航、视觉、任务和安全协调 |
 
 上位机打开 USB CDC 时配置 `115200 8N1`。USB CDC 本身不依赖物理串口波特率，但上下位机工具统一使用该配置。
@@ -94,8 +93,8 @@ struct.Struct("<IIBBHhhhhhHI")
 | 12 | `int16` | yaw_permille | CH1 等价量，`-1000..1000`，负左正右 |
 | 14 | `int16` | forward_permille | CH2 等价量，`-1000..1000`，负退正进 |
 | 16 | `int16` | speed_permille | CH3 等价量，`-1000..1000` |
-| 18 | `int16` | arm_j0_permille | CH6 等价量，`-1000..1000` |
-| 20 | `int16` | arm_j1_permille | CH7 等价量，`-1000..1000` |
+| 18 | `int16` | reserved_axis_0 | v1 保留；新发送端必须为 `0`，接收端兼容旧值后忽略 |
+| 20 | `int16` | reserved_axis_1 | v1 保留；新发送端必须为 `0`，接收端兼容旧值后忽略 |
 | 22 | `uint16` | channel_valid_mask | v1 固定 `0x0067` |
 | 24 | `uint32` | command_counter | session 内递增，允许 32 位回绕 |
 
@@ -125,7 +124,7 @@ virtual_mode = main_switch * 3 + sub_switch
 | 2 | LOW+HIGH | SAFE_HOLD | 腿 RX-only，轮驱 HOLD |
 | 3 | MID+LOW | STAND_HOLD | MIT 站立，轮驱 HOLD |
 | 4 | MID+MID | STAND_WHEEL | 站立轮行 |
-| 5 | MID+HIGH | STAND_ARM | 站立并允许 CH6/CH7 jog |
+| 5 | MID+HIGH | RESERVED_STAND | 保留，站立 HOLD |
 | 6 | HIGH+LOW | GAIT_ONLY | 纯足步态，轮驱 HOLD |
 | 7 | HIGH+MID | GAIT_WHEEL | 步态与轮驱同步 |
 | 8 | HIGH+HIGH | RESERVED | 保留，站立 HOLD |
@@ -138,13 +137,13 @@ USB 模式 0 是安全 IDLE，不等于当前实体遥控 LOW+LOW 的 MOTOR_CHEC
 
 | 位 | 名称 | 行为 |
 | ---: | --- | --- |
-| 0 | `DEADMAN_HELD` | 未置位时 CH1/CH2/CH6/CH7 强制为零 |
+| 0 | `DEADMAN_HELD` | 未置位时 CH1/CH2 强制为零 |
 | 1 | `MOTION_ENABLE` | 未置位时强制 IDLE、连续轴归零、CH3=-1000 |
-| 2 | `SMOOTH_STOP` | CH1/CH2/CH6/CH7 强制为零并请求平稳收步 |
+| 2 | `SMOOTH_STOP` | CH1/CH2 强制为零并请求平稳收步 |
 
 只有 `DEADMAN_HELD` 与 `MOTION_ENABLE` 同时置位时，才允许采用非零连续运动轴。未知 flag 位必须按无运动帧处理。
 
-`channel_valid_mask=0x0067` 对应 CH1/CH2/CH3/CH6/CH7。未置位通道必须按 0 处理。USB payload 不存在 CH9。
+`channel_valid_mask=0x0067` 为 v1 固定兼容值。当前只使用其中的 CH1/CH2/CH3；新发送端把原 CH6/CH7 槽位固定为 0，接收端仍接受 `-1000..1000` 的旧 v1 值但不执行任何动作。USB payload 不存在 CH9。
 
 ### 4.4 安全零帧
 
@@ -155,8 +154,8 @@ flags=0
 yaw=0
 forward=0
 speed=-1000
-arm_j0=0
-arm_j1=0
+reserved_axis_0=0
+reserved_axis_1=0
 channel_valid_mask=0x0067
 ```
 
@@ -167,7 +166,7 @@ channel_valid_mask=0x0067
 ```text
 session=0x11223344, host=0x01020304
 HIGH+LOW, flags=0x0003
-CH1=-250, CH2=500, CH3=-800, CH6/7=0
+CH1=-250, CH2=500, CH3=-800, reserved axes=0
 mask=0x0067, counter=10, frame_seq=0x1234
 
 A5 5A 01 10 00 00 34 12 1C 00 44 33 22 11 04 03 02 01
@@ -195,7 +194,7 @@ struct.Struct("<6fI")
 | 20 | `float32` | gyro_z | rad/s |
 | 24 | `uint32` | timestamp_ms | 上位机单调时钟低 32 位 |
 
-若启用 IMU 专项，必须检查 6 个 float 均为有限值，将 rad/s 转成当前 `Dog_Imu_Sample.gyro_dps[]` 所需的 deg/s，并以本地接收时间判断新鲜度。首轮实机验证只用于记录、观察和姿态超限停止，不直接修改足端目标。
+若启用 IMU 专项，必须检查 6 个 float 均为有限值，将 rad/s 转成 deg/s，并以本地接收时间判断新鲜度。首轮实机验证只用于记录、观察和姿态超限停止，不直接修改足端目标；当前固件没有 IMU 业务层 API。
 
 ## 6. 控制与安全约束
 
@@ -257,25 +256,13 @@ struct.Struct("<6fI")
 Mid-360 IMU
   -> 滤波
   -> 0x11，25 Hz
-  -> STM32 DogImu_Update()
+  -> STM32 新增经验证的 IMU 接收接口
   -> 观察/姿态补偿（分阶段开启）
 ```
 
-## 8. 机械臂 UART 文本协议
+## 8. 保留字段与模式
 
-机械臂控制器使用 `115200 8N1`，命令以 `\n` 结尾：
-
-| 命令 | 用途 |
-| --- | --- |
-| `HOME\n` | 回到待机位 |
-| `VISION_SCAN\n` | 视觉扫描姿态 |
-| `VISION_AID\n` | 辅助定位姿态 |
-| `GRASP\n` | 抓取姿态 |
-| `PLACE\n` | 放置姿态 |
-| `SUCTION_ON\n` | 开启吸盘 |
-| `SUCTION_OFF\n` | 关闭吸盘 |
-
-动作完成确认、幂等 operation_id 和机构状态回传尚未在本协议定义。第一阶段任务赛联调必须通过机械臂控制器现有反馈或上位机超时策略保证动作不会无限等待。
+当前硬件不使用机械臂，固件和上位机均不公开机械臂控制。为保持 v1 固定向量兼容，mode 5、payload 偏移 18/20 和 `channel_valid_mask=0x0067` 的数值不重排；mode 5 按站立 HOLD 处理，新发送端把两个保留轴置 0，接收端对旧 v1 非零值只做范围校验后忽略。需要新增执行机构时必须定义新协议版本，不能复用这些保留槽位改变 v1 语义。
 
 ## 9. 第一阶段验收
 

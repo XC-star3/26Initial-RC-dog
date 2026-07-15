@@ -27,8 +27,6 @@ typedef struct UsbVirtualRcSample {
     int16_t yaw_permille;
     int16_t forward_permille;
     int16_t speed_permille;
-    int16_t arm_j0_permille;
-    int16_t arm_j1_permille;
     uint16_t channel_valid_mask;
     uint32_t command_counter;
     uint16_t frame_seq;
