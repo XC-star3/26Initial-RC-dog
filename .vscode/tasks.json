@@ -2,7 +2,66 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "CMake: configure Debug",
+            "label": "_Firmware: Configure Flash",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--preset",
+                "Flash"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "hide": true
+        },
+        {
+            "label": "_Firmware: Build Flash",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "Flash"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": [
+                "_Firmware: Configure Flash"
+            ],
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "hide": true
+        },
+        {
+            "label": "_Firmware: OpenOCD Flash",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f",
+                "${workspaceFolder}/stm32h723_daplink.cfg",
+                "-c",
+                "init; reset halt; program build/Flash/RC-dog.elf verify; reset run; shutdown"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "hide": true
+        },
+        {
+            "label": "Firmware: Flash",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "_Firmware: Build Flash",
+                "_Firmware: OpenOCD Flash"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "_Firmware: Configure Debug",
             "type": "shell",
             "command": "cmake",
             "args": [
@@ -12,10 +71,11 @@
             "options": {
                 "cwd": "${workspaceFolder}"
             },
-            "problemMatcher": []
+            "problemMatcher": [],
+            "hide": true
         },
         {
-            "label": "CMake: build Debug",
+            "label": "Firmware: Build Debug",
             "type": "shell",
             "command": "cmake",
             "args": [
@@ -27,7 +87,7 @@
                 "cwd": "${workspaceFolder}"
             },
             "dependsOn": [
-                "CMake: configure Debug"
+                "_Firmware: Configure Debug"
             ],
             "problemMatcher": [
                 "$gcc"
@@ -36,32 +96,6 @@
                 "kind": "build",
                 "isDefault": true
             }
-        },
-        {
-            "label": "OpenOCD: flash Debug",
-            "type": "shell",
-            "command": "F:/xpack-openocd-0.12.0-7/bin/openocd.exe",
-            "args": [
-                "-f",
-                "${workspaceFolder}/stm32h743_daplink.cfg",
-                "-c",
-                "adapter speed 200",
-                "-c",
-                "init; reset halt; sleep 200; program build/Debug-cmake/dog_leg_test_SDK.elf verify; reset run; shutdown"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Build + Flash Debug",
-            "dependsOrder": "sequence",
-            "dependsOn": [
-                "CMake: build Debug",
-                "OpenOCD: flash Debug"
-            ],
-            "problemMatcher": []
         }
     ]
 }

@@ -9,6 +9,13 @@ set(CMAKE_CXX_COMPILER_ID GNU)
 set(TOOLCHAIN_PREFIX                arm-none-eabi-)
 
 set(_TOOLCHAIN_HINT_DIRS)
+
+# xPack toolchain (GCC 14.2+ for C++20 support)
+if(DEFINED ENV{HOME})
+    file(GLOB _XPACK_TOOL_DIRS "$ENV{HOME}/arm-toolchain/xpack-arm-none-eabi-gcc-*/bin")
+    list(APPEND _TOOLCHAIN_HINT_DIRS ${_XPACK_TOOL_DIRS})
+endif()
+
 if(DEFINED ENV{CUBE_BUNDLE_PATH})
     file(GLOB _CUBE_ENV_TOOL_DIRS "$ENV{CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/*/bin")
     list(APPEND _TOOLCHAIN_HINT_DIRS ${_CUBE_ENV_TOOL_DIRS})

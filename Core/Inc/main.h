@@ -65,9 +65,6 @@ void Error_Handler(void);
 #define ACCEL_INT_GPIO_Port GPIOE
 #define GYRO_INT_Pin GPIO_PIN_12
 #define GYRO_INT_GPIO_Port GPIOE
-#define ARM_PUMP_EN_Pin GPIO_PIN_13
-#define ARM_PUMP_EN_GPIO_Port GPIOE
-
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */

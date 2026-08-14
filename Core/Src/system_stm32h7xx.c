@@ -45,6 +45,10 @@
   */
 
 #include "stm32h7xx.h"
+
+void ExitRun0Mode(void)
+{
+}
 #include <math.h>
 
 #if !defined  (HSE_VALUE)

@@ -1,0 +1,8 @@
+modules:
+  - rcdog/SbusReceiver
+  - rcdog/DogMotor
+  - rcdog/WheelMotor
+  - rcdog/ObstacleController
+  - rcdog/HostLink
+  - rcdog/RobotControl
+  - rcdog/StatusLED

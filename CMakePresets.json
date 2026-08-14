@@ -5,36 +5,21 @@
             "name": "default",
             "hidden": true,
             "generator": "Ninja",
-            "binaryDir": "${sourceDir}/build/${presetName}-cmake",
+            "binaryDir": "${sourceDir}/build/${presetName}",
             "toolchainFile": "${sourceDir}/cmake/gcc-arm-none-eabi.cmake",
             "cacheVariables": {}
         },
         {
-            "name": "Debug",
-            "inherits": "default",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug"
-            }
-        },
-        {
-            "name": "Release",
+            "name": "Flash",
+            "displayName": "Flash (Release)",
             "inherits": "default",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
             }
         },
         {
-            "name": "codex-arm-debug",
+            "name": "Debug",
             "inherits": "default",
-            "binaryDir": "${sourceDir}/build/codex-arm-debug",
-            "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug"
-            }
-        },
-        {
-            "name": "codex-arm-sdk",
-            "inherits": "default",
-            "binaryDir": "${sourceDir}/build/codex-arm-sdk",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug"
             }
@@ -42,20 +27,12 @@
     ],
     "buildPresets": [
         {
+            "name": "Flash",
+            "configurePreset": "Flash"
+        },
+        {
             "name": "Debug",
             "configurePreset": "Debug"
-        },
-        {
-            "name": "Release",
-            "configurePreset": "Release"
-        },
-        {
-            "name": "codex-arm-debug",
-            "configurePreset": "codex-arm-debug"
-        },
-        {
-            "name": "codex-arm-sdk",
-            "configurePreset": "codex-arm-sdk"
         }
     ]
 }

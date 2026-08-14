@@ -1,0 +1,38 @@
+global_settings:
+  monitor_sleep_ms: 100
+modules:
+  - id: SbusReceiver_0
+    name: SbusReceiver
+    constructor_args:
+      stack_size: 2048
+  - id: DogMotor_0
+    name: DogMotor
+    constructor_args:
+      stack_size: 4096
+  - id: WheelMotor_0
+    name: WheelMotor
+    constructor_args:
+      stack_size: 3072
+  - id: ObstacleController_0
+    name: ObstacleController
+    constructor_args:
+      dog_motor: '@DogMotor_0'
+      wheel_motor: '@WheelMotor_0'
+  - id: HostLink_0
+    name: HostLink
+    constructor_args:
+      stack_size: 3072
+  - id: RobotControl_0
+    name: RobotControl
+    constructor_args:
+      sbus: '@SbusReceiver_0'
+      dog_motor: '@DogMotor_0'
+      wheel_motor: '@WheelMotor_0'
+      obstacle: '@ObstacleController_0'
+      host_link: '@HostLink_0'
+      stack_size: 4096
+  - id: StatusLED_0
+    name: StatusLED
+    constructor_args:
+      robot_control: '@RobotControl_0'
+      stack_size: 1536

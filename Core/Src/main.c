@@ -19,7 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "FreeRTOS.h"
-#include "cmsis_os2.h"
+#include "task.h"
 #include "adc.h"
 #include "bdma.h"
 #include "dma.h"
@@ -27,7 +27,7 @@
 #include "spi.h"
 #include "tim.h"
 #include "usart.h"
-#include "usb_device.h"
+#include "usb_otg.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -120,7 +120,6 @@ int main(void)
   MX_FDCAN3_Init();
   MX_UART5_Init();
   MX_SPI2_Init();
-  MX_TIM3_Init();
   MX_UART7_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
@@ -128,20 +127,19 @@ int main(void)
   MX_USART10_UART_Init();
   MX_ADC3_Init();
   MX_ADC1_Init();
-  MX_TIM1_Init();
-  MX_TIM2_Init();
   MX_TIM7_Init();
   MX_TIM8_Init();
+  MX_SPI6_Init();
+  MX_USB_OTG_HS_PCD_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
 
   /* Init scheduler */
-  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
 
   /* Start scheduler */
-  osKernelStart();
+  vTaskStartScheduler();
 
   /* We should never get here as control is now taken by the scheduler */
 

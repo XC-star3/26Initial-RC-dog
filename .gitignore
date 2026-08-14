@@ -1,5 +1,5 @@
 build/
-cmake-build-debug/
+.config.yaml
 mx.scratch/
 __pycache__/
 *.py[cod]

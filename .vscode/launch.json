@@ -2,58 +2,18 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "DAPLink OpenOCD Debug",
+            "name": "Firmware: Debug",
             "type": "cortex-debug",
             "request": "launch",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/Debug-cmake/dog_leg_test_SDK.elf",
+            "executable": "${workspaceFolder}/build/Debug/RC-dog.elf",
             "servertype": "openocd",
-            "serverpath": "F:/xpack-openocd-0.12.0-7/bin/openocd.exe",
-            "gdbTarget": "127.0.0.1:50000",
-            "serverArgs": [
-                "-c",
-                "bindto 127.0.0.1"
-            ],
-            "gdbPath": "C:/Users/XC/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gdb.exe",
-            "armToolchainPath": "C:/Users/XC/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin",
             "configFiles": [
-                "${workspaceFolder}/stm32h743_daplink.cfg"
+                "${workspaceFolder}/stm32h723_daplink.cfg"
             ],
-            "loadFiles": [],
-            "overrideLaunchCommands": [
-                "monitor reset halt",
-                "monitor program build/Debug-cmake/dog_leg_test_SDK.elf verify",
-                "monitor reset halt",
-                "break main",
-                "continue"
-            ],
-            "overrideRestartCommands": [
-                "monitor reset halt",
-                "break main",
-                "continue"
-            ],
+            "runToEntryPoint": "main",
             "showDevDebugOutput": "raw",
-            "preLaunchTask": "CMake: build Debug"
-        },
-        {
-            "name": "DAPLink OpenOCD Attach",
-            "type": "cortex-debug",
-            "request": "attach",
-            "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/Debug-cmake/dog_leg_test_SDK.elf",
-            "servertype": "openocd",
-            "serverpath": "F:/xpack-openocd-0.12.0-7/bin/openocd.exe",
-            "gdbTarget": "127.0.0.1:50000",
-            "serverArgs": [
-                "-c",
-                "bindto 127.0.0.1"
-            ],
-            "gdbPath": "C:/Users/XC/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gdb.exe",
-            "armToolchainPath": "C:/Users/XC/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin",
-            "configFiles": [
-                "${workspaceFolder}/stm32h743_daplink.cfg"
-            ],
-            "showDevDebugOutput": "raw"
+            "preLaunchTask": "Firmware: Build Debug"
         }
     ]
 }
