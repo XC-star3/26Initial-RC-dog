@@ -1,6 +1,6 @@
 # RC-dog
 
-RC-dog 是基于 STM32H723、LibXR 和 XRobot 的 8DOF 轮足四足机器人固件。当前工程只有一套运行架构：CubeMX 负责芯片外设初始化，LibXR 提供硬件抽象、线程和 XRUSB，XRobot 根据模块清单生成应用入口。
+RC-dog 是基于 STM32H723、LibXR 和 XRobot 的 8DOF 轮足四足机器人固件。当前工程只有一套运行架构：CubeMX 负责芯片外设初始化，LibXR 提供硬件抽象、线程和 XRUSB，项目生成器根据 IOC、LibXR 配置和 XRobot 模块清单生成平台及应用入口。
 
 旧三任务入口、全局电机发送器、CAN/SBUS C 桥、在线调参、运动调试命令、固定 40 字节 USB 协议和 Cube CDC middleware 已删除。LibXR 子模块固定为提交 `c512b364ab1f0646bb86c4929ac5877e1bc7b62d`。
 
@@ -29,20 +29,25 @@ RC-dog 是基于 STM32H723、LibXR 和 XRobot 的 8DOF 轮足四足机器人固�
 | `usb_cdc` | USB OTG HS + XRUSB CDC | 上位机控制/状态 |
 | `rgb_spi` | SPI6 | 板载 RGB |
 
-`app_main()` 只构造 LibXR 平台对象、XRUSB 和硬件容器，然后调用生成的 `XRobotMain()`。FreeRTOS 只手工创建一个 8 KiB 静态启动任务；各模块线程栈由 `User/xrobot.yaml` 显式配置。FreeRTOS heap 为 48 KiB，软件 timer task 未启用。
+生成的 `app_main()` 只构造 LibXR 平台对象、XRUSB 和硬件容器，然后调用生成的 `XRobotMain()`。FreeRTOS 只手工创建一个 8 KiB 静态启动任务；各模块线程栈由 `User/xrobot.yaml` 显式配置。FreeRTOS heap 为 48 KiB，CubeMX 的软件 timer task 未启用；`PlatformInit(2, 1024)` 的参数由 `User/libxr_config.yaml` 生成。
 
 `dm02.ioc` 仍保留 FreeRTOS middleware 选择，但不再登记应用任务。`Core/Src/freertos.c` 的 native FreeRTOS 单启动任务和精简后的 `cmake/stm32cubemx/CMakeLists.txt` 由本工程维护，不在 CubeMX USER CODE 保护块内；使用 CubeMX 全量再生成后，必须复核并恢复这两个文件，避免重新引入 CMSIS-RTOS2 默认任务和已禁用的可选内核组件。
 
-## XRobot 生成
+## LibXR 与 XRobot 生成
 
-要求 Python 包版本 `xrobot==0.3.1`。模块实例、依赖和栈大小的唯一配置是 `User/xrobot.yaml`，`User/xrobot_main.hpp` 是生成文件，不应手工修改。
+生成工具不锁定精确版本，最低要求为 `libxr>=5.2.4`、`xrobot>=0.3.1`。生成前会检查版本、命令行能力和当前 LibXR 头文件接口；兼容的新版本可以直接使用，缺少必要能力时会在写文件前失败。
 
 ```bash
-python3 -m pip install xrobot==0.3.1
-xrobot_gen_main --config User/xrobot.yaml --output User/xrobot_main.hpp
+python3 -m pip install -r tools/requirements-codegen.txt
+python3 tools/generate.py
+python3 tools/generate.py --check
 ```
 
-提交前连续执行两次生成命令，第二次必须没有工作树差异。模块清单位于各模块头文件的 MANIFEST V2 块；本地模块索引文件为 `Modules/modules.yaml` 和 `Modules/sources.yaml`。
+唯一配置输入为 `dm02.ioc`、`User/libxr_config.yaml` 和 `User/xrobot.yaml`。生成器调用 LibXR IOC parser 和 STM32 emitter 能力检查，过滤出 FDCAN1/2/3、UART5、SPI6 与 USB OTG HS，再生成 `User/app_main.cpp`、`User/app_main.h` 和 `User/xrobot_main.hpp`。这三个文件带有 `AUTO-GENERATED` 标记，不得手工修改。
+
+XRUSB 的端点缓冲、4096 字节硬件 FIFO 分配和 SPI6 非 DMA staging buffer 是 RC-dog 的结构化生成扩展，不依靠 C++ 文本替换。模块清单位于各模块头文件的 MANIFEST V2 块；本地模块索引为 `Modules/modules.yaml` 和 `Modules/sources.yaml`。
+
+`User/codegen_manifest.cmake` 记录实际生成器版本、LibXR 提交和输入/输出 SHA256。CMake 配置阶段只使用自身哈希功能检查生成物，不会运行 Python 或修改源码；若显示 `Generated code is stale`，先重新运行统一生成命令。提交前应连续生成两次，并确认第二次无差异且 `--check` 通过。
 
 首次获取工程后初始化固定的 LibXR 子模块：
 
@@ -51,7 +56,7 @@ git submodule update --init --recursive
 git -C Middlewares/Third_Party/LibXR rev-parse HEAD
 ```
 
-输出应为 `c512b364ab1f0646bb86c4929ac5877e1bc7b62d`。
+仓库当前记录的提交为 `c512b364ab1f0646bb86c4929ac5877e1bc7b62d`。生成器会记录实际提交并检查所需 C++ 接口，但不把该提交硬编码为生成条件。
 
 ## 构建与烧录
 
@@ -92,7 +97,7 @@ STM32Cube Build Analyzer 通过 CMake File API 发现构建产物。完成 Debug
 
 ## SBUS 与模式
 
-UART5 配置为 `100000 8E2`。通道使用从 0 开始的固件索引；遥控器面板通常以 CH1 开始编号。
+UART5 配置为仅接收的 `100000 8E2`，只使用 PD2 和 128 字节循环 RX DMA；未使用的 PC12 TX 已释放。通道使用从 0 开始的固件索引；遥控器面板通常以 CH1 开始编号。
 
 | 遥控通道 | 固件索引 | 语义 |
 | --- | --- | --- |
@@ -272,6 +277,7 @@ Windows 端口示例为 `COM7`。遗留固定帧、文本诊断命令和 ROS2 �
 | 轮电机无法解锁 | 四轮反馈掩码必须为 `0x0F`、速度小于 0.5 rad/s、无过温和 bus-off |
 | 楼梯停在 PRECHECK | 确认腿/轮全部健康、标准站立完成、轮停止并持续 200 ms |
 | RGB 不亮 | 检查 SPI6 PA5/PA7、mode 0/edge 2、prescaler 4 和板载 RGB 数据方向 |
+| CMake 提示生成物过期 | 安装最低版本生成依赖，运行 `python3 tools/generate.py`，再用 `--check` 确认输入、输出和清单一致 |
 
 ## 重构记录与优势
 
@@ -280,30 +286,30 @@ Windows 端口示例为 `COM7`。遗留固定帧、文本诊断命令和 ROS2 �
 - 删除旧三任务入口、全局电机状态、HAL 回调转发桥和重复 USB CDC 栈，CAN/UART/SPI/USB 统一通过 LibXR 驱动抽象。
 - `RobotControl` 成为唯一输入仲裁和安全所有者，SBUS、USB、模式进入条件和故障状态不再散落在多个任务。
 - 电机控制、越障、主机链路和状态灯具有明确依赖边界，线程频率和栈大小可从 XRobot 配置审查。
-- 应用入口由 MANIFEST V2 和 `xrobot.yaml` 可重复生成，减少手工实例化漂移。
+- LibXR 平台适配、XRUSB、硬件别名和应用入口均可重复生成，消除 IOC、缓冲参数与手工实例化之间的漂移。
 - 二进制状态 Topic 取代不可机读的文本诊断，上位机能观察控制源、模式进入阻塞、在线掩码和故障位。
 - Cube USB Device middleware 已移除，避免 ST CDC 回调与 XRUSB PCD 回调同时拥有同一外设。
 - 模块源码和应用入口在 CMake 中显式列出，移除了重复目标传播、无效编译定义以及当前配置禁用的 FreeRTOS coroutine、MPU wrapper、event group 和 stream buffer 编译单元。
 - 删除了只写不读的电机反馈/计数、重复命令状态和陈旧 CubeMX 三任务元数据；保留腿轮在线超时兜底，模式、安全锁、PID、限幅、热保护与 CAN 行为不变。
 - HostLink 将命令、接收时间和代际作为同一临界区快照发布，并复用线程生命周期同步对象；50 ms 半包超时在消费新字节前执行，上位机重连时也会清空旧解析半包。
 
-代码量按物理行统计，不包含第三方库、Cube/HAL 平台代码和生成的 `User/xrobot_main.hpp`：重构前取提交 `67dc029` 中 `User_File + host` 的 C/C++/Python 文件，重构后取当前 `Modules + User + host`。
+代码量按物理行统计，不包含第三方库、Cube/HAL 平台代码和生成的三个入口文件：重构前取提交 `67dc029` 中 `User_File + host` 的 C/C++/Python 文件，重构后取当前 `Modules + User + host + tools` 中的手写业务及生成工具源码。
 
 | 指标 | 重构前 | 重构后 |
 | --- | --- | --- |
-| 业务源码物理行 | 16,650 | 3,650 |
-| XRobot 生成入口 | 无 | 38 行（不计入业务源码） |
-| Debug 链接器 FLASH | 152,080 B（迁移过程中的旧/新混合基线） | 124,616 B |
+| 手写业务与生成工具源码物理行 | 16,650 | 4,356 |
+| LibXR/XRobot 生成入口 | 无 | 自动生成（不计入业务源码） |
+| Debug 链接器 FLASH | 152,080 B（迁移过程中的旧/新混合基线） | 124,536 B |
 | Debug 链接器 DTCMRAM | 78,456 B（混合基线） | 95,752 B |
-| Debug `size` text/data/bss | 未保留可复现旧产物 | 124,464 / 148 / 95,720 B |
-| Flash（Release）链接器 FLASH / DTCMRAM | 未保留可复现旧产物 | 99,908 / 95,744 B |
-| Flash（Release）`size` text/data/bss | 未保留可复现旧产物 | 99,760 / 144 / 95,712 B |
+| Debug `size` text/data/bss | 未保留可复现旧产物 | 124,384 / 148 / 95,720 B |
+| Flash（Release）链接器 FLASH / DTCMRAM | 未保留可复现旧产物 | 99,836 / 95,744 B |
+| Flash（Release）`size` text/data/bss | 未保留可复现旧产物 | 99,688 / 144 / 95,712 B |
 
 这些数据只描述当前构建和代码规模，不代表控制性能、实时性或实机可靠性提升。
 
 ## 验收状态
 
-自动验收包括：XRobot 连续生成幂等、干净 Flash/Debug 配置与链接、`arm-none-eabi-size`、链接 map 内存区域检查、Python `compileall`、XRUSB codec 回归、静态检查，以及旧目录/协议/文档引用扫描。本次交付不恢复旧单元测试，编译是阻塞验收项。
+自动验收包括：统一生成连续幂等、`--check`、CMake 过期拒绝、干净 Flash/Debug 配置与链接、`arm-none-eabi-size`、链接 map 内存区域检查、Python `compileall`、XRUSB codec 回归、静态检查，以及旧目录/协议/文档引用扫描。本次交付不恢复旧业务单元测试，编译仍是阻塞验收项。
 
 以下项目必须在架空、防跌落和可直接急停的条件下人工回归；当前重构未进行实机验证，不得视为已完成：
 

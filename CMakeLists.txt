@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
 
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/VerifyGenerated.cmake)
+rcdog_verify_generated(
+    "${CMAKE_CURRENT_LIST_DIR}"
+    "${CMAKE_CURRENT_LIST_DIR}/User/codegen_manifest.cmake"
+)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
