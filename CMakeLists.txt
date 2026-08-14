@@ -14,18 +14,8 @@ endif()
 set(CMAKE_PROJECT_NAME RC-dog)
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 project(${CMAKE_PROJECT_NAME} C CXX ASM)
-message("Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 add_executable(${CMAKE_PROJECT_NAME})
 add_subdirectory(cmake/stm32cubemx)
-
-target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
-    ARM_MATH_CM7
-    __FPU_PRESENT=1U
-    ARM_MATH_CHECK
-)
-
-list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE stm32cubemx)
-
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/LibXR.CMake)

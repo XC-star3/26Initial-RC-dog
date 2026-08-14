@@ -8,10 +8,12 @@ from enum import IntEnum
 PACKET_PREFIX = 0x5A
 PACKET_VERSION = 0x01
 PACKET_HEADER_SIZE = 16
-PACKET_BASE_SIZE = 17
+PACKET_BASE_SIZE = PACKET_HEADER_SIZE + 1
 CONTROL_TOPIC = "rcdog.control.command.v1"
 STATUS_TOPIC = "rcdog.status.v1"
 SCHEMA_VERSION = 1
+CONTROL_PAYLOAD_SIZE = 24
+STATUS_PAYLOAD_SIZE = 24
 
 DEADMAN = 1 << 0
 MOTION_ENABLE = 1 << 1
@@ -19,6 +21,7 @@ SMOOTH_STOP = 1 << 2
 
 _CONTROL = struct.Struct("<BBHhhhHIII")
 _STATUS = struct.Struct("<12BIII")
+_PACKET_PREFIX = bytes((PACKET_PREFIX,))
 
 
 class RobotMode(IntEnum):
@@ -154,8 +157,10 @@ class RobotStatus:
         if len(payload) != _STATUS.size:
             raise ValueError("RobotStatusV1 payload must be exactly 24 bytes")
         values = _STATUS.unpack(payload)
-        if values[0] != SCHEMA_VERSION or values[11] != 0:
-            raise ValueError("invalid RobotStatusV1 version or reserved byte")
+        if values[0] != SCHEMA_VERSION:
+            raise ValueError("invalid RobotStatusV1 schema version")
+        if values[11] != 0:
+            raise ValueError("RobotStatusV1 reserved byte must be zero")
         return cls(*values[:11], *values[12:])
 
 
@@ -169,7 +174,7 @@ class TopicPacketParser:
         self._buffer.extend(data)
         payloads: list[bytes] = []
         while True:
-            prefix = self._buffer.find(bytes((PACKET_PREFIX,)))
+            prefix = self._buffer.find(_PACKET_PREFIX)
             if prefix < 0:
                 self._buffer.clear()
                 break
@@ -199,5 +204,5 @@ class TopicPacketParser:
         return payloads
 
 
-assert _CONTROL.size == 24
-assert _STATUS.size == 24
+assert _CONTROL.size == CONTROL_PAYLOAD_SIZE
+assert _STATUS.size == STATUS_PAYLOAD_SIZE

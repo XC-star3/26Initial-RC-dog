@@ -1,3 +1,2 @@
 target_include_directories(xr PUBLIC ${CMAKE_CURRENT_LIST_DIR})
-file(GLOB MODULE_HOSTLINK_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/*.cpp")
-target_sources(xr PRIVATE ${MODULE_HOSTLINK_SRC})
+target_sources(xr PRIVATE ${CMAKE_CURRENT_LIST_DIR}/HostLink.cpp)

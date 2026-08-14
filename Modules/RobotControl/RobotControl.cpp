@@ -390,8 +390,7 @@ void RobotControl::Execute(const Input& input, uint32_t now_ms)
       break;
     }
   }
-  active_mode_ = input.mode;
-  status_.active_mode = static_cast<uint8_t>(active_mode_);
+  status_.active_mode = static_cast<uint8_t>(input.mode);
   status_.entry_state = status_.block_reason == 0
       ? static_cast<uint8_t>(RCDog::EntryState::ACTIVE)
       : static_cast<uint8_t>(RCDog::EntryState::BLOCKED);
@@ -412,12 +411,12 @@ void RobotControl::StopAll(bool safety)
 
 void RobotControl::PublishStatus(const Input& input, uint32_t now_ms)
 {
-  taskENTER_CRITICAL();
+  const RCDog::ObstacleFault obstacle_fault = obstacle_.Fault();
   status_.schema_version = RCDog::kSchemaVersion;
   status_.control_source = static_cast<uint8_t>(input.source);
   status_.safety_latched = safety_latched_ ? 1 : 0;
   status_.obstacle_state = static_cast<uint8_t>(obstacle_.State());
-  status_.obstacle_fault = static_cast<uint8_t>(obstacle_.Fault());
+  status_.obstacle_fault = static_cast<uint8_t>(obstacle_fault);
   status_.leg_online_mask = dog_.OnlineMask();
   status_.wheel_online_mask = wheel_.OnlineMask();
   status_.reserved = 0;
@@ -426,13 +425,14 @@ void RobotControl::PublishStatus(const Input& input, uint32_t now_ms)
   if (usb_timeout_latched_)
     status_.fault_bits |= RCDog::FAULT_USB_LOST;
   if (safety_latched_) status_.fault_bits |= RCDog::FAULT_SAFETY_LATCHED;
-  if (obstacle_.Fault() != RCDog::ObstacleFault::NONE)
+  if (obstacle_fault != RCDog::ObstacleFault::NONE)
     status_.fault_bits |= RCDog::FAULT_OBSTACLE;
   if (host_.ProtocolErrors() != 0) status_.fault_bits |= RCDog::FAULT_USB_PROTOCOL;
   status_.last_command_counter = last_accepted_usb_counter_;
   status_.uptime_ms = now_ms;
-  published_status_ = status_;
-  const RCDog::RobotStatusV1 snapshot = published_status_;
+  const RCDog::RobotStatusV1 snapshot = status_;
+  taskENTER_CRITICAL();
+  published_status_ = snapshot;
   taskEXIT_CRITICAL();
   host_.SetStatus(snapshot);
 }

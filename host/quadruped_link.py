@@ -6,16 +6,24 @@ from collections.abc import Callable
 
 import serial
 
-try:
+if __package__:
     from .xrusb_codec import (
         ControlCommand,
         ControlStream,
         RobotStatus,
+        STATUS_PAYLOAD_SIZE,
         STATUS_TOPIC,
         TopicPacketParser,
     )
-except ImportError:  # Direct script/module execution from the host directory.
-    from xrusb_codec import ControlCommand, ControlStream, RobotStatus, STATUS_TOPIC, TopicPacketParser
+else:  # Direct script/module execution from the host directory.
+    from xrusb_codec import (
+        ControlCommand,
+        ControlStream,
+        RobotStatus,
+        STATUS_PAYLOAD_SIZE,
+        STATUS_TOPIC,
+        TopicPacketParser,
+    )
 
 
 class QuadrupedSerialLink:
@@ -27,9 +35,9 @@ class QuadrupedSerialLink:
         self._serial: serial.Serial | None = None
         self._stream = ControlStream()
         self._command = ControlCommand.safe_zero()
-        self._parser = TopicPacketParser(STATUS_TOPIC, 24)
+        self._parser = TopicPacketParser(STATUS_TOPIC, STATUS_PAYLOAD_SIZE)
         self._status: RobotStatus | None = None
-        self._command_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -44,7 +52,7 @@ class QuadrupedSerialLink:
 
     @property
     def latest_status(self) -> RobotStatus | None:
-        with self._command_lock:
+        with self._state_lock:
             return self._status
 
     def open(self) -> None:
@@ -57,8 +65,9 @@ class QuadrupedSerialLink:
             write_timeout=0.05,
         )
         self._stream = ControlStream()
+        self._parser = TopicPacketParser(STATUS_TOPIC, STATUS_PAYLOAD_SIZE)
         self._stop.clear()
-        with self._command_lock:
+        with self._state_lock:
             self._command = ControlCommand.safe_zero()
             self._status = None
         self._thread = threading.Thread(target=self._run, name="quadruped-50hz", daemon=True)
@@ -85,11 +94,11 @@ class QuadrupedSerialLink:
             self._serial = None
 
     def set_command(self, command: ControlCommand) -> None:
-        with self._command_lock:
+        with self._state_lock:
             self._command = command.sanitized()
 
     def stop_motion(self) -> None:
-        with self._command_lock:
+        with self._state_lock:
             self._command = ControlCommand.safe_zero()
 
     def _require_open(self) -> serial.Serial:
@@ -112,14 +121,14 @@ class QuadrupedSerialLink:
         deadline = time.monotonic()
         try:
             while not self._stop.is_set():
-                with self._command_lock:
+                with self._state_lock:
                     command = self._command
                 self._write_command(command)
                 serial_port = self._require_open()
                 incoming = serial_port.read(serial_port.in_waiting or 1)
                 for payload in self._parser.feed(incoming):
                     status = RobotStatus.decode(payload)
-                    with self._command_lock:
+                    with self._state_lock:
                         self._status = status
                     if self._status_callback is not None:
                         self._status_callback(status)
@@ -131,7 +140,7 @@ class QuadrupedSerialLink:
                     deadline = time.monotonic()
         except Exception as exc:  # Serial failure must atomically stop the producer.
             self._stop.set()
-            with self._command_lock:
+            with self._state_lock:
                 self._command = ControlCommand.safe_zero()
             if self._error_callback is not None:
                 self._error_callback(exc)

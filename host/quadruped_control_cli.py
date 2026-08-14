@@ -4,10 +4,10 @@ import argparse
 import sys
 import time
 
-try:
+if __package__:
     from .quadruped_link import QuadrupedSerialLink
     from .xrusb_codec import ControlCommand, RobotMode, RobotStatus
-except ImportError:  # Direct execution: python host/quadruped_control_cli.py ...
+else:  # Direct execution: python host/quadruped_control_cli.py ...
     from quadruped_link import QuadrupedSerialLink
     from xrusb_codec import ControlCommand, RobotMode, RobotStatus
 

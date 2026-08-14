@@ -111,8 +111,6 @@ void WheelMotor::SetTargets(const float rpm[4], const float scale[4])
     command_.target_rpm[i] = RCDog::Clamp(rpm[i], -200.0F, 200.0F);
     command_.scale[i] = RCDog::Clamp(scale[i], 0.0F, 1.0F);
   }
-  command_.generation++;
-  command_generation_.store(command_.generation, std::memory_order_release);
   last_command_ms_ = LibXR::Thread::GetTime();
   taskEXIT_CRITICAL();
 }
@@ -128,8 +126,6 @@ void WheelMotor::SetMode(Mode mode)
       std::fill(std::begin(command_.target_rpm), std::end(command_.target_rpm),
                 0.0F);
     }
-    command_.generation++;
-    command_generation_.store(command_.generation, std::memory_order_release);
   }
   last_command_ms_ = LibXR::Thread::GetTime();
   taskEXIT_CRITICAL();
@@ -144,8 +140,6 @@ void WheelMotor::StopAndLock()
     command_.locked = true;
     std::fill(std::begin(command_.target_rpm), std::end(command_.target_rpm),
               0.0F);
-    command_.generation++;
-    command_generation_.store(command_.generation, std::memory_order_release);
   }
   taskEXIT_CRITICAL();
 }
@@ -165,8 +159,6 @@ bool WheelMotor::TryClearLock()
   }
   command_.locked = false;
   command_.mode = Mode::HOLD;
-  command_.generation++;
-  command_generation_.store(command_.generation, std::memory_order_release);
   last_command_ms_ = LibXR::Thread::GetTime();
   taskEXIT_CRITICAL();
   return true;
@@ -194,10 +186,6 @@ bool WheelMotor::IsHealthy() const
 uint8_t WheelMotor::OnlineMask() const
 {
   return static_cast<uint8_t>(online_mask_.load(std::memory_order_acquire));
-}
-uint8_t WheelMotor::ThermalDeratedMask() const
-{
-  return static_cast<uint8_t>(derated_mask_.load(std::memory_order_acquire));
 }
 uint32_t WheelMotor::FaultBits() const
 {
@@ -240,9 +228,7 @@ void WheelMotor::HandleCan(const LibXR::CAN::ClassicPack& pack)
     return;
   }
   const uint8_t index = static_cast<uint8_t>(pack.id - 0x201);
-  feedback_[index].encoder = static_cast<uint16_t>(pack.data[0] << 8U | pack.data[1]);
   feedback_[index].speed_rpm = static_cast<int16_t>(pack.data[2] << 8U | pack.data[3]);
-  feedback_[index].current_raw = static_cast<int16_t>(pack.data[4] << 8U | pack.data[5]);
   feedback_[index].temperature_c = pack.data[6];
   feedback_[index].last_update_ms = LibXR::Thread::GetTime();
 }
@@ -255,7 +241,6 @@ void WheelMotor::Tick(uint32_t now_ms)
   command = command_;
   last_command_ms = last_command_ms_;
   taskEXIT_CRITICAL();
-  applied_generation_ = command.generation;
 
   Feedback feedback[4]{};
   taskENTER_CRITICAL();
@@ -273,7 +258,6 @@ void WheelMotor::Tick(uint32_t now_ms)
   }
   online_mask_.store(online, std::memory_order_release);
   uint32_t faults = online == 0x0F ? RCDog::FAULT_NONE : RCDog::FAULT_WHEEL_OFFLINE;
-  uint8_t derated = 0;
   bool overtemp = false;
   for (uint8_t i = 0; i < 4; ++i)
   {
@@ -285,25 +269,18 @@ void WheelMotor::Tick(uint32_t now_ms)
     {
       overtemp_latched_[i] = false;
     }
-    if (feedback[i].temperature_c > kDerateC)
-    {
-      derated |= static_cast<uint8_t>(1U << i);
-    }
     overtemp |= overtemp_latched_[i];
   }
   if (overtemp)
   {
     faults |= RCDog::FAULT_WHEEL_OVERTEMP;
   }
-  derated_mask_.store(derated, std::memory_order_release);
-
   if (now_ms - last_bus_check_ms_ >= 100U)
   {
     LibXR::CAN::ErrorState error{};
     if (can_.GetErrorState(error) == LibXR::ErrorCode::OK && error.bus_off)
     {
       bus_off_ = true;
-      ++bus_off_count_;
     }
     else
     {

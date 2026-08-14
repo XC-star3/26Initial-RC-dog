@@ -11,7 +11,6 @@ depends: []
 === END MANIFEST === */
 // clang-format on
 
-#include <atomic>
 #include <cstdint>
 
 #include "app_framework.hpp"
@@ -41,6 +40,5 @@ class SbusReceiver final : public LibXR::Application
   uint8_t stream_[25]{};
   uint8_t stream_size_ = 0;
   RCDog::SbusSample sample_{};
-  std::atomic<uint32_t> generation_{0};
-  std::atomic<uint32_t> parse_errors_{0};
+  uint32_t generation_ = 0;
 };

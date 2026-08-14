@@ -36,7 +36,20 @@ constexpr float kMechanicalHipDeg = -15.0F;
 constexpr float kMechanicalReverseHipDeg = 5.0F;
 constexpr float kMechanicalStepDeg = 20.0F * kPeriodMs / 800.0F;
 
-constexpr DogMotor::MotorConfig kMotors[8] = {
+struct MotorConfig
+{
+  uint8_t leg;
+  uint8_t joint;
+  uint8_t bus;
+  uint8_t node_id;
+  float direction;
+  float torque_direction;
+  float ratio;
+  float min_deg;
+  float max_deg;
+};
+
+constexpr MotorConfig kMotors[8] = {
     {0, 0, 0, 2, 1.0F, -1.0F, 8.0F, -120.0F, 120.0F},
     {0, 1, 0, 1, -1.0F, 1.0F, 8.0F, -120.0F, 143.0F},
     {1, 0, 0, 4, -1.0F, 1.0F, 8.0F, -120.0F, 120.0F},
@@ -98,7 +111,6 @@ void DogMotor::SafeStop()
       GetState() != State::SAFE)
   {
     pending_command_.requested_state = State::SAFE;
-    pending_command_.gait_enabled = false;
     pending_command_.generation++;
     command_generation_.store(pending_command_.generation, std::memory_order_release);
   }
@@ -113,22 +125,6 @@ void DogMotor::RequestStand()
       (state != State::CONFIGURING && state != State::STANDING))
   {
     pending_command_.requested_state = State::STANDING;
-    pending_command_.gait_enabled = false;
-    pending_command_.generation++;
-    command_generation_.store(pending_command_.generation, std::memory_order_release);
-  }
-  taskEXIT_CRITICAL();
-}
-
-void DogMotor::RequestLower()
-{
-  taskENTER_CRITICAL();
-  const State state = GetState();
-  if (pending_command_.requested_state != State::LOWERING ||
-      (state != State::LOWERING && state != State::SAFE))
-  {
-    pending_command_.requested_state = State::LOWERING;
-    pending_command_.gait_enabled = false;
     pending_command_.generation++;
     command_generation_.store(pending_command_.generation, std::memory_order_release);
   }
@@ -145,7 +141,6 @@ void DogMotor::RequestMechanicalPose(bool reverse)
   {
     pending_command_.requested_state = State::MECHANICAL;
     pending_command_.mechanical_reverse = reverse;
-    pending_command_.gait_enabled = false;
     pending_command_.generation++;
     command_generation_.store(pending_command_.generation, std::memory_order_release);
   }
@@ -173,15 +168,12 @@ void DogMotor::SetGait(float forward, float yaw, float speed, bool enabled,
   taskENTER_CRITICAL();
   if (pending_command_.requested_state != State::GAIT ||
       pending_command_.forward != forward || pending_command_.yaw != yaw ||
-      pending_command_.speed != speed ||
-      pending_command_.smooth_stop != smooth_stop)
+      pending_command_.speed != speed)
   {
     pending_command_.requested_state = State::GAIT;
     pending_command_.forward = forward;
     pending_command_.yaw = yaw;
     pending_command_.speed = speed;
-    pending_command_.gait_enabled = true;
-    pending_command_.smooth_stop = smooth_stop;
     pending_command_.generation++;
     command_generation_.store(pending_command_.generation,
                               std::memory_order_release);
@@ -225,7 +217,6 @@ bool DogMotor::IsStanding() const
 {
   return GetState() == State::STANDING;
 }
-bool DogMotor::IsSafe() const { return GetState() == State::SAFE; }
 bool DogMotor::IsHealthy() const
 {
   return OnlineMask() == 0xFF && FaultBits() == RCDog::FAULT_NONE;
@@ -314,7 +305,6 @@ void DogMotor::HandleCan(const LibXR::CAN::ClassicPack& pack, uint8_t bus)
     else if (command == 0x09)
     {
       feedback_[i].encoder_turn = ReadFloatLe(pack.data);
-      feedback_[i].velocity_turn_s = ReadFloatLe(pack.data + 4);
       feedback_[i].last_encoder_ms = now;
       if (!feedback_[i].zero_valid)
       {
@@ -435,9 +425,9 @@ void DogMotor::ControlTick(uint32_t now_ms)
   last_control_state_ = control_state;
 
   UpdateTargets(now_ms);
+  const State send_state = GetState();
   for (uint8_t i = 0; i < 8; ++i)
   {
-    const State send_state = GetState();
     if ((closed_loop & (1U << i)) != 0 && send_state != State::SAFE &&
         send_state != State::FAULT &&
         (send_state != State::CONFIGURING ||
@@ -486,7 +476,6 @@ void DogMotor::ApplyCommand(const Command& command, uint32_t now_ms)
     motion_fault_ = false;
     closed_loop_fault_ = false;
     motion_.active = false;
-    motion_.complete = false;
     motion_complete_.store(false, std::memory_order_release);
     configuration_started_ms_ = 0;
     configuration_wait_idle_ = false;
@@ -500,7 +489,6 @@ void DogMotor::ApplyCommand(const Command& command, uint32_t now_ms)
     {
       motion_fault_ = true;
       motion_.active = false;
-      motion_.complete = false;
       motion_complete_.store(false, std::memory_order_release);
       published_state_.store(static_cast<uint32_t>(State::FAULT),
                              std::memory_order_release);
@@ -513,7 +501,6 @@ void DogMotor::ApplyCommand(const Command& command, uint32_t now_ms)
     motion_.duration_ms = command.foot_duration_ms;
     motion_.clearance_mm = command.foot_clearance_mm;
     motion_.active = true;
-    motion_.complete = false;
     motion_complete_.store(false, std::memory_order_release);
   }
   else if (command.requested_state == State::GAIT && gait_epoch_ms_ == 0)
@@ -567,16 +554,13 @@ void DogMotor::UpdateTargets(uint32_t now_ms)
   {
     UpdateFootTargets(now_ms);
   }
-  else if (state == State::LOWERING || state == State::STANDING ||
-           state == State::CONFIGURING)
+  else if (state == State::STANDING || state == State::CONFIGURING)
   {
     const bool all_closed = !configuration_wait_idle_ &&
         closed_loop_mask_.load(std::memory_order_acquire) == 0xFF;
-    const float end_front = state == State::LOWERING ? kFrontStartMm : kFrontStandMm;
-    const float end_rear = state == State::LOWERING ? kRearStartMm : kRearStandMm;
     for (uint8_t leg = 0; leg < 4; ++leg)
     {
-      const float target = leg >= 2 ? end_rear : end_front;
+      const float target = leg >= 2 ? kRearStandMm : kFrontStandMm;
       if (state != State::CONFIGURING || all_closed)
       {
         const float delta =
@@ -586,21 +570,7 @@ void DogMotor::UpdateTargets(uint32_t now_ms)
         current_foot_[leg].z_mm += delta;
       }
     }
-    if (state == State::LOWERING)
-    {
-      bool done = true;
-      for (uint8_t leg = 0; leg < 4; ++leg)
-      {
-        const float target = leg >= 2 ? kRearStartMm : kFrontStartMm;
-        done &= std::fabs(current_foot_[leg].z_mm - target) < 1.0F;
-      }
-      if (done)
-      {
-        published_state_.store(static_cast<uint32_t>(State::SAFE),
-                               std::memory_order_release);
-      }
-    }
-    else if (state == State::CONFIGURING)
+    if (state == State::CONFIGURING)
     {
       bool done = all_closed &&
                   online_mask_.load(std::memory_order_acquire) == 0xFF;
@@ -694,7 +664,6 @@ void DogMotor::UpdateTargets(uint32_t now_ms)
       motion_fault_ = true;
       fault_bits_.fetch_or(RCDog::FAULT_LEG_DRIVE, std::memory_order_release);
       motion_.active = false;
-      motion_.complete = false;
       motion_complete_.store(false, std::memory_order_release);
       published_state_.store(static_cast<uint32_t>(State::FAULT),
                              std::memory_order_release);
@@ -731,7 +700,6 @@ void DogMotor::UpdateFootTargets(uint32_t now_ms)
   if (p >= 1.0F)
   {
     motion_.active = false;
-    motion_.complete = true;
     motion_complete_.store(true, std::memory_order_release);
     published_state_.store(static_cast<uint32_t>(State::STANDING),
                            std::memory_order_release);

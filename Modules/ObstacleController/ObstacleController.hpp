@@ -13,7 +13,6 @@ depends:
 === END MANIFEST === */
 // clang-format on
 
-#include <atomic>
 #include <cstdint>
 
 #include "DogMotor.hpp"
@@ -35,11 +34,11 @@ class ObstacleController final : public LibXR::Application
   void Tick(uint32_t now_ms);
   RCDog::ObstacleState State() const;
   RCDog::ObstacleFault Fault() const;
-  RCDog::StairProfile Profile() const;
-  uint8_t Phase() const;
   bool CanExit() const;
 
  private:
+  static constexpr uint8_t kSequenceCapacity = 26;
+
   struct Segment
   {
     RCDog::FootTarget target[4];
@@ -55,7 +54,7 @@ class ObstacleController final : public LibXR::Application
 
   DogMotor& dog_;
   WheelMotor& wheel_;
-  Segment sequence_[28]{};
+  Segment sequence_[kSequenceCapacity]{};
   uint8_t sequence_count_ = 0;
   uint8_t phase_ = 0;
   uint32_t dwell_started_ms_ = 0;
@@ -63,6 +62,6 @@ class ObstacleController final : public LibXR::Application
   bool requested_ = false;
   bool step_pending_ = false;
   RCDog::StairProfile profile_ = RCDog::StairProfile::MID;
-  std::atomic<uint32_t> state_{static_cast<uint32_t>(RCDog::ObstacleState::DISABLED)};
-  std::atomic<uint32_t> fault_{static_cast<uint32_t>(RCDog::ObstacleFault::NONE)};
+  RCDog::ObstacleState state_ = RCDog::ObstacleState::DISABLED;
+  RCDog::ObstacleFault fault_ = RCDog::ObstacleFault::NONE;
 };

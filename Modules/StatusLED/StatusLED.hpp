@@ -30,7 +30,8 @@ class StatusLED final : public LibXR::Application
  private:
   static void ThreadEntry(StatusLED* self);
   void Run();
-  void Write(uint8_t red, uint8_t green, uint8_t blue);
+  void Write(uint8_t red, uint8_t green, uint8_t blue,
+             LibXR::Semaphore& semaphore);
   static void Encode(uint8_t* output, uint8_t value);
 
   LibXR::SPI& spi_;

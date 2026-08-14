@@ -41,15 +41,12 @@ class WheelMotor final : public LibXR::Application
   bool IsStopped() const;
   bool IsHealthy() const;
   uint8_t OnlineMask() const;
-  uint8_t ThermalDeratedMask() const;
   uint32_t FaultBits() const;
 
  private:
   struct Feedback
   {
-    uint16_t encoder = 0;
     int16_t speed_rpm = 0;
-    int16_t current_raw = 0;
     uint8_t temperature_c = 0;
     uint32_t last_update_ms = 0;
   };
@@ -60,7 +57,6 @@ class WheelMotor final : public LibXR::Application
     float scale[4]{1.0F, 1.0F, 1.0F, 1.0F};
     Mode mode = Mode::OFF;
     bool locked = true;
-    uint32_t generation = 0;
   };
 
   static void ThreadEntry(WheelMotor* self);
@@ -81,13 +77,9 @@ class WheelMotor final : public LibXR::Application
   float integral_[4]{};
   float peak_budget_ms_[4]{};
   bool overtemp_latched_[4]{};
-  std::atomic<uint32_t> command_generation_{0};
   std::atomic<uint32_t> online_mask_{0};
-  std::atomic<uint32_t> derated_mask_{0};
   std::atomic<uint32_t> fault_bits_{0};
-  uint32_t applied_generation_ = 0;
   uint32_t last_command_ms_ = 0;
   uint32_t last_bus_check_ms_ = 0;
-  uint32_t bus_off_count_ = 0;
   bool bus_off_ = false;
 };

@@ -8,6 +8,7 @@ constexpr uint8_t kLF = 1U << 0;
 constexpr uint8_t kRF = 1U << 1;
 constexpr uint8_t kLB = 1U << 2;
 constexpr uint8_t kRB = 1U << 3;
+constexpr uint8_t kAllLegs = kLF | kRF | kLB | kRB;
 constexpr float kFrontZ = 300.0F;
 constexpr float kRearZ = 315.0F;
 constexpr float kCompactX = 108.0F;
@@ -39,23 +40,20 @@ void ObstacleController::SetRequested(bool requested)
 {
   if (requested && !requested_ && CanExit())
   {
-    fault_.store(static_cast<uint32_t>(RCDog::ObstacleFault::NONE),
-                 std::memory_order_release);
-    state_.store(static_cast<uint32_t>(RCDog::ObstacleState::DISABLED),
-                 std::memory_order_release);
+    fault_ = RCDog::ObstacleFault::NONE;
+    state_ = RCDog::ObstacleState::DISABLED;
   }
   requested_ = requested;
   if (!requested && CanExit())
   {
-    state_.store(static_cast<uint32_t>(RCDog::ObstacleState::DISABLED),
-                 std::memory_order_release);
+    state_ = RCDog::ObstacleState::DISABLED;
     step_pending_ = false;
   }
 }
 
 void ObstacleController::SelectProfile(RCDog::StairProfile profile)
 {
-  if (State() != RCDog::ObstacleState::MOVING)
+  if (state_ != RCDog::ObstacleState::MOVING)
   {
     profile_ = profile;
   }
@@ -63,14 +61,13 @@ void ObstacleController::SelectProfile(RCDog::StairProfile profile)
 
 bool ObstacleController::RequestStep()
 {
-  if (!requested_ || State() == RCDog::ObstacleState::MOVING ||
-      State() == RCDog::ObstacleState::FAULT)
+  if (!requested_ || state_ == RCDog::ObstacleState::MOVING ||
+      state_ == RCDog::ObstacleState::FAULT)
   {
     return false;
   }
   step_pending_ = true;
-  state_.store(static_cast<uint32_t>(RCDog::ObstacleState::PRECHECK),
-               std::memory_order_release);
+  state_ = RCDog::ObstacleState::PRECHECK;
   return true;
 }
 
@@ -81,8 +78,8 @@ void ObstacleController::SafetyAbort()
   const bool unfinished_sequence = sequence_count_ != 0 &&
                                    phase_ < sequence_count_;
   if (requested_ || unfinished_sequence ||
-      State() == RCDog::ObstacleState::PRECHECK ||
-      State() == RCDog::ObstacleState::MOVING)
+      state_ == RCDog::ObstacleState::PRECHECK ||
+      state_ == RCDog::ObstacleState::MOVING)
   {
     Fail(RCDog::ObstacleFault::SAFETY);
   }
@@ -92,32 +89,29 @@ void ObstacleController::Tick(uint32_t now_ms)
 {
   if (!requested_)
   {
-    if (State() == RCDog::ObstacleState::MOVING && segment_started_ &&
+    if (state_ == RCDog::ObstacleState::MOVING && segment_started_ &&
         dog_.MotionComplete())
     {
       ++phase_;
       segment_started_ = false;
       dwell_started_ms_ = 0;
-      state_.store(static_cast<uint32_t>(RCDog::ObstacleState::READY),
-                   std::memory_order_release);
+      state_ = RCDog::ObstacleState::READY;
     }
     return;
   }
-  if (State() == RCDog::ObstacleState::DISABLED)
+  if (state_ == RCDog::ObstacleState::DISABLED)
   {
-    state_.store(static_cast<uint32_t>(RCDog::ObstacleState::READY),
-                 std::memory_order_release);
+    state_ = RCDog::ObstacleState::READY;
   }
-  if (!step_pending_ && State() != RCDog::ObstacleState::MOVING)
+  if (!step_pending_ && state_ != RCDog::ObstacleState::MOVING)
   {
     if (sequence_count_ == 0 || phase_ >= sequence_count_)
     {
       return;
     }
-    state_.store(static_cast<uint32_t>(RCDog::ObstacleState::MOVING),
-                 std::memory_order_release);
+    state_ = RCDog::ObstacleState::MOVING;
   }
-  if (State() == RCDog::ObstacleState::PRECHECK)
+  if (state_ == RCDog::ObstacleState::PRECHECK)
   {
     wheel_.SetMode(WheelMotor::Mode::HOLD);
     if (!dog_.IsHealthy() || !wheel_.IsHealthy())
@@ -133,10 +127,9 @@ void ObstacleController::Tick(uint32_t now_ms)
     phase_ = 0;
     segment_started_ = false;
     step_pending_ = false;
-    state_.store(static_cast<uint32_t>(RCDog::ObstacleState::MOVING),
-                 std::memory_order_release);
+    state_ = RCDog::ObstacleState::MOVING;
   }
-  if (State() != RCDog::ObstacleState::MOVING)
+  if (state_ != RCDog::ObstacleState::MOVING)
   {
     return;
   }
@@ -147,8 +140,7 @@ void ObstacleController::Tick(uint32_t now_ms)
   }
   if (phase_ >= sequence_count_)
   {
-    state_.store(static_cast<uint32_t>(RCDog::ObstacleState::COMPLETE),
-                 std::memory_order_release);
+    state_ = RCDog::ObstacleState::COMPLETE;
     return;
   }
   auto& segment = sequence_[phase_];
@@ -181,19 +173,17 @@ void ObstacleController::Tick(uint32_t now_ms)
 
 RCDog::ObstacleState ObstacleController::State() const
 {
-  return static_cast<RCDog::ObstacleState>(state_.load(std::memory_order_acquire));
+  return state_;
 }
 RCDog::ObstacleFault ObstacleController::Fault() const
 {
-  return static_cast<RCDog::ObstacleFault>(fault_.load(std::memory_order_acquire));
+  return fault_;
 }
-RCDog::StairProfile ObstacleController::Profile() const { return profile_; }
-uint8_t ObstacleController::Phase() const { return phase_; }
 bool ObstacleController::CanExit() const
 {
   return !segment_started_ &&
          (sequence_count_ == 0 || phase_ >= sequence_count_ ||
-          State() == RCDog::ObstacleState::FAULT);
+          state_ == RCDog::ObstacleState::FAULT);
 }
 
 void ObstacleController::BuildSequence()
@@ -218,14 +208,13 @@ void ObstacleController::BuildSequence()
   };
 
   RCDog::FootTarget pose[4]{};
-  SetPose(pose, 0, kFrontZ, 0, kRearZ);
   if (raise > 0.0F)
   {
     SetPose(pose, 0, front_support, 0, rear_support);
-    add(pose, 0x0F, 1500, 0, 0);
+    add(pose, kAllLegs, 1500, 0, 0);
   }
   SetPose(pose, -kCompactX, front_support, -kCompactX, rear_support);
-  add(pose, 0x0F, 1500, 0, 0);
+  add(pose, kAllLegs, 1500, 0, 0);
   pose[2] = {kCompactX, rear_support}; add(pose, kLB, 1500, 30);
   pose[3] = {kCompactX, rear_support}; add(pose, kRB, 1500, 30);
 
@@ -238,7 +227,7 @@ void ObstacleController::BuildSequence()
   pose[1].z_mm = front_landing; add(pose, kRF, 1800);
 
   SetPose(pose, -kCompactX, front_landing, kRearShiftX, rear_support);
-  add(pose, 0x0F, 2000, 0, 0);
+  add(pose, kAllLegs, 2000, 0, 0);
   const float rear_swing = rear_landing - 70.0F;
   pose[2] = {kRearShiftX, rear_swing}; add(pose, kLB, 1000, 0, 0);
   pose[2] = {kCompactX, rear_swing}; add(pose, kLB, 1500, 0, 0);
@@ -248,24 +237,23 @@ void ObstacleController::BuildSequence()
   pose[3].z_mm = rear_landing; add(pose, kRB, 1800);
 
   SetPose(pose, -kCompactX, kFrontZ, kCompactX, kRearZ);
-  add(pose, 0x0F, 1800);
+  add(pose, kAllLegs, 1800);
   pose[0] = {kForwardX, kFrontZ}; add(pose, kLF, 1500, 30);
   pose[1] = {kForwardX, kFrontZ}; add(pose, kRF, 1500, 30);
   SetPose(pose, -kCompactX, kFrontZ, kRearShiftX, kRearZ);
-  add(pose, 0x0F, 2000, 0, 0);
+  add(pose, kAllLegs, 2000, 0, 0);
   pose[2] = {kCompactX, kRearZ}; add(pose, kLB, 1500, 30);
   pose[3] = {kCompactX, kRearZ}; add(pose, kRB, 1500, 30);
   SetPose(pose, -2.0F * kCompactX, kFrontZ, 0, kRearZ);
-  add(pose, 0x0F, 1500, 0, 0);
+  add(pose, kAllLegs, 1500, 0, 0);
   pose[0] = {0, kFrontZ}; add(pose, kLF, 1500, 30);
   pose[1] = {0, kFrontZ}; add(pose, kRF, 1500, 30);
 }
 
 void ObstacleController::Fail(RCDog::ObstacleFault fault)
 {
-  fault_.store(static_cast<uint32_t>(fault), std::memory_order_release);
-  state_.store(static_cast<uint32_t>(RCDog::ObstacleState::FAULT),
-               std::memory_order_release);
+  fault_ = fault;
+  state_ = RCDog::ObstacleState::FAULT;
   segment_started_ = false;
   step_pending_ = false;
   sequence_count_ = 0;

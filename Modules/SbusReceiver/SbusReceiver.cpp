@@ -72,7 +72,6 @@ void SbusReceiver::Feed(uint8_t byte)
   {
     if (byte != kHeader)
     {
-      parse_errors_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
     stream_[stream_size_++] = byte;
@@ -89,7 +88,6 @@ void SbusReceiver::Feed(uint8_t byte)
     stream_size_ = 0;
     return;
   }
-  parse_errors_.fetch_add(1, std::memory_order_relaxed);
   uint8_t keep = 0;
   for (uint8_t i = 1; i < sizeof(stream_); ++i)
   {
@@ -129,7 +127,7 @@ void SbusReceiver::ParseFrame()
   sample.signal_lost = (stream_[23] & kSignalLost) != 0;
   sample.failsafe = (stream_[23] & kFailsafe) != 0;
   sample.last_update_ms = LibXR::Thread::GetTime();
-  sample.frame_counter = generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+  sample.frame_counter = ++generation_;
   taskENTER_CRITICAL();
   sample_ = sample;
   taskEXIT_CRITICAL();

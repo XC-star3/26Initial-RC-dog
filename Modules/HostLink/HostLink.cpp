@@ -28,7 +28,7 @@ bool HostLink::ReadCommand(RCDog::ControlCommandV1& command, uint32_t& received_
                            uint32_t& generation) const
 {
   taskENTER_CRITICAL();
-  const uint32_t current = command_generation_.load(std::memory_order_acquire);
+  const uint32_t current = command_generation_;
   if (current == generation)
   {
     taskEXIT_CRITICAL();
@@ -46,12 +46,11 @@ void HostLink::SetStatus(const RCDog::RobotStatusV1& status)
   taskENTER_CRITICAL();
   status_ = status;
   taskEXIT_CRITICAL();
-  status_generation_.fetch_add(1, std::memory_order_release);
 }
 
 uint32_t HostLink::ProtocolErrors() const
 {
-  return protocol_errors_.load(std::memory_order_acquire);
+  return protocol_errors_.load(std::memory_order_relaxed);
 }
 
 void HostLink::ThreadEntry(HostLink* self) { self->Run(); }
@@ -63,20 +62,21 @@ void HostLink::Run()
   LibXR::Semaphore semaphore;
   while (true)
   {
-    const uint32_t now = LibXR::Thread::GetTime();
     LibXR::ReadOperation operation(semaphore, 10);
-    if (uart_.Read({&byte, 1}, operation) == LibXR::ErrorCode::OK)
-    {
-      Feed(byte, now);
-    }
+    const auto result = uart_.Read({&byte, 1}, operation);
+    const uint32_t now = LibXR::Thread::GetTime();
     if (parse_state_ != ParseState::SYNC && now - partial_started_ms_ > kPartialTimeoutMs)
     {
       protocol_errors_.fetch_add(1, std::memory_order_relaxed);
-      ResetParser();
+      ResetParser(result == LibXR::ErrorCode::OK ? byte : 0);
+    }
+    else if (result == LibXR::ErrorCode::OK)
+    {
+      Feed(byte, now);
     }
     if (now - last_status_ms >= kStatusPeriodMs)
     {
-      SendStatus(now);
+      SendStatus(semaphore);
       last_status_ms = now;
     }
   }
@@ -156,12 +156,12 @@ bool HostLink::ValidateAndPublish(uint32_t now_ms)
   taskENTER_CRITICAL();
   command_ = command;
   received_ms_ = now_ms;
+  ++command_generation_;
   taskEXIT_CRITICAL();
-  command_generation_.fetch_add(1, std::memory_order_release);
   return true;
 }
 
-void HostLink::SendStatus(uint32_t)
+void HostLink::SendStatus(LibXR::Semaphore& semaphore)
 {
   RCDog::RobotStatusV1 status{};
   taskENTER_CRITICAL();
@@ -181,7 +181,6 @@ void HostLink::SendStatus(uint32_t)
   std::memcpy(packet + sizeof(LibXR::Topic::PackedDataHeader), &status,
               sizeof(status));
   packet[sizeof(packet) - 1] = LibXR::CRC8::Calculate(packet, sizeof(packet) - 1);
-  LibXR::Semaphore semaphore;
   LibXR::WriteOperation operation(semaphore, 20);
   (void)uart_.Write(LibXR::ConstRawData(packet), operation);
 }

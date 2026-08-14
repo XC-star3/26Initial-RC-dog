@@ -97,5 +97,4 @@ class RobotControl final : public LibXR::Application
   bool low_wheel_reverse_rearm_ = false;
   int8_t low_wheel_direction_ = 0;
   uint32_t low_wheel_neutral_since_ms_ = 0;
-  RCDog::RobotMode active_mode_ = RCDog::RobotMode::MOTOR_CHECK;
 };

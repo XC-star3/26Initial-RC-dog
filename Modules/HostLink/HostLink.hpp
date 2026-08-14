@@ -44,7 +44,7 @@ class HostLink final : public LibXR::Application
   void Feed(uint8_t byte, uint32_t now_ms);
   void ResetParser(uint8_t possible_prefix = 0);
   bool ValidateAndPublish(uint32_t now_ms);
-  void SendStatus(uint32_t now_ms);
+  void SendStatus(LibXR::Semaphore& semaphore);
 
   LibXR::UART& uart_;
   LibXR::Thread thread_;
@@ -56,7 +56,6 @@ class HostLink final : public LibXR::Application
   RCDog::ControlCommandV1 command_{};
   RCDog::RobotStatusV1 status_{};
   uint32_t received_ms_ = 0;
-  std::atomic<uint32_t> command_generation_{0};
-  std::atomic<uint32_t> status_generation_{0};
+  uint32_t command_generation_ = 0;
   std::atomic<uint32_t> protocol_errors_{0};
 };

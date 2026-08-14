@@ -28,8 +28,7 @@ class DogMotor final : public LibXR::Application
     SAFE = 0,
     CONFIGURING,
     STANDING,
-    LOWERING,
-    MECHANICAL,
+    MECHANICAL = 4,
     GAIT,
     FOOT_MOTION,
     FAULT,
@@ -41,7 +40,6 @@ class DogMotor final : public LibXR::Application
   void OnMonitor() override;
   void SafeStop();
   void RequestStand();
-  void RequestLower();
   void RequestMechanicalPose(bool reverse);
   bool IsMechanicalPoseReady(bool reverse) const;
   void SetGait(float forward, float yaw, float speed, bool enabled,
@@ -50,32 +48,15 @@ class DogMotor final : public LibXR::Application
                        uint32_t duration_ms, float clearance_mm = 0.0F);
   bool MotionComplete() const;
   bool IsStanding() const;
-  bool IsSafe() const;
   bool IsHealthy() const;
   uint8_t OnlineMask() const;
   uint32_t FaultBits() const;
   State GetState() const;
 
- public:
-  struct MotorConfig
-  {
-    uint8_t leg;
-    uint8_t joint;
-    uint8_t bus;
-    uint8_t node_id;
-    float direction;
-    float torque_direction;
-    float ratio;
-    float min_deg;
-    float max_deg;
-  };
-
  private:
-
   struct MotorFeedback
   {
     float encoder_turn;
-    float velocity_turn_s;
     float zero_turn;
     uint32_t last_heartbeat_ms;
     uint32_t last_encoder_ms;
@@ -91,8 +72,6 @@ class DogMotor final : public LibXR::Application
     float forward = 0.0F;
     float yaw = 0.0F;
     float speed = 0.5F;
-    bool gait_enabled = false;
-    bool smooth_stop = false;
     bool mechanical_reverse = false;
     RCDog::FootTarget foot_target[4]{};
     uint8_t foot_mask = 0;
@@ -110,7 +89,6 @@ class DogMotor final : public LibXR::Application
     uint32_t duration_ms = 0;
     float clearance_mm = 0.0F;
     bool active = false;
-    bool complete = false;
   };
 
   static void ThreadEntry(DogMotor* self);

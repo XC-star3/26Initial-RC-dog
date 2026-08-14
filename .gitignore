@@ -1,5 +1,6 @@
 build/
 .config.yaml
+.mxproject
 mx.scratch/
 __pycache__/
 *.py[cod]

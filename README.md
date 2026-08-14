@@ -16,7 +16,7 @@ RC-dog 是基于 STM32H723、LibXR 和 XRobot 的 8DOF 轮足四足机器人固�
 | `RobotControl` | 唯一模式、SBUS/USB 仲裁和安全锁存所有者 | REALTIME，1 kHz |
 | `StatusLED` | 通过 LibXR `SPI` 驱动 SPI6 板载 RGB，只显示系统状态 | LOW，10 Hz |
 
-所有模块继承 `LibXR::Application`，使用 MANIFEST V2，并由构造函数接收 `HardwareContainer` 和 `ApplicationManager`。`OnMonitor()` 的周期为 10 Hz，仅保留诊断扩展点，不承载控制环。
+所有模块继承 `LibXR::Application`，使用 MANIFEST V2，并由构造函数接收 `HardwareContainer` 和 `ApplicationManager`。`OnMonitor()` 的周期为 10 Hz，不承载控制环；腿/轮模块只在此刷新反馈超时掩码，作为高频线程失效时的健康状态兜底。
 
 硬件容器的稳定别名为：
 
@@ -30,6 +30,8 @@ RC-dog 是基于 STM32H723、LibXR 和 XRobot 的 8DOF 轮足四足机器人固�
 | `rgb_spi` | SPI6 | 板载 RGB |
 
 `app_main()` 只构造 LibXR 平台对象、XRUSB 和硬件容器，然后调用生成的 `XRobotMain()`。FreeRTOS 只手工创建一个 8 KiB 静态启动任务；各模块线程栈由 `User/xrobot.yaml` 显式配置。FreeRTOS heap 为 48 KiB，软件 timer task 未启用。
+
+`dm02.ioc` 仍保留 FreeRTOS middleware 选择，但不再登记应用任务。`Core/Src/freertos.c` 的 native FreeRTOS 单启动任务和精简后的 `cmake/stm32cubemx/CMakeLists.txt` 由本工程维护，不在 CubeMX USER CODE 保护块内；使用 CubeMX 全量再生成后，必须复核并恢复这两个文件，避免重新引入 CMSIS-RTOS2 默认任务和已禁用的可选内核组件。
 
 ## XRobot 生成
 
@@ -281,24 +283,27 @@ Windows 端口示例为 `COM7`。遗留固定帧、文本诊断命令和 ROS2 �
 - 应用入口由 MANIFEST V2 和 `xrobot.yaml` 可重复生成，减少手工实例化漂移。
 - 二进制状态 Topic 取代不可机读的文本诊断，上位机能观察控制源、模式进入阻塞、在线掩码和故障位。
 - Cube USB Device middleware 已移除，避免 ST CDC 回调与 XRUSB PCD 回调同时拥有同一外设。
+- 模块源码和应用入口在 CMake 中显式列出，移除了重复目标传播、无效编译定义以及当前配置禁用的 FreeRTOS coroutine、MPU wrapper、event group 和 stream buffer 编译单元。
+- 删除了只写不读的电机反馈/计数、重复命令状态和陈旧 CubeMX 三任务元数据；保留腿轮在线超时兜底，模式、安全锁、PID、限幅、热保护与 CAN 行为不变。
+- HostLink 将命令、接收时间和代际作为同一临界区快照发布，并复用线程生命周期同步对象；50 ms 半包超时在消费新字节前执行，上位机重连时也会清空旧解析半包。
 
-代码量按物理行统计，不包含第三方库、Cube/HAL 平台代码和生成的 `User/xrobot_main.hpp`：重构前取 Git `HEAD` 中遗留业务目录与主机目录的 C/C++/Python 文件，重构后取 `Modules + User + host`。
+代码量按物理行统计，不包含第三方库、Cube/HAL 平台代码和生成的 `User/xrobot_main.hpp`：重构前取提交 `67dc029` 中 `User_File + host` 的 C/C++/Python 文件，重构后取当前 `Modules + User + host`。
 
 | 指标 | 重构前 | 重构后 |
 | --- | --- | --- |
-| 业务源码物理行 | 16,650 | 3,751 |
+| 业务源码物理行 | 16,650 | 3,650 |
 | XRobot 生成入口 | 无 | 38 行（不计入业务源码） |
-| Debug 链接器 FLASH | 152,080 B（迁移过程中的旧/新混合基线） | 125,304 B |
-| Debug 链接器 DTCMRAM | 78,456 B（混合基线） | 96,000 B |
-| Debug `size` text/data/bss | 未保留可复现旧产物 | 125,152 / 148 / 95,968 B |
-| Flash（Release）链接器 FLASH / DTCMRAM | 未保留可复现旧产物 | 100,516 / 95,992 B |
-| Flash（Release）`size` text/data/bss | 未保留可复现旧产物 | 100,368 / 144 / 95,960 B |
+| Debug 链接器 FLASH | 152,080 B（迁移过程中的旧/新混合基线） | 124,616 B |
+| Debug 链接器 DTCMRAM | 78,456 B（混合基线） | 95,752 B |
+| Debug `size` text/data/bss | 未保留可复现旧产物 | 124,464 / 148 / 95,720 B |
+| Flash（Release）链接器 FLASH / DTCMRAM | 未保留可复现旧产物 | 99,908 / 95,744 B |
+| Flash（Release）`size` text/data/bss | 未保留可复现旧产物 | 99,760 / 144 / 95,712 B |
 
 这些数据只描述当前构建和代码规模，不代表控制性能、实时性或实机可靠性提升。
 
 ## 验收状态
 
-自动验收包括：XRobot 连续生成幂等、干净 Flash/Debug 配置与链接、`arm-none-eabi-size`、链接 map 内存区域检查、Python `compileall`，以及旧目录/协议/文档引用扫描。本次交付不恢复旧单元测试，编译是阻塞验收项。
+自动验收包括：XRobot 连续生成幂等、干净 Flash/Debug 配置与链接、`arm-none-eabi-size`、链接 map 内存区域检查、Python `compileall`、XRUSB codec 回归、静态检查，以及旧目录/协议/文档引用扫描。本次交付不恢复旧单元测试，编译是阻塞验收项。
 
 以下项目必须在架空、防跌落和可直接急停的条件下人工回归；当前重构未进行实机验证，不得视为已完成：
 
