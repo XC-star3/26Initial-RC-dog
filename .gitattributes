@@ -1,0 +1,5 @@
+# Keep GitHub language statistics focused on project-owned source code.
+Drivers/** linguist-vendored
+Middlewares/ST/** linguist-vendored
+Middlewares/Third_Party/FreeRTOS/** linguist-vendored
+Core/** linguist-generated=true
