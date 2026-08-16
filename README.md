@@ -34,7 +34,9 @@
 | `haokunya0716-creator` | [机械臂4310电机](https://github.com/haokunya0716-creator/rc_bigcatmotor_test) | https://github.com/haokunya0716-creator|
 | `Joushua233` | [机械臂灵足电机](https://github.com/Joushua233/LINGZU_demo) | https://github.com/Joushua233 |
 | `累累111` |电控代码框架编写，四足整体调试| https://gitee.com/are-you-tired |
-| `XC` | [电控代码框架编写，各个代码模块整合，以及四足运控算法](https://github.com/XC-star3/RC-dog) | https://github.com/XC-star3?tab=repositories |
+| `XC` | [电控代码框架编写，各个代码模块整合，以及四足运控算法](https://github.com/XC-star3/RC-dog) | https://github.com/XC-star3 |
+
+感谢指导老师和Initial战队所有成员的共同努力！希望新的赛季能够不忘初心，更进一步！
 
 ## 四足整体分析
 
