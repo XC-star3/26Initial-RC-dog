@@ -1,12 +1,28 @@
 # RC-dog
 
-RC-dog 是基于 STM32H723、LibXR 和 XRobot 的26赛季南京邮电大学Initial战队的 8DOF 轮足四足机器人固件。当前工程只有一套运行架构：CubeMX 负责芯片外设初始化，LibXR 提供硬件抽象、线程和 XRUSB，项目生成器根据 IOC、LibXR 配置和 XRobot 模块清单生成平台及应用入口。
-早期代码框架参考了辽宁科技大学COD战队的**2025RoboMaster辽宁科技大学COD战队电控通用控制系统(达妙MC02 STM32H723VGT6)**
-Github: https://gitee.com/wangcaofan/cod-h7-template
-Gitee:  https://github.com/GrassFanWang/COD-H7-Template
-但是因为其比赛过程中时间紧张以及AI使用和其他因素的影响导致代码混乱，架构不清等原因，现阶段使用更加规范且有人维护的XRobot/Libxr
-XRobot官网：https://xrobot-org.github.io
-感谢他们的开源给予的思路和帮助！
+  RC-dog 是南京邮电大学 Initial 战队面向 2026 赛季开发的 8-DOF 轮足四足机器人固
+  件，基于 STM32H723、LibXR 与 XRobot 构建。
+
+  本项目采用统一、清晰的运行架构：
+
+  - STM32CubeMX 负责芯片外设的配置与初始化；
+  - LibXR 提供硬件抽象、线程管理及 XRUSB 等基础能力；
+  - 项目生成器根据 IOC 文件、LibXR 配置和 XRobot 模块清单，自动生成平台代码与应
+    用入口。
+
+  项目早期框架参考了辽宁科技大学 COD 战队开源的「2025 RoboMaster 电控通用控制系
+  统（达妙 MC02 STM32H723VGT6）」：
+
+  - GitHub：https://github.com/GrassFanWang/COD-H7-Template
+  - Gitee：https://gitee.com/wangcaofan/cod-h7-template
+
+  受备赛周期紧张、开发过程快速迭代等因素影响，早期代码逐渐出现结构混乱、职责边界
+  不清等问题。为提升工程的规范性、可维护性与扩展能力，项目现已迁移至维护更加完善
+  的 XRobot/LibXR 技术体系。
+
+  XRobot 官网：https://xrobot-org.github.io
+
+  感谢上述团队与开源项目提供的技术思路和帮助！
 
 
 ## 贡献者
