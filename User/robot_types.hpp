@@ -5,6 +5,7 @@
 namespace RCDog
 {
 
+inline constexpr char kSbusTopic[] = "rcdog.input.sbus.v1";
 inline constexpr char kControlTopic[] = "rcdog.control.command.v1";
 inline constexpr char kStatusTopic[] = "rcdog.status.v1";
 inline constexpr uint8_t kSchemaVersion = 1;
@@ -143,6 +144,17 @@ struct RobotStatusV1
 
 static_assert(sizeof(ControlCommandV1) == 24);
 static_assert(sizeof(RobotStatusV1) == 24);
+
+inline RobotStatusV1 SafeRobotStatus()
+{
+  RobotStatusV1 status{};
+  status.schema_version = kSchemaVersion;
+  status.entry_state = static_cast<uint8_t>(EntryState::BLOCKED);
+  status.block_reason = static_cast<uint8_t>(BlockReason::SAFETY_LATCH);
+  status.safety_latched = 1;
+  status.fault_bits = FAULT_SBUS_LOST | FAULT_SAFETY_LATCHED;
+  return status;
+}
 
 struct SbusSample
 {

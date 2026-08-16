@@ -2,9 +2,6 @@
 
 #include <cstring>
 
-#include "FreeRTOS.h"
-#include "task.h"
-
 namespace
 {
 constexpr uint8_t kHeader = 0x0F;
@@ -14,8 +11,10 @@ constexpr uint8_t kFailsafe = 0x08;
 }
 
 SbusReceiver::SbusReceiver(LibXR::HardwareContainer& hw,
-                           LibXR::ApplicationManager& app, uint32_t stack_size)
-    : uart_(*hw.FindOrExit<LibXR::UART>({"sbus_uart"}))
+                           LibXR::ApplicationManager& app, RobotTopics& topics,
+                           uint32_t stack_size)
+    : uart_(*hw.FindOrExit<LibXR::UART>({"sbus_uart"})),
+      sbus_topic_(topics.Sbus())
 {
   (void)uart_.SetConfig({100000, LibXR::UART::Parity::EVEN, 8, 2});
   app.Register(*this);
@@ -24,31 +23,6 @@ SbusReceiver::SbusReceiver(LibXR::HardwareContainer& hw,
 }
 
 void SbusReceiver::OnMonitor() {}
-
-RCDog::SbusSample SbusReceiver::Snapshot() const
-{
-  RCDog::SbusSample result{};
-  taskENTER_CRITICAL();
-  result = sample_;
-  taskEXIT_CRITICAL();
-  return result;
-}
-
-bool SbusReceiver::IsFresh(uint32_t now_ms, uint32_t timeout_ms) const
-{
-  const auto sample = Snapshot();
-  return sample.last_update_ms != 0 && now_ms - sample.last_update_ms <= timeout_ms &&
-         !sample.signal_lost && !sample.failsafe;
-}
-
-uint8_t SbusReceiver::Switch3(const RCDog::SbusSample& sample, uint8_t channel)
-{
-  if (channel >= 16 || sample.channel[channel] < 700)
-  {
-    return 0;
-  }
-  return sample.channel[channel] < 1350 ? 1 : 2;
-}
 
 void SbusReceiver::ThreadEntry(SbusReceiver* self) { self->Run(); }
 
@@ -128,9 +102,7 @@ void SbusReceiver::ParseFrame()
   sample.failsafe = (stream_[23] & kFailsafe) != 0;
   sample.last_update_ms = LibXR::Thread::GetTime();
   sample.frame_counter = ++generation_;
-  taskENTER_CRITICAL();
-  sample_ = sample;
-  taskEXIT_CRITICAL();
+  sbus_topic_.Publish(sample);
 }
 
 int16_t SbusReceiver::Normalize(uint16_t value)

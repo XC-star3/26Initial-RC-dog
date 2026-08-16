@@ -2,17 +2,20 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: Event-driven UART5 SBUS receiver and strong typed snapshot publisher
+module_description: Event-driven UART5 SBUS receiver and strongly typed topic publisher
 constructor_args:
+  - topics: null
   - stack_size: 2048
 required_hardware:
   - sbus_uart
-depends: []
+depends:
+  - RobotTopics
 === END MANIFEST === */
 // clang-format on
 
 #include <cstdint>
 
+#include "RobotTopics.hpp"
 #include "app_framework.hpp"
 #include "libxr.hpp"
 #include "robot_types.hpp"
@@ -22,11 +25,8 @@ class SbusReceiver final : public LibXR::Application
 {
  public:
   SbusReceiver(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-               uint32_t stack_size = 2048);
+               RobotTopics& topics, uint32_t stack_size = 2048);
   void OnMonitor() override;
-  RCDog::SbusSample Snapshot() const;
-  bool IsFresh(uint32_t now_ms, uint32_t timeout_ms = 250) const;
-  static uint8_t Switch3(const RCDog::SbusSample& sample, uint8_t channel);
 
  private:
   static void ThreadEntry(SbusReceiver* self);
@@ -36,9 +36,9 @@ class SbusReceiver final : public LibXR::Application
   static int16_t Normalize(uint16_t value);
 
   LibXR::UART& uart_;
+  LibXR::Topic sbus_topic_;
   LibXR::Thread thread_;
   uint8_t stream_[25]{};
   uint8_t stream_size_ = 0;
-  RCDog::SbusSample sample_{};
   uint32_t generation_ = 0;
 };

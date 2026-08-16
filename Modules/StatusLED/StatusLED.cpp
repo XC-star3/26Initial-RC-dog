@@ -10,8 +10,9 @@ constexpr std::size_t kPacketSize = 2 * kResetBytes + 3 * kEncodedChannelBytes;
 }
 
 StatusLED::StatusLED(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                     RobotControl& robot_control, uint32_t stack_size)
-    : spi_(*hw.FindOrExit<LibXR::SPI>({"rgb_spi"})), control_(robot_control)
+                     RobotTopics& topics, uint32_t stack_size)
+    : spi_(*hw.FindOrExit<LibXR::SPI>({"rgb_spi"})),
+      status_(topics.Status(), RCDog::SafeRobotStatus())
 {
   (void)spi_.SetConfig({LibXR::SPI::ClockPolarity::LOW,
                         LibXR::SPI::ClockPhase::EDGE_2,
@@ -29,7 +30,7 @@ void StatusLED::Run()
   LibXR::Semaphore semaphore;
   while (true)
   {
-    const auto status = control_.Status();
+    const auto status = status_.Snapshot();
     if (status.safety_latched != 0 || status.fault_bits != 0)
     {
       Write(96, 0, 0, semaphore);

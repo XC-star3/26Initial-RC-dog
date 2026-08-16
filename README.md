@@ -1,22 +1,55 @@
 # RC-dog
 
-RC-dog 是基于 STM32H723、LibXR 和 XRobot 的 8DOF 轮足四足机器人固件。当前工程只有一套运行架构：CubeMX 负责芯片外设初始化，LibXR 提供硬件抽象、线程和 XRUSB，项目生成器根据 IOC、LibXR 配置和 XRobot 模块清单生成平台及应用入口。
+RC-dog 是基于 STM32H723、LibXR 和 XRobot 的26赛季南京邮电大学Initial战队的 8DOF 轮足四足机器人固件。当前工程只有一套运行架构：CubeMX 负责芯片外设初始化，LibXR 提供硬件抽象、线程和 XRUSB，项目生成器根据 IOC、LibXR 配置和 XRobot 模块清单生成平台及应用入口。
+早期代码框架参考了辽宁科技大学COD战队的**2025RoboMaster辽宁科技大学COD战队电控通用控制系统(达妙MC02 STM32H723VGT6)**
+Github: https://gitee.com/wangcaofan/cod-h7-template
+Gitee:  https://github.com/GrassFanWang/COD-H7-Template
+但是因为其比赛过程中时间紧张以及AI使用和其他因素的影响导致代码混乱，架构不清等原因，现阶段使用更加规范且有人维护的XRobot/Libxr
+XRobot官网：https://xrobot-org.github.io
+感谢他们的开源给予的思路和帮助！
 
-旧三任务入口、全局电机发送器、CAN/SBUS C 桥、在线调参、运动调试命令、固定 40 字节 USB 协议和 Cube CDC middleware 已删除。LibXR 子模块固定为提交 `c512b364ab1f0646bb86c4929ac5877e1bc7b62d`。
+
+## 贡献者
+
+| 贡献者 | 主要贡献 | 个人主页链接 |
+| --- | --- | --- |
+| `petershe1by` | [robocon26_pc](https://github.com/petershe1by/robocon26_pc) | https://github.com/petershe1by|
+| `Chen hong an` | [遥控链路](https://github.com/cha815/Robocon) | https://github.com/cha815 |
+| `haokunya0716-creator` | [机械臂4310电机](https://github.com/haokunya0716-creator/rc_bigcatmotor_test) | https://github.com/haokunya0716-creator|
+| `Joushua233` | [机械臂灵足电机](https://github.com/Joushua233/LINGZU_demo) | https://github.com/Joushua233 |
+| `累累111` |电控代码框架编写，四足整体调试| https://gitee.com/are-you-tired |
+| `XC` | [电控代码框架编写，各个代码模块整合，以及四足运控算法](https://github.com/XC-star3/RC-dog) | https://github.com/XC-star3?tab=repositories |
+
+## 四足整体分析
+
+RC-dog 采用轮足复合驱动方案，整机包含 8 个关节自由度和 4 个主动轮。关节部分使用海泰 `HWG7015-J8` 电机，并配套守护兽科技电机驱动板；轮组使用加装减速箱的 `M3508` 电机，并由 `C620` 电调驱动。系统以达妙 `DM MC-02` 作为主控制器，负责各执行器的状态采集与运动控制。
+
+| 子系统 | 硬件组成 | 主要作用 |
+| --- | --- | --- |
+| 关节执行系统 | 8 × 海泰 `HWG7015-J8` + 守护兽科技电机驱动板 | 驱动四条腿的 8 个关节自由度 |
+| 轮组执行系统 | 4 × `M3508` + 减速箱 + `C620` 电调 | 提供轮式行驶动力 |
+| 主控制系统 | 达妙 `DM MC-02` | 运行控制算法，接收执行器反馈并下发控制指令 |
+| 供电与总线分配 | `TB47` 电池 + CAN 分电板 | 为各执行器供电，并完成 CAN 总线汇接与分配 |
+| 上位机通信 | USB CDC | 实现上位机与 `MC-02` 之间的控制指令和状态数据传输 |
+
+整机由 `TB47` 电池统一供电，通过 CAN 分电板将电源和 CAN 总线分配至各关节驱动板及 `C620` 电调。各执行器按照功能分组接入 `MC-02` 对应的 CAN 接口，使关节电机与轮电机的通信链路相互独立，便于总线负载管理、故障定位和后续维护。上位机通过 USB CDC 与 `MC-02` 通信，用于控制指令下发、运行状态回传和在线调试。
 
 ## 架构
-
+旧三任务入口、全局电机发送器、CAN/SBUS C 桥、在线调参、可运动调试命令、固定 40 字节 USB 协议和 Cube CDC middleware 已删除；正式固件仅保留只读 `p` 与 `Y/y` 人工诊断。LibXR 子模块固定为提交 `c512b364ab1f0646bb86c4929ac5877e1bc7b62d`。
 | 模块 | 职责 | 执行上下文 |
 | --- | --- | --- |
-| `SbusReceiver` | 通过 LibXR `UART` 读取 UART5，解析 SBUS 并发布强类型快照 | HIGH，事件驱动 |
+| `RobotTopics` | 创建独立 Domain 和三条强类型 LibXR Topic | 无线程 |
+| `SbusReceiver` | 通过 LibXR `UART` 读取 UART5，解析并发布 SBUS Topic | HIGH，事件驱动 |
 | `DogMotor` | 8 个 MW 腿电机、MIT PID、站立/低姿、运动学、足端轨迹和对角 trot | HIGH，500 Hz |
 | `WheelMotor` | 4 个 C620/M3508、PI、斜坡、峰值电流预算、温度降额和反馈保护 | HIGH，500 Hz |
 | `ObstacleController` | LOW/MID/HIGH 单级上台阶状态机 | 由控制线程推进 |
-| `HostLink` | XRUSB CDC、严格 Topic packet 解析和状态发送 | MEDIUM，事件驱动/10 Hz 状态 |
+| `HostLink` | XRUSB CDC、`Topic::Server` 收包和 `PackData()` 状态发送 | MEDIUM，事件驱动/10 Hz 状态 |
 | `RobotControl` | 唯一模式、SBUS/USB 仲裁和安全锁存所有者 | REALTIME，1 kHz |
 | `StatusLED` | 通过 LibXR `SPI` 驱动 SPI6 板载 RGB，只显示系统状态 | LOW，10 Hz |
 
 所有模块继承 `LibXR::Application`，使用 MANIFEST V2，并由构造函数接收 `HardwareContainer` 和 `ApplicationManager`。`OnMonitor()` 的周期为 10 Hz，不承载控制环；腿/轮模块只在此刷新反馈超时掩码，作为高频线程失效时的健康状态兜底。
+
+模块间使用 `rcdog` Domain 下的三条强类型 Topic：`rcdog.input.sbus.v1`、`rcdog.control.command.v1` 和 `rcdog.status.v1`。LibXR Topic 不缓存 latest payload；RobotControl、HostLink 和 StatusLED 分别通过长期存在的上层邮箱保存最近值、接收时间和 generation。Topic 回调只执行短临界区复制，不执行 UART、SPI 或电机操作。腿轮命令和越障推进仍由 RobotControl 同步直接调用。
 
 硬件容器的稳定别名为：
 
@@ -30,6 +63,8 @@ RC-dog 是基于 STM32H723、LibXR 和 XRobot 的 8DOF 轮足四足机器人固�
 | `rgb_spi` | SPI6 | 板载 RGB |
 
 生成的 `app_main()` 只构造 LibXR 平台对象、XRUSB 和硬件容器，然后调用生成的 `XRobotMain()`。FreeRTOS 只手工创建一个 8 KiB 静态启动任务；各模块线程栈由 `User/xrobot.yaml` 显式配置。FreeRTOS heap 为 48 KiB，CubeMX 的软件 timer task 未启用；`PlatformInit(2, 1024)` 的参数由 `User/libxr_config.yaml` 生成。
+
+Topic Domain、节点和五个订阅回调在初始化阶段从 FreeRTOS heap 分配；HostLink 的 `Topic::Server` 另有 64 字节输入 FIFO 和 64 字节 staging buffer。迁移没有新增线程，链接 map 中固定的 48 KiB `ucHeap` 大小不变；heap_4 的运行时剩余量需在实机回归时通过 `xPortGetFreeHeapSize()` 观察。
 
 `dm02.ioc` 仍保留 FreeRTOS middleware 选择，但不再登记应用任务。`Core/Src/freertos.c` 的 native FreeRTOS 单启动任务和精简后的 `cmake/stm32cubemx/CMakeLists.txt` 由本工程维护，不在 CubeMX USER CODE 保护块内；使用 CubeMX 全量再生成后，必须复核并恢复这两个文件，避免重新引入 CMSIS-RTOS2 默认任务和已禁用的可选内核组件。
 
@@ -174,7 +209,15 @@ payload 固定 24 字节、小端：
 | 16 | `u32` | `command_counter` | 同一 session 单调前进 |
 | 20 | `u32` | `host_time_ms` | 主机单调时钟低 32 位 |
 
-USB mode 8 是保留站立，不会进入越障。固件严格拒绝错误版本、非精确长度、未知 flag、非零 reserved、越界轴、零 session、topic/CRC 错误；不完整包超过 50 ms 后重同步。
+USB mode 8 是保留站立，不会进入越障。HostLink 将每个 CDC 字节直接交给 64 字节 `Topic::Server`：Server 校验 packet 版本、已注册 topic、头 CRC8 和尾 CRC8，但沿用 LibXR 的长度兼容规则。`0..23` 字节短 payload 会把 staging buffer 中未被本包覆盖的尾部作为 `ControlCommandV1` 的剩余字段，`25..47` 字节长 payload 只发布前 24 字节；更大的声明因超出 Server FIFO 被丢弃。部分 packet 可以跨任意时间继续拼接，不再执行 50 ms 超时复位。
+
+RobotControl 在使用 Server 发布的对象前仍严格检查 schema、mode、flags、reserved、三个运动轴和非零 session。字段非法的对象不会刷新 150 ms USB 看门狗，并锁存 `FAULT_USB_PROTOCOL`；坏头、CRC 错误、未知 topic 和未完成 packet 由 Server 静默处理，不设置该故障位。仓库主机工具仍只发送精确 24 字节 payload。
+
+### 只读人工诊断
+
+XRUSB CDC 同时保留重构前正式固件的两个单字符只读命令：发送 `p` 立即输出控制源、模式、阻塞、安全、故障、腿轮健康和越障状态；发送 `Y` 或 `y` 输出 SBUS 帧龄、丢失/失控标志、关键通道原始值与归一化值、当前模式和安全状态。它们不写控制 Topic、不修改模式，也不能解除安全锁。
+
+HostLink 的只读观察器会识别有效 Topic header，并跳过其完整 payload 与尾 CRC，因此二进制控制包内部出现 `p/Y/y` 不会误触发诊断。观察器不校验或发布控制数据，所有输入字节仍先交给 `Topic::Server`。文本响应与 10 Hz 二进制状态共用 CDC；仓库 Python parser 会跳过非 Topic 文本并在下一个 `0x5A` 重新同步。
 
 ### RobotStatusV1
 
@@ -187,7 +230,7 @@ payload 固定 24 字节、小端：
 | 16 | `u32` | `last_command_counter` |
 | 20 | `u32` | `uptime_ms` |
 
-`fault_bits` 从 bit0 起依次为：SBUS 丢失、USB 丢失、腿离线、腿驱动故障、轮离线、轮过温、CAN bus-off、障碍故障、安全锁存、USB 协议错误。
+`fault_bits` 从 bit0 起依次为：SBUS 丢失、USB 丢失、腿离线、腿驱动故障、轮离线、轮过温、CAN bus-off、障碍故障、安全锁存、USB 业务字段错误。最后一位不再表示 Server 静默丢弃的 CRC、坏头或未知 topic。
 
 ## 输入仲裁与安全
 
@@ -264,7 +307,7 @@ python3 -m host.quadruped_control_cli /dev/ttyACM0 \
   --mode GAIT_ONLY --enable --deadman --smooth-stop --status
 ```
 
-Windows 端口示例为 `COM7`。遗留固定帧、文本诊断命令和 ROS2 包不再支持；主机集成应复用 `host/xrusb_codec.py` 的 Topic codec。
+Windows 端口示例为 `COM7`。遗留固定帧、可运动 ASCII 命令和 ROS2 包不再支持；只读 `p` 与 `Y/y` 可供人工串口诊断，主机控制仍应复用 `host/xrusb_codec.py` 的 Topic codec。
 
 ## 故障排查
 
@@ -272,7 +315,7 @@ Windows 端口示例为 `COM7`。遗留固定帧、文本诊断命令和 ROS2 �
 | --- | --- |
 | USB 不枚举 | 确认设备名、VID/PID、PA11/PA12、HS PCD Full Speed 配置和 OTG_HS IRQ；工程中不应再链接 Cube CDC middleware |
 | USB 命令无效 | SBUS 必须新鲜，CH9 已释放，CH5/CH8 为 LOW+LOW，CH1/CH2 居中；使用新 session 连续发送三帧安全零命令 |
-| `FAULT_USB_PROTOCOL` | 核对 topic CRC、24 字节 payload、little-endian、版本/flags/reserved、双 CRC8 和 50 ms 分包间隔 |
+| `FAULT_USB_PROTOCOL` | Server 已发布对象但业务字段无效；核对 schema、mode、flags、reserved、轴范围和非零 session。CRC/坏头由 Server 静默丢弃，不会设置此位 |
 | 腿电机离线 | 检查 FDCAN1/2、节点映射、心跳/编码器帧和 8:1 编码换算；确认 map 中未发生内存溢出 |
 | 轮电机无法解锁 | 四轮反馈掩码必须为 `0x0F`、速度小于 0.5 rad/s、无过温和 bus-off |
 | 楼梯停在 PRECHECK | 确认腿/轮全部健康、标准站立完成、轮停止并持续 200 ms |
@@ -287,29 +330,34 @@ Windows 端口示例为 `COM7`。遗留固定帧、文本诊断命令和 ROS2 �
 - `RobotControl` 成为唯一输入仲裁和安全所有者，SBUS、USB、模式进入条件和故障状态不再散落在多个任务。
 - 电机控制、越障、主机链路和状态灯具有明确依赖边界，线程频率和栈大小可从 XRobot 配置审查。
 - LibXR 平台适配、XRUSB、硬件别名和应用入口均可重复生成，消除 IOC、缓冲参数与手工实例化之间的漂移。
-- 二进制状态 Topic 取代不可机读的文本诊断，上位机能观察控制源、模式进入阻塞、在线掩码和故障位。
+- SBUS、USB 命令和机器人状态使用强类型 LibXR Topic；latest 状态由上层邮箱明确持有，不依赖旧 `DumpData()` 或 Topic cache 语义。
+- 二进制状态 Topic 取代周期文本诊断，上位机能观察控制源、模式进入阻塞、在线掩码和故障位；只读 `p` 与 `Y/y` 作为人工维护补充。
 - Cube USB Device middleware 已移除，避免 ST CDC 回调与 XRUSB PCD 回调同时拥有同一外设。
 - 模块源码和应用入口在 CMake 中显式列出，移除了重复目标传播、无效编译定义以及当前配置禁用的 FreeRTOS coroutine、MPU wrapper、event group 和 stream buffer 编译单元。
 - 删除了只写不读的电机反馈/计数、重复命令状态和陈旧 CubeMX 三任务元数据；保留腿轮在线超时兜底，模式、安全锁、PID、限幅、热保护与 CAN 行为不变。
-- HostLink 将命令、接收时间和代际作为同一临界区快照发布，并复用线程生命周期同步对象；50 ms 半包超时在消费新字节前执行，上位机重连时也会清空旧解析半包。
+- HostLink 直接使用 `Topic::Server::ParseData()` 投递控制命令，并使用 `Topic::PackData()` 生成状态 packet；长度兼容、无半包超时和底层错误静默丢弃是当前明确接受的协议边界。
 
 代码量按物理行统计，不包含第三方库、Cube/HAL 平台代码和生成的三个入口文件：重构前取提交 `67dc029` 中 `User_File + host` 的 C/C++/Python 文件，重构后取当前 `Modules + User + host + tools` 中的手写业务及生成工具源码。
 
 | 指标 | 重构前 | 重构后 |
 | --- | --- | --- |
-| 手写业务与生成工具源码物理行 | 16,650 | 4,356 |
+| 手写业务与生成工具源码物理行 | 16,650 | 4,506 |
 | LibXR/XRobot 生成入口 | 无 | 自动生成（不计入业务源码） |
-| Debug 链接器 FLASH | 152,080 B（迁移过程中的旧/新混合基线） | 124,536 B |
-| Debug 链接器 DTCMRAM | 78,456 B（混合基线） | 95,752 B |
-| Debug `size` text/data/bss | 未保留可复现旧产物 | 124,384 / 148 / 95,720 B |
-| Flash（Release）链接器 FLASH / DTCMRAM | 未保留可复现旧产物 | 99,836 / 95,744 B |
-| Flash（Release）`size` text/data/bss | 未保留可复现旧产物 | 99,688 / 144 / 95,712 B |
+| Debug 链接器 FLASH | 152,080 B（迁移过程中的旧/新混合基线） | 135,108 B |
+| Debug 链接器 DTCMRAM | 78,456 B（混合基线） | 96,056 B |
+| Debug `size` text/data/bss | 未保留可复现旧产物 | 134,952 / 148 / 96,024 B |
+| Flash（Release）链接器 FLASH / DTCMRAM | 未保留可复现旧产物 | 107,892 / 96,048 B |
+| Flash（Release）`size` text/data/bss | 未保留可复现旧产物 | 107,740 / 144 / 96,016 B |
+
+相对本次 Topic 迁移前的验收基线，Flash `text/data/bss` 从 `99,760 / 144 / 95,712 B` 变为 `107,740 / 144 / 96,016 B`，Debug 从 `124,464 / 148 / 95,720 B` 变为 `134,952 / 148 / 96,024 B`；即 text 分别增加 7,980 B 和 10,488 B，bss 均增加 304 B。链接 map 中 Flash/Debug DTCMRAM 分别从 `95,744 / 95,752 B` 变为 `96,048 / 96,056 B`，均增加 304 B。
+
+其中，本次新增只读 `p` 与 `Y/y` 诊断使 Flash/Debug 链接器 FLASH 分别增加 3,848 B 和 4,084 B，DTCMRAM 均增加 128 B；对应 `size` 的 text 分别增加 3,844 B 和 4,080 B，bss 均增加 128 B。`.dma_buffer` 仍为 128 B。上述静态尺寸不包含 Topic/Server 初始化时从 48 KiB FreeRTOS heap 获取的运行时对象，实际剩余 heap 仍以实机观测为准。
 
 这些数据只描述当前构建和代码规模，不代表控制性能、实时性或实机可靠性提升。
 
 ## 验收状态
 
-自动验收包括：统一生成连续幂等、`--check`、CMake 过期拒绝、干净 Flash/Debug 配置与链接、`arm-none-eabi-size`、链接 map 内存区域检查、Python `compileall`、XRUSB codec 回归、静态检查，以及旧目录/协议/文档引用扫描。本次交付不恢复旧业务单元测试，编译仍是阻塞验收项。
+自动验收包括：统一生成连续幂等、`--check`、CMake 过期拒绝、Flash/Debug 配置与链接、`arm-none-eabi-size`、链接 map 内存区域检查、Python `compileall`、XRUSB codec/Topic packet 回归、Topic 单发布者与无阻塞回调静态检查，以及旧接口扫描。本次交付不恢复旧业务单元测试，编译仍是阻塞验收项。
 
 以下项目必须在架空、防跌落和可直接急停的条件下人工回归；当前重构未进行实机验证，不得视为已完成：
 
@@ -321,8 +369,3 @@ Windows 端口示例为 `COM7`。遗留固定帧、文本诊断命令和 ROS2 �
 - [ ] 轮电机 70/85/65 C 降额、切断和恢复
 - [ ] 对角 trot、停止和轮腿混合
 - [ ] LOW/MID/HIGH 单级上台阶完整序列、中断续跑和 CH10 八帧触发
-
-## 贡献者
-
-| 贡献者 | 主要贡献 | 个人主页链接 |
-| --- | --- | --- |

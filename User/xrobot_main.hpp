@@ -5,6 +5,7 @@
 #include "libxr.hpp"
 
 // Module headers
+#include "RobotTopics.hpp"
 #include "SbusReceiver.hpp"
 #include "DogMotor.hpp"
 #include "WheelMotor.hpp"
@@ -18,22 +19,22 @@ static void XRobotMain(LibXR::HardwareContainer &hw) {
   ApplicationManager appmgr;
 
   // Auto-generated module instantiations
-  static SbusReceiver SbusReceiver_0(hw, appmgr, 2048);
+  static RobotTopics RobotTopics_0(hw, appmgr);
+  static SbusReceiver SbusReceiver_0(hw, appmgr, RobotTopics_0, 2048);
   static DogMotor DogMotor_0(hw, appmgr, 4096);
   static WheelMotor WheelMotor_0(hw, appmgr, 3072);
   static ObstacleController ObstacleController_0(hw, appmgr, DogMotor_0, WheelMotor_0);
-  static HostLink HostLink_0(hw, appmgr, 3072);
+  static HostLink HostLink_0(hw, appmgr, RobotTopics_0, DogMotor_0, WheelMotor_0, 3072);
   static RobotControl RobotControl_0(
       hw,
       appmgr,
-      SbusReceiver_0,
+      RobotTopics_0,
       DogMotor_0,
       WheelMotor_0,
       ObstacleController_0,
-      HostLink_0,
       4096
   );
-  static StatusLED StatusLED_0(hw, appmgr, RobotControl_0, 1536);
+  static StatusLED StatusLED_0(hw, appmgr, RobotTopics_0, 1536);
 
   while (true) {
     appmgr.MonitorAll();

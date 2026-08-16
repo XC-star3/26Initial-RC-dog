@@ -18,20 +18,38 @@ constexpr uint32_t kObstacleWheelStopMs = 200;
 constexpr float kMoveEnterDeadband = 0.25F;
 constexpr float kMoveExitDeadband = 0.12F;
 constexpr uint32_t kWheelReverseNeutralMs = 200;
+constexpr int16_t kAxisLimit = 1000;
 
 float Axis(int16_t value) { return RCDog::Clamp(value / 100.0F, -1.0F, 1.0F); }
+
+bool SbusFresh(const RCDog::SbusSample& sample, uint32_t now_ms,
+               uint32_t timeout_ms = kSbusTimeoutMs)
+{
+  return sample.last_update_ms != 0 &&
+      now_ms - sample.last_update_ms <= timeout_ms && !sample.signal_lost &&
+      !sample.failsafe;
+}
+
+uint8_t Switch3(const RCDog::SbusSample& sample, uint8_t channel)
+{
+  if (channel >= 16 || sample.channel[channel] < 700)
+  {
+    return 0;
+  }
+  return sample.channel[channel] < 1350 ? 1 : 2;
+}
 }
 
 RobotControl::RobotControl(LibXR::HardwareContainer&,
-                           LibXR::ApplicationManager& app, SbusReceiver& sbus,
+                           LibXR::ApplicationManager& app, RobotTopics& topics,
                            DogMotor& dog_motor, WheelMotor& wheel_motor,
-                           ObstacleController& obstacle, HostLink& host_link,
-                           uint32_t stack_size)
-    : sbus_(sbus),
-      dog_(dog_motor),
+                           ObstacleController& obstacle, uint32_t stack_size)
+    : dog_(dog_motor),
       wheel_(wheel_motor),
       obstacle_(obstacle),
-      host_(host_link)
+      sbus_(topics.Sbus()),
+      control_command_(topics.ControlCommand()),
+      status_topic_(topics.Status())
 {
   status_.schema_version = RCDog::kSchemaVersion;
   app.Register(*this);
@@ -40,14 +58,6 @@ RobotControl::RobotControl(LibXR::HardwareContainer&,
 }
 
 void RobotControl::OnMonitor() {}
-RCDog::RobotStatusV1 RobotControl::Status() const
-{
-  RCDog::RobotStatusV1 status{};
-  taskENTER_CRITICAL();
-  status = published_status_;
-  taskEXIT_CRITICAL();
-  return status;
-}
 void RobotControl::ThreadEntry(RobotControl* self) { self->Run(); }
 
 void RobotControl::Run()
@@ -62,7 +72,7 @@ void RobotControl::Run()
 
 void RobotControl::Tick(uint32_t now_ms)
 {
-  const auto sbus = sbus_.Snapshot();
+  const RCDog::SbusSample sbus = sbus_.Snapshot();
   UpdateSafety(sbus, now_ms);
   const Input input = SelectInput(sbus, now_ms);
   if (safety_latched_ || !input.valid)
@@ -71,35 +81,41 @@ void RobotControl::Tick(uint32_t now_ms)
   }
   else
   {
-    Execute(input, now_ms);
+    Execute(input, sbus, now_ms);
   }
   obstacle_.Tick(now_ms);
-  PublishStatus(input, now_ms);
+  PublishStatus(input, sbus, now_ms);
 }
 
 RobotControl::Input RobotControl::SelectInput(const RCDog::SbusSample& sbus,
                                               uint32_t now_ms)
 {
   Input input{};
-  if (!sbus_.IsFresh(now_ms, kSbusTimeoutMs))
+  if (!SbusFresh(sbus, now_ms))
   {
     RevokeUsb();
     return input;
   }
-  const uint8_t main = SbusReceiver::Switch3(sbus, kMainModeChannel);
-  const uint8_t sub = SbusReceiver::Switch3(sbus, kSubModeChannel);
+  const uint8_t main = Switch3(sbus, kMainModeChannel);
+  const uint8_t sub = Switch3(sbus, kSubModeChannel);
   const bool physical_authorizes_usb = main == 0 && sub == 0 &&
       std::abs(sbus.normalized[kYawChannel]) <= 12 &&
       std::abs(sbus.normalized[kForwardChannel]) <= 12;
 
   RCDog::ControlCommandV1 latest{};
   uint32_t rx_ms = 0;
-  const bool fresh_packet = host_.ReadCommand(latest, rx_ms, usb_generation_);
+  const bool fresh_packet =
+      control_command_.ReadNext(latest, rx_ms, usb_generation_);
+  const bool valid_packet = !fresh_packet || ValidCommand(latest);
+  if (fresh_packet && !valid_packet)
+  {
+    ++semantic_protocol_errors_;
+  }
   if (!physical_authorizes_usb)
   {
     RevokeUsb();
   }
-  else if (fresh_packet)
+  else if (fresh_packet && valid_packet)
   {
     const bool safe_zero = latest.mode == 0 && latest.flags == 0 &&
         latest.yaw == 0 && latest.forward == 0 && latest.speed == 0;
@@ -172,7 +188,7 @@ RobotControl::Input RobotControl::SelectInput(const RCDog::SbusSample& sbus,
 
 void RobotControl::UpdateSafety(const RCDog::SbusSample& sbus, uint32_t now_ms)
 {
-  const bool fresh = sbus_.IsFresh(now_ms, kSbusTimeoutMs);
+  const bool fresh = SbusFresh(sbus, now_ms);
   const bool trigger = !fresh || sbus.normalized[kSafetyChannel] >= 50;
   if (trigger)
   {
@@ -183,8 +199,8 @@ void RobotControl::UpdateSafety(const RCDog::SbusSample& sbus, uint32_t now_ms)
     return;
   }
   const bool released = sbus.normalized[kSafetyChannel] <= 20;
-  const bool low_low = SbusReceiver::Switch3(sbus, kMainModeChannel) == 0 &&
-                       SbusReceiver::Switch3(sbus, kSubModeChannel) == 0;
+  const bool low_low = Switch3(sbus, kMainModeChannel) == 0 &&
+                       Switch3(sbus, kSubModeChannel) == 0;
   if (safety_latched_ && released && low_low)
   {
     if (release_since_ms_ == 0)
@@ -203,7 +219,8 @@ void RobotControl::UpdateSafety(const RCDog::SbusSample& sbus, uint32_t now_ms)
   }
 }
 
-void RobotControl::Execute(const Input& input, uint32_t now_ms)
+void RobotControl::Execute(const Input& input, const RCDog::SbusSample& sbus,
+                           uint32_t now_ms)
 {
   status_.requested_mode = input.requested_mode;
   status_.entry_state = static_cast<uint8_t>(RCDog::EntryState::ENTERING);
@@ -317,10 +334,9 @@ void RobotControl::Execute(const Input& input, uint32_t now_ms)
     case RCDog::RobotMode::OBSTACLE:
     {
       wheel_.SetMode(WheelMotor::Mode::HOLD);
-      const auto sample = sbus_.Snapshot();
       if (!obstacle_profile_locked_)
       {
-        const int16_t profile = sample.normalized[kSpeedChannel];
+        const int16_t profile = sbus.normalized[kSpeedChannel];
         obstacle_.SelectProfile(profile < -33 ? RCDog::StairProfile::LOW :
                                 (profile > 33 ? RCDog::StairProfile::HIGH :
                                                 RCDog::StairProfile::MID));
@@ -356,11 +372,11 @@ void RobotControl::Execute(const Input& input, uint32_t now_ms)
         break;
       }
       obstacle_.SetRequested(true);
-      if (sample.frame_counter != last_step_frame_)
+      if (sbus.frame_counter != last_step_frame_)
       {
-        last_step_frame_ = sample.frame_counter;
-        const bool candidate = sample.channel[kStepChannel] > 1200 ? true :
-            (sample.channel[kStepChannel] < 800 ? false : step_candidate_high_);
+        last_step_frame_ = sbus.frame_counter;
+        const bool candidate = sbus.channel[kStepChannel] > 1200 ? true :
+            (sbus.channel[kStepChannel] < 800 ? false : step_candidate_high_);
         if (!step_input_initialized_)
         {
           step_input_initialized_ = true;
@@ -409,7 +425,9 @@ void RobotControl::StopAll(bool safety)
                                                      : RCDog::BlockReason::INPUT_TIMEOUT);
 }
 
-void RobotControl::PublishStatus(const Input& input, uint32_t now_ms)
+void RobotControl::PublishStatus(const Input& input,
+                                 const RCDog::SbusSample& sbus,
+                                 uint32_t now_ms)
 {
   const RCDog::ObstacleFault obstacle_fault = obstacle_.Fault();
   status_.schema_version = RCDog::kSchemaVersion;
@@ -421,20 +439,17 @@ void RobotControl::PublishStatus(const Input& input, uint32_t now_ms)
   status_.wheel_online_mask = wheel_.OnlineMask();
   status_.reserved = 0;
   status_.fault_bits = dog_.FaultBits() | wheel_.FaultBits();
-  if (!sbus_.IsFresh(now_ms)) status_.fault_bits |= RCDog::FAULT_SBUS_LOST;
+  if (!SbusFresh(sbus, now_ms)) status_.fault_bits |= RCDog::FAULT_SBUS_LOST;
   if (usb_timeout_latched_)
     status_.fault_bits |= RCDog::FAULT_USB_LOST;
   if (safety_latched_) status_.fault_bits |= RCDog::FAULT_SAFETY_LATCHED;
   if (obstacle_fault != RCDog::ObstacleFault::NONE)
     status_.fault_bits |= RCDog::FAULT_OBSTACLE;
-  if (host_.ProtocolErrors() != 0) status_.fault_bits |= RCDog::FAULT_USB_PROTOCOL;
+  if (semantic_protocol_errors_ != 0)
+    status_.fault_bits |= RCDog::FAULT_USB_PROTOCOL;
   status_.last_command_counter = last_accepted_usb_counter_;
   status_.uptime_ms = now_ms;
-  const RCDog::RobotStatusV1 snapshot = status_;
-  taskENTER_CRITICAL();
-  published_status_ = snapshot;
-  taskEXIT_CRITICAL();
-  host_.SetStatus(snapshot);
+  status_topic_.Publish(status_);
 }
 
 void RobotControl::RevokeUsb()
@@ -452,6 +467,16 @@ void RobotControl::RevokeUsb()
 bool RobotControl::CounterForward(uint32_t value, uint32_t previous)
 {
   return static_cast<int32_t>(value - previous) > 0;
+}
+
+bool RobotControl::ValidCommand(const RCDog::ControlCommandV1& command)
+{
+  return command.schema_version == RCDog::kSchemaVersion && command.mode <= 8 &&
+      (command.flags & ~RCDog::KNOWN_FLAGS) == 0 && command.reserved == 0 &&
+      command.yaw >= -kAxisLimit && command.yaw <= kAxisLimit &&
+      command.forward >= -kAxisLimit && command.forward <= kAxisLimit &&
+      command.speed >= 0 && command.speed <= kAxisLimit &&
+      command.session_id != 0;
 }
 
 float RobotControl::LowWheelForward(float requested, uint32_t now_ms)

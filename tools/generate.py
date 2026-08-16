@@ -624,6 +624,7 @@ def generate_xrobot_main(toolchain: Toolchain, temp_root: Path) -> str:
         (
             "static void XRobotMain(LibXR::HardwareContainer &hw)",
             "ApplicationManager appmgr",
+            "RobotTopics_0",
             "SbusReceiver_0",
             "DogMotor_0",
             "WheelMotor_0",
